@@ -1,0 +1,16 @@
+bin/
+obj/
+**/bin/
+**/obj/
+.vs/
+.vscode/
+.idea/
+.DS_Store
+.env
+.env.production
+.env.preview
+*.user
+*.suo
+TestResults/
+publish/
+node_modules/

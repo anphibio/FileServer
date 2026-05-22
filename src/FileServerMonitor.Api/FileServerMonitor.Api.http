@@ -1,0 +1,44 @@
+@FileServerMonitor.Api_HostAddress = http://localhost:5088
+
+GET {{FileServerMonitor.Api_HostAddress}}/health
+Accept: application/json
+
+###
+
+POST {{FileServerMonitor.Api_HostAddress}}/api/events
+Content-Type: application/json
+
+{
+  "server": "FS01",
+  "share": "Departamentos",
+  "path": "\\\\FS01\\Departamentos\\Financeiro\\relatorio.xlsx",
+  "objectType": "file",
+  "action": "modified",
+  "user": "EMPRESA\\maria.silva",
+  "sourceHost": "WKS-023",
+  "sourceIp": "192.168.10.23",
+  "processName": "EXCEL.EXE",
+  "fileSizeBytes": 248120,
+  "extension": ".xlsx",
+  "source": "manual-test"
+}
+
+###
+
+GET {{FileServerMonitor.Api_HostAddress}}/api/events?take=20
+Accept: application/json
+
+###
+
+GET {{FileServerMonitor.Api_HostAddress}}/api/agents/health
+Accept: application/json
+
+###
+
+GET {{FileServerMonitor.Api_HostAddress}}/api/alerts?status=open&take=20
+Accept: application/json
+
+###
+
+POST {{FileServerMonitor.Api_HostAddress}}/api/alerts/00000000-0000-0000-0000-000000000000/ack
+Accept: application/json

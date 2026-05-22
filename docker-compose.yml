@@ -1,0 +1,91 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Web/Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:${APP_API_PORT:-8180}
+        VITE_API_KEY: ${FILESERVER_MONITOR_API_KEY:-}
+        VITE_ACTOR_NAME: ${PUBLIC_WEB_ACTOR_NAME:-web-dev}
+    container_name: fileserver-monitor-web
+    ports:
+      - "${APP_WEB_PORT:-3300}:80"
+    depends_on:
+      api:
+        condition: service_started
+
+  api:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Api/Dockerfile
+    container_name: fileserver-monitor-api
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      Monitor__InMemoryMaxEvents: 10000
+      Auth__Enabled: ${AUTH_ENABLED:-false}
+      Auth__ApiKey: ${FILESERVER_MONITOR_API_KEY:-}
+      Auth__AdminApiKey: ${FILESERVER_MONITOR_ADMIN_API_KEY:-}
+      Cors__AllowedOrigins__0: http://localhost:${APP_WEB_PORT:-3300}
+      Cors__AllowedOrigins__1: http://localhost:5173
+      Cors__AllowedOrigins__2: http://localhost:4173
+      Cors__AllowedOrigins__3: http://127.0.0.1:${APP_WEB_PORT:-3300}
+      Cors__AllowedOrigins__4: http://127.0.0.1:5173
+      Cors__AllowedOrigins__5: http://127.0.0.1:4173
+      Agents__StaleMinutes: ${AGENTS_STALE_MINUTES:-10}
+      Agents__BacklogWarningThreshold: ${AGENTS_BACKLOG_WARNING_THRESHOLD:-1000}
+      Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
+      Notifications__WebhookUrl: ${NOTIFICATIONS_WEBHOOK_URL:-}
+      Notifications__Format: ${NOTIFICATIONS_FORMAT:-generic}
+      Notifications__MinimumSeverity: ${NOTIFICATIONS_MINIMUM_SEVERITY:-critical}
+      Retention__Enabled: ${RETENTION_ENABLED:-false}
+      Retention__EventsDays: ${RETENTION_EVENTS_DAYS:-180}
+      Retention__AlertsDays: ${RETENTION_ALERTS_DAYS:-365}
+      Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
+      Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
+      ConnectionStrings__SqlServer: Server=sqlserver,1433;Database=FileServerMonitor;User Id=sa;Password=${SQLSERVER_SA_PASSWORD};TrustServerCertificate=True;
+    ports:
+      - "${APP_API_PORT:-8180}:8080"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      sql-init:
+        condition: service_completed_successfully
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: fileserver-monitor-sql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${SQLSERVER_SA_PASSWORD}
+    ports:
+      - "14333:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$${MSSQL_SA_PASSWORD}\" -C -Q \"SELECT 1\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  sql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: fileserver-monitor-sql-init
+    environment:
+      SQLSERVER_SA_PASSWORD: ${SQLSERVER_SA_PASSWORD}
+    volumes:
+      - ./docker/sql:/docker-entrypoint-initdb.d:ro
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    command: >
+      /bin/bash -c '/opt/mssql-tools18/bin/sqlcmd
+      -S sqlserver,1433
+      -U sa
+      -P "$$SQLSERVER_SA_PASSWORD"
+      -C
+      -i /docker-entrypoint-initdb.d/001_create_schema.sql'
+
+volumes:
+  sqlserver-data:

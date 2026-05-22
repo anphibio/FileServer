@@ -1,0 +1,45 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Web/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${PUBLIC_PREVIEW_API_BASE_URL:-http://localhost:8081}
+        VITE_API_KEY: ${FILESERVER_MONITOR_API_KEY:-}
+        VITE_ACTOR_NAME: ${PUBLIC_WEB_ACTOR_NAME:-web-preview}
+    container_name: fileserver-monitor-web-preview
+    ports:
+      - "${PREVIEW_WEB_PORT:-3001}:80"
+    depends_on:
+      api:
+        condition: service_started
+
+  api:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Api/Dockerfile
+      args:
+        ENABLE_SQLSERVER: "false"
+    container_name: fileserver-monitor-api-preview
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      Monitor__StorageProvider: InMemory
+      Monitor__InMemoryMaxEvents: 20000
+      Auth__Enabled: ${AUTH_ENABLED:-false}
+      Auth__ApiKey: ${FILESERVER_MONITOR_API_KEY:-}
+      Auth__AdminApiKey: ${FILESERVER_MONITOR_ADMIN_API_KEY:-}
+      Cors__AllowedOrigins__0: http://localhost:${PREVIEW_WEB_PORT:-3001}
+      Cors__AllowedOrigins__1: http://127.0.0.1:${PREVIEW_WEB_PORT:-3001}
+      Agents__StaleMinutes: ${AGENTS_STALE_MINUTES:-10}
+      Agents__BacklogWarningThreshold: ${AGENTS_BACKLOG_WARNING_THRESHOLD:-1000}
+      Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
+      Notifications__WebhookUrl: ${NOTIFICATIONS_WEBHOOK_URL:-}
+      Notifications__Format: ${NOTIFICATIONS_FORMAT:-generic}
+      Notifications__MinimumSeverity: ${NOTIFICATIONS_MINIMUM_SEVERITY:-critical}
+      Retention__Enabled: ${RETENTION_ENABLED:-false}
+      Retention__EventsDays: ${RETENTION_EVENTS_DAYS:-180}
+      Retention__AlertsDays: ${RETENTION_ALERTS_DAYS:-365}
+      Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
+      Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
+    ports:
+      - "${PREVIEW_API_PORT:-8081}:8080"

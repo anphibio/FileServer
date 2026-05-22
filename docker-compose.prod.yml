@@ -1,0 +1,59 @@
+services:
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: fileserver-monitor-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/certs:/etc/nginx/certs:ro
+    depends_on:
+      web:
+        condition: service_started
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Web/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${PUBLIC_API_BASE_URL}
+        VITE_API_KEY: ${PUBLIC_WEB_API_KEY:-}
+        VITE_ACTOR_NAME: ${PUBLIC_WEB_ACTOR_NAME:-}
+    container_name: fileserver-monitor-web
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: src/FileServerMonitor.Api/Dockerfile
+    container_name: fileserver-monitor-api
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      Monitor__StorageProvider: SqlServer
+      Auth__Enabled: ${AUTH_ENABLED:-true}
+      Auth__ApiKey: ${FILESERVER_MONITOR_API_KEY}
+      Auth__AdminApiKey: ${FILESERVER_MONITOR_ADMIN_API_KEY:-}
+      Cors__AllowedOrigins__0: ${PUBLIC_WEB_ORIGIN}
+      ConnectionStrings__SqlServer: ${SQLSERVER_CONNECTION_STRING}
+      Alerts__WindowMinutes: ${ALERT_WINDOW_MINUTES:-5}
+      Alerts__DedupMinutes: ${ALERT_DEDUP_MINUTES:-10}
+      Alerts__MassDeleteThreshold: ${ALERT_MASS_DELETE_THRESHOLD:-50}
+      Alerts__MassRenameThreshold: ${ALERT_MASS_RENAME_THRESHOLD:-100}
+      Alerts__RansomwareActivityThreshold: ${ALERT_RANSOMWARE_ACTIVITY_THRESHOLD:-250}
+      Alerts__SuspiciousExtensionThreshold: ${ALERT_SUSPICIOUS_EXTENSION_THRESHOLD:-10}
+      Agents__StaleMinutes: ${AGENTS_STALE_MINUTES:-10}
+      Agents__BacklogWarningThreshold: ${AGENTS_BACKLOG_WARNING_THRESHOLD:-1000}
+      Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
+      Notifications__WebhookUrl: ${NOTIFICATIONS_WEBHOOK_URL:-}
+      Notifications__Format: ${NOTIFICATIONS_FORMAT:-generic}
+      Notifications__MinimumSeverity: ${NOTIFICATIONS_MINIMUM_SEVERITY:-critical}
+      Retention__Enabled: ${RETENTION_ENABLED:-true}
+      Retention__EventsDays: ${RETENTION_EVENTS_DAYS:-180}
+      Retention__AlertsDays: ${RETENTION_ALERTS_DAYS:-365}
+      Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
+      Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
+    restart: unless-stopped

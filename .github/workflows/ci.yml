@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup PowerShell
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y powershell
+          fi
+
+      - name: Restore API dependencies
+        run: dotnet restore src/FileServerMonitor.Api/FileServerMonitor.Api.csproj /p:EnableSqlServer=true
+
+      - name: Run validation
+        env:
+          VALIDATE_SQLSERVER: true
+        run: ./scripts/validate.sh

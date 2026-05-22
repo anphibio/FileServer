@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FileServerMonitor.Agent/FileServerMonitor.Agent.csproj" />
+    <Project Path="src/FileServerMonitor.Api/FileServerMonitor.Api.csproj" />
+    <Project Path="src/FileServerMonitor.Core/FileServerMonitor.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FileServerMonitor.Core.Tests/FileServerMonitor.Core.Tests.csproj" />
+  </Folder>
+</Solution>

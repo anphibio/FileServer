@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+compose_cmd() {
+  if command -v docker-compose >/dev/null 2>&1; then
+    docker-compose "$@"
+  else
+    docker compose "$@"
+  fi
+}
