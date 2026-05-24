@@ -2748,11 +2748,31 @@ function isRootOnlyNoise(
     return false;
   }
 
+  if (isShareRootPath(event)) {
+    return true;
+  }
+
   return cluster.some(({ event: candidate }) =>
     candidate.id !== event.id
     && isFileLikePath(candidate.path)
-    && getParentPath(candidate.path) === event.path
+    && normalizePath(getParentPath(candidate.path)) === normalizePath(event.path)
     && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000);
+}
+
+function isShareRootPath(event: FileAuditEvent) {
+  const shareName = event.share.trim().toLowerCase();
+  if (!shareName) {
+    return false;
+  }
+
+  const leafName = getLeafName(event.path).toLowerCase();
+  if (leafName !== shareName) {
+    return false;
+  }
+
+  const parentPath = normalizePath(getParentPath(event.path));
+  return /^[a-z]:$/i.test(parentPath)
+    || /^\\\\[^\\]+$/.test(parentPath);
 }
 
 function isRedundantParentCreate(
