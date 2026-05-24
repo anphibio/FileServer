@@ -2158,16 +2158,6 @@ function buildDisplayEvents(events: FileAuditEvent[]) {
       continue;
     }
 
-    if (current.source === "windows-security-log" && current.action === "deleted" && isFileLikePath(current.path)) {
-      const condensedTransition = tryBuildFileTransition(current, cluster);
-      if (condensedTransition) {
-        condensedTransition.consumedIndexes.forEach((clusterIndex) => consumed.add(clusterIndex));
-        emittedSemanticKeys.add(getSemanticEventKey(condensedTransition.event));
-        display.push(condensedTransition.event);
-        continue;
-      }
-    }
-
     if (isProvisionalDocumentNoise(current, ordered)) {
       consumed.add(index);
       continue;
@@ -2186,52 +2176,6 @@ function buildDisplayEvents(events: FileAuditEvent[]) {
     if (isRootOnlyNoise(current, cluster)) {
       consumed.add(index);
       continue;
-    }
-
-    if (current.source.includes("usn-journal") && isRenameLikeAction(current.action)) {
-      const clusterByUser = cluster
-        .filter(({ event }) => event.user === current.user || event.user === "UNKNOWN");
-
-      const deletedMatch = clusterByUser.find(({ event }) =>
-        event.source === "windows-security-log"
-        && event.action === "deleted"
-        && event.path !== current.path
-        && isFileLikePath(event.path)
-      );
-      const usnFileCandidates = clusterByUser
-        .filter(({ event }) =>
-          event.source.includes("usn-journal")
-          && isRenameLikeAction(event.action)
-          && isFileLikePath(event.path))
-        .map(({ event }) => event.path)
-        .filter(Boolean)
-        .filter((path, pathIndex, paths) => paths.findIndex((candidate) => candidate === path) === pathIndex);
-
-      if (deletedMatch && usnFileCandidates.length >= 2) {
-        const previousPath = deletedMatch.event.path;
-        const nextPath = usnFileCandidates.find((path) => path !== previousPath) ?? current.path;
-        const isProvisionalOrigin = isProvisionalDocumentName(previousPath) || isProvisionalFolderName(previousPath);
-        const consumedIndexes = clusterByUser
-          .filter(({ event }) =>
-            (event.source.includes("usn-journal") && usnFileCandidates.includes(event.path))
-            || (event.source === "windows-security-log" && event.action === "deleted" && event.path === previousPath)
-            || (event.source === "windows-security-log" && event.action === "created_or_appended" && event.path === getParentPath(previousPath))
-          )
-          .map(({ clusterIndex }) => clusterIndex);
-
-        consumedIndexes.forEach((clusterIndex) => consumed.add(clusterIndex));
-        display.push({
-          ...current,
-          id: `${current.id}-renamed`,
-          action: isProvisionalOrigin ? "created" : isMove(previousPath, nextPath) ? "moved" : "renamed",
-          previousPath: isProvisionalOrigin ? null : previousPath,
-          path: nextPath,
-          source: "usn-journal+security-log",
-          displayAction: isProvisionalOrigin ? "Criação" : isMove(previousPath, nextPath) ? "Movido" : "Renomeado",
-          displayTarget: getLeafName(nextPath)
-        });
-        continue;
-      }
     }
 
     if (isRedundantParentCreate(current, cluster)) {
@@ -2269,10 +2213,8 @@ function buildDisplayEvents(events: FileAuditEvent[]) {
 }
 
 function refineDisplayEvents(events: DisplayEvent[]) {
-  const normalized = events.map((event) => normalizeTransitionDirection(event, events));
-  const inferred = inferDisplayTransitions(normalized);
-  const withInferredRenames = inferMissingRenamesBeforeMoves(inferred);
-  const withResolvedUsers = resolveUnknownDisplayUsers(withInferredRenames);
+  const withProvisionalCreates = normalizeProvisionalCreateTransitions(events);
+  const withResolvedUsers = resolveUnknownDisplayUsers(withProvisionalCreates);
 
   return withResolvedUsers.filter((event, _, allEvents) =>
     !isTransientDisplayNoise(event)
@@ -2284,6 +2226,27 @@ function refineDisplayEvents(events: DisplayEvent[]) {
     && !isRedundantDisplayCreateEcho(event, allEvents)
     && !isRedundantDisplayChangedEcho(event, allEvents)
   );
+}
+
+function normalizeProvisionalCreateTransitions(events: DisplayEvent[]) {
+  return events.map((event) => {
+    if ((event.action !== "renamed" && event.action !== "moved") || !event.previousPath) {
+      return event;
+    }
+
+    const provisionalOrigin = isProvisionalDocumentName(event.previousPath) || isProvisionalFolderName(event.previousPath);
+    if (!provisionalOrigin) {
+      return event;
+    }
+
+    return {
+      ...event,
+      action: "created",
+      previousPath: null,
+      displayAction: "Criação",
+      displayTarget: getLeafName(event.path)
+    } satisfies DisplayEvent;
+  });
 }
 
 function resolveUnknownDisplayUsers(events: DisplayEvent[]) {
@@ -2312,8 +2275,8 @@ function resolveUnknownDisplayUsers(events: DisplayEvent[]) {
 }
 
 function hasRelatedDisplayPath(left: FileAuditEvent, right: FileAuditEvent) {
-  const leftPaths = [left.path, left.previousPath].filter(Boolean).map((path) => normalizePath(path));
-  const rightPaths = [right.path, right.previousPath].filter(Boolean).map((path) => normalizePath(path));
+  const leftPaths = [left.path, left.previousPath].filter(isPresentString).map((path) => normalizePath(path));
+  const rightPaths = [right.path, right.previousPath].filter(isPresentString).map((path) => normalizePath(path));
 
   return leftPaths.some((leftPath) =>
     rightPaths.some((rightPath) =>
@@ -2321,6 +2284,10 @@ function hasRelatedDisplayPath(left: FileAuditEvent, right: FileAuditEvent) {
       || rightPath.startsWith(`${leftPath}\\`)
       || leftPath.startsWith(`${rightPath}\\`)
       || normalizePath(getParentPath(leftPath)) === normalizePath(getParentPath(rightPath))));
+}
+
+function isPresentString(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function inferMissingRenamesBeforeMoves(events: DisplayEvent[]) {
@@ -2623,13 +2590,25 @@ function isRedundantDisplayProvisionalCreate(event: DisplayEvent, allEvents: Dis
   }
 
   const parentPath = normalizePath(getParentPath(event.path));
+  const eventTime = new Date(event.timestampUtc).getTime();
   return allEvents.some((candidate) =>
     candidate.id !== event.id
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 45_000
     && normalizePath(getParentPath(candidate.path)) === parentPath
-    && !isProvisionalDocumentName(candidate.path)
-    && !isProvisionalFolderName(candidate.path)
-    && (candidate.action === "created" || candidate.action === "renamed" || candidate.action === "moved"));
+    && (candidate.action === "created" || candidate.action === "renamed" || candidate.action === "moved")
+    && isRelatedToProvisionalCreate(event, candidate));
+}
+
+function isRelatedToProvisionalCreate(provisionalCreate: DisplayEvent, candidate: DisplayEvent) {
+  if (!isProvisionalDocumentName(candidate.path) && !isProvisionalFolderName(candidate.path)) {
+    return true;
+  }
+
+  if (!candidate.previousPath) {
+    return false;
+  }
+
+  return hasSameProvisionalFamily(provisionalCreate.path, candidate.previousPath);
 }
 
 function isRedundantDisplayRenameAfterCreate(event: DisplayEvent, allEvents: DisplayEvent[]) {
@@ -3238,9 +3217,49 @@ function isTransientContainerSegment(segment: string) {
 }
 
 function isProvisionalDocumentName(path: string) {
-  const leaf = getLeafName(path).toLowerCase();
-  return leaf === "novo documento de texto.txt"
-    || leaf === "new text document.txt";
+  return getProvisionalDocumentKind(path) !== null;
+}
+
+function hasSameProvisionalFamily(leftPath: string, rightPath: string) {
+  const leftKind = getProvisionalDocumentKind(leftPath);
+  const rightKind = getProvisionalDocumentKind(rightPath);
+  return leftKind !== null && leftKind === rightKind;
+}
+
+function getProvisionalDocumentKind(path: string) {
+  const baseLeaf = getLeafName(path)
+    .toLowerCase()
+    .replace(/ \(\d+\)(?=\.[^.]+$)/, "");
+
+  const provisionalKinds: Array<[string, RegExp[]]> = [
+    ["text", [
+      /^novo documento de texto\.txt$/,
+      /^new text document\.txt$/
+    ]],
+    ["excel", [
+      /^novo\(a\) planilha do microsoft excel.*\.xlsx$/,
+      /^new microsoft excel worksheet.*\.xlsx$/
+    ]],
+    ["word", [
+      /^novo\(a\) documento do microsoft word.*\.docx$/,
+      /^new microsoft word document.*\.docx$/
+    ]],
+    ["powerpoint", [
+      /^novo\(a\) apresenta.*microsoft powerpoint.*\.pptx$/,
+      /^new microsoft powerpoint presentation.*\.pptx$/
+    ]],
+    ["publisher", [
+      /^novo\(a\).*microsoft publisher document.*\.pub$/,
+      /^new microsoft publisher document.*\.pub$/
+    ]],
+    ["bitmap", [
+      /^nova imagem de bitmap.*\.bmp$/,
+      /^new bitmap image.*\.bmp$/
+    ]]
+  ];
+
+  return provisionalKinds.find(([, patterns]) =>
+    patterns.some((pattern) => pattern.test(baseLeaf)))?.[0] ?? null;
 }
 
 function isProvisionalFolderName(path: string) {

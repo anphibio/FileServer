@@ -44,7 +44,7 @@ public sealed class EventCorrelator
 
         if (securityEvents.Length == 0)
         {
-            return preparedEvents;
+            return preparedEvents.Select(FinalizeCorrelatedEvent).ToArray();
         }
 
         var matchedSecurityRecordIds = new HashSet<long>();
@@ -82,12 +82,14 @@ public sealed class EventCorrelator
                 SourceHost = item.SourceHost ?? match.SourceHost,
                 SourceIp = item.SourceIp ?? match.SourceIp,
                 ProcessName = item.ProcessName == "fsutil.exe" ? match.ProcessName : item.ProcessName,
+                Action = GetCorrelatedAction(item, match),
                 Severity = "info",
                 Source = "usn-journal+security-log"
             });
         }
 
         return correlatedEvents
+            .Select(FinalizeCorrelatedEvent)
             .Where(item =>
                 !item.CursorType.Equals("security", StringComparison.OrdinalIgnoreCase)
                 || item.RecordId is null
@@ -149,7 +151,7 @@ public sealed class EventCorrelator
                 yield return newEvent with
                 {
                     PreviousPath = oldEvent.Path,
-                    Action = "renamed",
+                    Action = ClassifyPathTransition(oldEvent.Path, newEvent.Path),
                     ObjectType = PromoteObjectType(oldEvent.ObjectType, newEvent.ObjectType)
                 };
 
@@ -231,10 +233,101 @@ public sealed class EventCorrelator
         inferredRename = newEvent with
         {
             PreviousPath = oldEvent.Path,
-            Action = "renamed",
+            Action = ClassifyPathTransition(oldEvent.Path, newEvent.Path),
             ObjectType = PromoteObjectType(oldEvent.ObjectType, newEvent.ObjectType)
         };
         return true;
+    }
+
+    private static CollectedFileEvent FinalizeCorrelatedEvent(CollectedFileEvent item)
+    {
+        if ((item.Action.Equals("changed", StringComparison.OrdinalIgnoreCase)
+                || item.Action.Equals("modified", StringComparison.OrdinalIgnoreCase))
+            && IsProvisionalDocumentPath(item.Path)
+            && string.IsNullOrWhiteSpace(item.PreviousPath))
+        {
+            return item with { Action = "created" };
+        }
+
+        if (item.Action.Equals("created", StringComparison.OrdinalIgnoreCase)
+            && IsProvisionalDocumentPath(item.PreviousPath))
+        {
+            return item with { PreviousPath = null };
+        }
+
+        return item;
+    }
+
+    private static string GetCorrelatedAction(CollectedFileEvent usnEvent, CollectedFileEvent securityEvent)
+    {
+        if ((usnEvent.Action.Equals("changed", StringComparison.OrdinalIgnoreCase)
+                || usnEvent.Action.Equals("modified", StringComparison.OrdinalIgnoreCase))
+            && securityEvent.Action.Equals("created_or_appended", StringComparison.OrdinalIgnoreCase)
+            && IsProvisionalDocumentPath(usnEvent.Path)
+            && NormalizePath(usnEvent.Path).Equals(NormalizePath(securityEvent.Path), StringComparison.OrdinalIgnoreCase))
+        {
+            return "created";
+        }
+
+        return usnEvent.Action;
+    }
+
+    private static string ClassifyPathTransition(string previousPath, string nextPath)
+    {
+        if (IsProvisionalDocumentPath(previousPath))
+        {
+            return "created";
+        }
+
+        return IsMove(previousPath, nextPath) ? "moved" : "renamed";
+    }
+
+    private static bool IsMove(string previousPath, string nextPath)
+    {
+        var previousParent = GetParentPath(previousPath);
+        var nextParent = GetParentPath(nextPath);
+
+        return !previousParent.Equals(nextParent, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetParentPath(string path)
+    {
+        var normalized = NormalizePath(path);
+        var separatorIndex = normalized.LastIndexOf('\\');
+
+        return separatorIndex <= 0 ? normalized : normalized[..separatorIndex];
+    }
+
+    private static bool IsProvisionalDocumentPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        var leafName = GetLeafName(path).ToLowerInvariant();
+
+        return leafName.StartsWith("novo documento de texto", StringComparison.Ordinal)
+            || leafName.StartsWith("new text document", StringComparison.Ordinal)
+            || leafName.StartsWith("nova imagem de bitmap", StringComparison.Ordinal)
+            || leafName.StartsWith("new bitmap image", StringComparison.Ordinal)
+            || leafName.StartsWith("novo(a) planilha do microsoft excel", StringComparison.Ordinal)
+            || leafName.StartsWith("new microsoft excel worksheet", StringComparison.Ordinal)
+            || leafName.StartsWith("novo(a) documento do microsoft word", StringComparison.Ordinal)
+            || leafName.StartsWith("new microsoft word document", StringComparison.Ordinal)
+            || (leafName.StartsWith("novo(a) apresenta", StringComparison.Ordinal)
+                && leafName.Contains("microsoft powerpoint", StringComparison.Ordinal))
+            || leafName.StartsWith("new microsoft powerpoint presentation", StringComparison.Ordinal)
+            || leafName.StartsWith("novo(a) microsoft publisher document", StringComparison.Ordinal)
+            || leafName.StartsWith("new microsoft publisher document", StringComparison.Ordinal);
+    }
+
+    private static string GetLeafName(string path)
+    {
+        var normalized = NormalizePath(path);
+        var separatorIndex = normalized.LastIndexOf('\\');
+
+        return separatorIndex < 0 ? normalized : normalized[(separatorIndex + 1)..];
     }
 
     private IEnumerable<int> FindRenameNoiseIndexes(

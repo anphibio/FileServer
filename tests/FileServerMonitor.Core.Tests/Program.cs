@@ -11,7 +11,13 @@ var tests = new (string Name, Action Test)[]
     ("nao correlaciona fora da janela", DoesNotCorrelateOutsideWindow),
     ("consolida rename do USN e suprime ruido do security log", CollapsesUsnRenameAndSuppressesSecurityNoise),
     ("consolida rename do USN mesmo com eventos intercalados", CollapsesUsnRenameWithInterleavedEvents),
-    ("infere rename a partir de ruído do USN com o mesmo file id", InfersRenameFromUsnNoiseWithSameFileId)
+    ("infere rename a partir de ruído do USN com o mesmo file id", InfersRenameFromUsnNoiseWithSameFileId),
+    ("trata nome provisorio de bitmap como criacao final", TreatsBitmapProvisionalRenameAsFinalCreation),
+    ("trata nome provisorio do Office como criacao final", TreatsOfficeProvisionalRenameAsFinalCreation),
+    ("trata alteracao de nome provisorio como criacao quando security log confirma criacao", TreatsProvisionalChangeAsCreationWhenSecurityShowsCreation),
+    ("trata nome provisorio mantido como criacao", TreatsKeptProvisionalNameAsCreation),
+    ("classifica rename entre pastas como movimentacao", ClassifiesCrossFolderRenameAsMove),
+    ("nao correlaciona arquivos diferentes por proximidade", DoesNotCorrelateDifferentFilesByTiming)
 };
 
 var failures = new List<string>();
@@ -216,6 +222,120 @@ static void InfersRenameFromUsnNoiseWithSameFileId()
     Assert(renamed.Source == "usn-journal+security-log", "Rename inferido deveria ser enriquecido pelo Security Log.");
     Assert(correlated.All(item => item.Action != "changed"), "Ruido bruto do USN deveria ser removido depois da inferencia do rename.");
     Assert(correlated.All(item => item.RecordId is not 10 and not 11), "Ruido do Security Log deveria ser suprimido para rename inferido.");
+}
+
+static void TreatsBitmapProvisionalRenameAsFinalCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\New Bitmap Image.bmp", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\New Bitmap Image.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "bitmap-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\Teste Bitmap.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "bitmap-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var created = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(created.Action == "created", "Rename de nome provisorio deveria virar criacao final.");
+    Assert(created.Path == "\\\\FS01\\Dados\\Teste Bitmap.bmp", "Criacao deveria apontar para o nome final.");
+    Assert(created.PreviousPath is null, "Criacao final nao deveria expor caminho anterior provisorio.");
+    Assert(created.User == "EMPRESA\\maria.silva", "Criacao final deveria herdar usuario do Security Log.");
+    Assert(correlated.All(item => item.RecordId is not 10), "Criacao provisoria do Security Log deveria ser suprimida.");
+}
+
+static void TreatsOfficeProvisionalRenameAsFinalCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel.xlsx", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel.xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "excel-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\Relatorio Final.xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "excel-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var created = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(created.Action == "created", "Rename de nome provisorio Office deveria virar criacao final.");
+    Assert(created.Path == "\\\\FS01\\Dados\\Relatorio Final.xlsx", "Criacao Office deveria apontar para o nome final.");
+    Assert(created.PreviousPath is null, "Criacao Office nao deveria expor caminho anterior provisorio.");
+    Assert(created.User == "EMPRESA\\maria.silva", "Criacao Office deveria herdar usuario do Security Log.");
+}
+
+static void TreatsProvisionalChangeAsCreationWhenSecurityShowsCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\Novo Documento de Texto.txt", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Novo Documento de Texto.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "changed", usn: 100, fileReferenceId: "text-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var created = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(created.Action == "created", "Alteracao de nome provisorio recem-criado deveria virar criacao.");
+    Assert(created.Path == "\\\\FS01\\Dados\\Novo Documento de Texto.txt", "Criacao deveria preservar o nome quando ele ainda e o atual.");
+    Assert(created.User == "EMPRESA\\maria.silva", "Criacao deveria herdar usuario do Security Log.");
+    Assert(correlated.All(item => item.RecordId is not 10), "Criacao ruidosa do Security Log deveria ser suprimida.");
+}
+
+static void TreatsKeptProvisionalNameAsCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("usn", timestamp, "\\\\FS01\\Dados\\Novo Documento de Texto.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "changed", usn: 100, fileReferenceId: "text-1"),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(2), "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "modified", usn: 101, fileReferenceId: "bitmap-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+
+    Assert(correlated.Length == 2, "Nomes provisorios mantidos deveriam continuar aparecendo.");
+    Assert(correlated.All(item => item.Action == "created"), "Nomes provisorios mantidos deveriam aparecer como criacao, nao alteracao.");
+}
+
+static void ClassifiesCrossFolderRenameAsMove()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("usn", timestamp, "\\\\FS01\\Dados\\teste-live-02.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "move-1", previousPath: null),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\RH\\teste-live-02.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "move-1"),
+        BuildCollectedEvent("security", timestamp.AddMilliseconds(150), "\\\\FS01\\Dados\\teste-live-02.txt", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "deleted", recordId: 20)
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var moved = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(moved.Action == "moved", "Rename entre pastas deveria ser classificado como movimentacao.");
+    Assert(moved.Path == "\\\\FS01\\Dados\\RH\\teste-live-02.txt", "Movimentacao deveria apontar para o destino.");
+    Assert(moved.PreviousPath == "\\\\FS01\\Dados\\teste-live-02.txt", "Movimentacao deveria preservar origem.");
+    Assert(moved.User == "EMPRESA\\maria.silva", "Movimentacao deveria herdar usuario do Security Log.");
+    Assert(correlated.All(item => item.RecordId is not 20), "Delete aparente usado na movimentacao deveria ser suprimido.");
+}
+
+static void DoesNotCorrelateDifferentFilesByTiming()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("usn", timestamp, "\\\\FS01\\Dados\\teste-live-02.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "changed", usn: 100, fileReferenceId: "txt-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "changed", usn: 101, fileReferenceId: "bmp-1"),
+        BuildCollectedEvent("security", timestamp.AddMilliseconds(150), "\\\\FS01\\Dados\\teste-live-02.txt", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "deleted", recordId: 20)
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+
+    Assert(correlated.All(item => item.Action != "renamed" && item.Action != "moved"), "Arquivos diferentes nao deveriam virar transicao.");
+    Assert(correlated.Any(item => item.Path == "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp"), "Evento do bitmap deveria permanecer independente.");
 }
 
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)
