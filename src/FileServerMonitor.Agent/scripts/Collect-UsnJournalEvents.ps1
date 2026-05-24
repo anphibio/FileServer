@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Volume,
 
+    [string]$BasePath,
+
     [long]$StartUsn = 0,
 
     [int]$MaxEvents = 200,
@@ -52,8 +54,12 @@ function Convert-ReasonToAction {
         return "deleted"
     }
 
-    if ($Reason -match "RENAME_OLD_NAME|RENAME_NEW_NAME|Renomear: nome antigo|Renomear: novo nome") {
-        return "renamed"
+    if ($Reason -match "RENAME_OLD_NAME|Renomear: nome antigo") {
+        return "renamed_old"
+    }
+
+    if ($Reason -match "RENAME_NEW_NAME|Renomear: novo nome") {
+        return "renamed_new"
     }
 
     if ($Reason -match "SECURITY_CHANGE|Alteração de segurança|Alteracao de seguranca") {
@@ -67,26 +73,6 @@ function Convert-ReasonToAction {
     return "changed"
 }
 
-function Test-RenameOldReason {
-    param([string]$Reason)
-
-    if ([string]::IsNullOrWhiteSpace($Reason)) {
-        return $false
-    }
-
-    return $Reason -match "RENAME_OLD_NAME|Renomear: nome antigo"
-}
-
-function Test-RenameNewReason {
-    param([string]$Reason)
-
-    if ([string]::IsNullOrWhiteSpace($Reason)) {
-        return $false
-    }
-
-    return $Reason -match "RENAME_NEW_NAME|Renomear: novo nome"
-}
-
 function Get-Extension {
     param([string]$Path)
 
@@ -95,6 +81,54 @@ function Get-Extension {
     }
 
     return [System.IO.Path]::GetExtension($Path)
+}
+
+function Normalize-ReferenceId {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    return ($Value -replace '\s+', '').Trim()
+}
+
+function Join-ResolvedPath {
+    param(
+        [string]$ParentPath,
+        [string]$Name,
+        [string]$FallbackBasePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return "$FallbackBasePath\"
+    }
+
+    if ([System.IO.Path]::IsPathRooted($Name)) {
+        return $Name
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ParentPath)) {
+        return Join-Path $ParentPath $Name
+    }
+
+    return Join-Path $FallbackBasePath $Name
+}
+
+function Is-MoveTransition {
+    param(
+        [string]$PreviousPath,
+        [string]$CurrentPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PreviousPath) -or [string]::IsNullOrWhiteSpace($CurrentPath)) {
+        return $false
+    }
+
+    $previousParent = [System.IO.Path]::GetDirectoryName($PreviousPath)
+    $currentParent = [System.IO.Path]::GetDirectoryName($CurrentPath)
+
+    return -not [string]::Equals($previousParent, $currentParent, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Normalize-Volume {
@@ -108,6 +142,11 @@ function Normalize-Volume {
 }
 
 $normalizedVolume = Normalize-Volume -Value $Volume
+$normalizedBasePath = if ([string]::IsNullOrWhiteSpace($BasePath)) {
+    $normalizedVolume
+} else {
+    Normalize-Volume -Value $BasePath
+}
 
 # fsutil usn readjournal e suportado no Windows Server 2022. A opcao csv existe em builds modernos
 # e facilita uma coleta inicial sem P/Invoke. Uma etapa posterior pode substituir isso por leitura nativa.
@@ -142,13 +181,14 @@ if ($headerIndex -lt 0) {
 
 $csvLines = $lines[$headerIndex..($lines.Count - 1)]
 $records = $csvLines | ConvertFrom-Csv
-$parsedRecords = foreach ($record in $records | Select-Object -First ([Math]::Max($MaxEvents * 4, $MaxEvents))) {
+$parsedRecords = foreach ($record in $records) {
     try {
         $usnValue = 0L
         $fileName = $null
         $reason = $null
         $timestampText = $null
         $fileId = $null
+        $parentFileId = $null
 
         foreach ($property in $record.PSObject.Properties) {
             switch -Regex ($property.Name) {
@@ -157,17 +197,12 @@ $parsedRecords = foreach ($record in $records | Select-Object -First ([Math]::Ma
                 "Reason|Motivo" { $reason = [string]$property.Value }
                 "Time.*Stamp|Date.*Time|Carimbo.*data.*hora" { if ($null -eq $timestampText) { $timestampText = [string]$property.Value } }
                 "File.*Reference|File.*ID|ID do arquivo" { if ($null -eq $fileId) { $fileId = [string]$property.Value } }
+                "Parent.*Reference|Parent.*ID|ID do arquivo pai" { if ($null -eq $parentFileId) { $parentFileId = [string]$property.Value } }
             }
         }
 
         if ($usnValue -le $StartUsn) {
             continue
-        }
-
-        $path = if ([string]::IsNullOrWhiteSpace($fileName)) {
-            "$normalizedVolume\"
-        } else {
-            Join-Path $normalizedVolume $fileName
         }
 
         [pscustomobject]@{
@@ -176,19 +211,22 @@ $parsedRecords = foreach ($record in $records | Select-Object -First ([Math]::Ma
             timestampUtc = Parse-UsnTimestamp -Value $timestampText
             server = $ServerName
             share = $DefaultShare
-            path = $path
+            path = $null
             previousPath = $null
             objectType = "unknown"
             action = Convert-ReasonToAction -Reason $reason
             reason = $reason
-            fileId = $fileId
+            fileId = Normalize-ReferenceId -Value $fileId
+            parentFileId = Normalize-ReferenceId -Value $parentFileId
+            fileName = $fileName
             user = "UNKNOWN"
             sid = $null
             sourceHost = $null
             sourceIp = $null
             processName = "fsutil.exe"
             fileSizeBytes = $null
-            extension = Get-Extension -Path $path
+            extension = $null
+            fileReferenceId = Normalize-ReferenceId -Value $fileId
             result = "success"
             severity = "info"
             source = "usn-journal"
@@ -198,78 +236,87 @@ $parsedRecords = foreach ($record in $records | Select-Object -First ([Math]::Ma
     }
 }
 
-$materializedRecords = @(
+$selectedRecords = @(
     $parsedRecords |
-        Sort-Object { [long]$_.usn } |
-        Select-Object -First $MaxEvents
+        Sort-Object { [long]$_.usn } -Descending |
+        Select-Object -First $MaxEvents |
+        Sort-Object { [long]$_.usn }
 )
 
-$result = New-Object System.Collections.Generic.List[object]
+$currentPathByFileId = @{}
+$pendingRenameOldPathByFileId = @{}
+$hydratedRecords = foreach ($record in $selectedRecords) {
+    $knownPath = if (-not [string]::IsNullOrWhiteSpace($record.fileId)) { $currentPathByFileId[$record.fileId] } else { $null }
+    $parentPath = if (-not [string]::IsNullOrWhiteSpace($record.parentFileId)) { $currentPathByFileId[$record.parentFileId] } else { $null }
+    $resolvedPath = Join-ResolvedPath -ParentPath $parentPath -Name $record.fileName -FallbackBasePath $normalizedBasePath
+    $resolvedAction = $record.action
+    $previousPath = $null
 
-for ($index = 0; $index -lt $materializedRecords.Count; $index++) {
-    $record = $materializedRecords[$index]
-    $isRenameOld = Test-RenameOldReason -Reason $record.reason
+    if (($record.action -eq "changed" -or $record.action -eq "modified" -or $record.action -eq "created") `
+        -and -not [string]::IsNullOrWhiteSpace($knownPath) `
+        -and -not [string]::Equals($knownPath, $resolvedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $previousPath = $knownPath
+        $resolvedAction = if (Is-MoveTransition -PreviousPath $knownPath -CurrentPath $resolvedPath) { "moved" } else { $record.action }
+    }
 
-    if ($record.action -eq "renamed" -and $isRenameOld -and $index + 1 -lt $materializedRecords.Count) {
-        $nextRecord = $materializedRecords[$index + 1]
-        $isRenameNew = Test-RenameNewReason -Reason $nextRecord.reason
+    if ($record.action -eq "renamed_old") {
+        $pendingRenameOldPathByFileId[$record.fileId] = if (-not [string]::IsNullOrWhiteSpace($knownPath)) { $knownPath } else { $resolvedPath }
+    }
 
-        if ($nextRecord.action -eq "renamed" -and $isRenameNew) {
-            $result.Add([pscustomobject]@{
-                cursorType = "usn"
-                usn = $nextRecord.usn
-                volume = $nextRecord.volume
-                timestampUtc = $nextRecord.timestampUtc.ToString("o")
-                server = $nextRecord.server
-                share = $nextRecord.share
-                path = $nextRecord.path
-                previousPath = $record.path
-                objectType = if ([string]::IsNullOrWhiteSpace($nextRecord.extension)) { "unknown" } else { "file" }
-                action = "renamed"
-                user = $nextRecord.user
-                sid = $nextRecord.sid
-                sourceHost = $nextRecord.sourceHost
-                sourceIp = $nextRecord.sourceIp
-                processName = $nextRecord.processName
-                fileSizeBytes = $nextRecord.fileSizeBytes
-                extension = $nextRecord.extension
-                result = $nextRecord.result
-                severity = $nextRecord.severity
-                source = $nextRecord.source
-            })
-            $index++
-            continue
+    if ($record.action -eq "renamed_new") {
+        if ($pendingRenameOldPathByFileId.ContainsKey($record.fileId)) {
+            $previousPath = $pendingRenameOldPathByFileId[$record.fileId]
+            $pendingRenameOldPathByFileId.Remove($record.fileId)
+            $resolvedAction = if (Is-MoveTransition -PreviousPath $previousPath -CurrentPath $resolvedPath) { "moved" } else { "renamed" }
+        } elseif (-not [string]::IsNullOrWhiteSpace($knownPath) `
+            -and -not [string]::Equals($knownPath, $resolvedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $previousPath = $knownPath
+            $resolvedAction = if (Is-MoveTransition -PreviousPath $knownPath -CurrentPath $resolvedPath) { "moved" } else { "renamed" }
         }
     }
 
-    $isRenameNewOnly = $record.action -eq "renamed" -and (Test-RenameNewReason -Reason $record.reason)
-    if ($isRenameNewOnly) {
-        continue
+    if ($record.action -eq "deleted" -and -not [string]::IsNullOrWhiteSpace($knownPath)) {
+        $resolvedPath = $knownPath
     }
 
-    $result.Add([pscustomobject]@{
+    if (-not [string]::IsNullOrWhiteSpace($record.fileId)) {
+        if ($record.action -eq "deleted") {
+            $currentPathByFileId.Remove($record.fileId)
+            $pendingRenameOldPathByFileId.Remove($record.fileId)
+        } else {
+            $currentPathByFileId[$record.fileId] = $resolvedPath
+        }
+    }
+
+    $extension = Get-Extension -Path $resolvedPath
+    $objectType = if ([string]::IsNullOrWhiteSpace($extension)) { "unknown" } else { "file" }
+
+    [pscustomobject]@{
         cursorType = "usn"
         usn = $record.usn
         volume = $record.volume
         timestampUtc = $record.timestampUtc.ToString("o")
         server = $record.server
         share = $record.share
-        path = $record.path
-        previousPath = $record.previousPath
-        objectType = if ([string]::IsNullOrWhiteSpace($record.extension)) { "unknown" } else { "file" }
-        action = $record.action
+        path = $resolvedPath
+        previousPath = $previousPath
+        objectType = $objectType
+        action = $resolvedAction
         user = $record.user
         sid = $record.sid
         sourceHost = $record.sourceHost
         sourceIp = $record.sourceIp
         processName = $record.processName
         fileSizeBytes = $record.fileSizeBytes
-        extension = $record.extension
+        extension = $extension
+        fileReferenceId = $record.fileReferenceId
         result = $record.result
         severity = $record.severity
         source = $record.source
-    })
+    }
 }
+
+$result = @($hydratedRecords)
 
 if ($result.Count -eq 0) {
     @() | ConvertTo-Json -Depth 8

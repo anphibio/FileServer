@@ -155,7 +155,9 @@ internal sealed class FileServerAgent
         {
             var scriptPath = Path.GetFullPath(_options.SecurityLogScriptPath);
             var arguments = BuildSecurityLogArguments(scriptPath);
-            collected.AddRange(await RunCollectorScriptAsync(arguments, cancellationToken));
+            var securityEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+            Console.WriteLine($"Coleta Security: lastRecordId={_state.LastRecordId}; recebidos={securityEvents.Count}");
+            collected.AddRange(securityEvents);
         }
 
         if (_options.EnableUsnJournalCollector)
@@ -163,8 +165,14 @@ internal sealed class FileServerAgent
             foreach (var volume in GetEffectiveUsnVolumes())
             {
                 var scriptPath = Path.GetFullPath(_options.UsnJournalScriptPath);
-                var arguments = BuildUsnJournalArguments(scriptPath, volume);
-                collected.AddRange(await RunCollectorScriptAsync(arguments, cancellationToken));
+                var startUsn = _state.LastUsnByVolume.TryGetValue(volume, out var value)
+                    ? value
+                    : 0;
+                var basePath = GetEffectiveUsnBasePath(volume);
+                var arguments = BuildUsnJournalArguments(scriptPath, volume, startUsn, basePath);
+                var usnEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+                Console.WriteLine($"Coleta USN: volume={volume}; startUsn={startUsn}; basePath={basePath}; recebidos={usnEvents.Count}");
+                collected.AddRange(usnEvents);
             }
         }
 
@@ -172,10 +180,14 @@ internal sealed class FileServerAgent
             ? CorrelateEvents(collected)
             : collected;
 
-        return FilterByRemoteConfig(output)
-            .OrderBy(item => item.TimestampUtc)
+        var filtered = FilterByRemoteConfig(output)
+            .OrderByDescending(item => item.TimestampUtc)
             .Take(_options.BatchSize)
+            .OrderBy(item => item.TimestampUtc)
             .ToArray();
+
+        Console.WriteLine($"Coleta final: brutos={collected.Count}; pos-correlacao={output.Count}; pos-filtro={filtered.Length}");
+        return filtered;
     }
 
     private async Task<IReadOnlyCollection<CollectedFileEvent>> RunCollectorScriptAsync(
@@ -245,12 +257,8 @@ internal sealed class FileServerAgent
         return string.Join(" ", parts);
     }
 
-    private string BuildUsnJournalArguments(string scriptPath, string volume)
+    private string BuildUsnJournalArguments(string scriptPath, string volume, long startUsn, string basePath)
     {
-        var startUsn = _state.LastUsnByVolume.TryGetValue(volume, out var value)
-            ? value
-            : 0;
-
         var parts = new List<string>
         {
             "-NoProfile",
@@ -259,6 +267,8 @@ internal sealed class FileServerAgent
             Quote(scriptPath),
             "-Volume",
             Quote(volume),
+            "-BasePath",
+            Quote(basePath),
             "-StartUsn",
             startUsn.ToString(),
             "-MaxEvents",
@@ -270,6 +280,30 @@ internal sealed class FileServerAgent
         };
 
         return string.Join(" ", parts);
+    }
+
+    private string GetEffectiveUsnBasePath(string volume)
+    {
+        var normalizedVolume = NormalizePathPrefix(volume);
+
+        if (_options.EnableRemoteConfig && (_remoteConfig?.MonitoredPaths.Length ?? 0) > 0)
+        {
+            var matchingPath = _remoteConfig!.MonitoredPaths
+                .Where(item => item.Status.Equals("active", StringComparison.OrdinalIgnoreCase))
+                .Select(item => NormalizePathPrefix(item.Path))
+                .Where(item =>
+                    !string.IsNullOrWhiteSpace(item)
+                    && item.StartsWith(normalizedVolume, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(item => item.Length)
+                .FirstOrDefault();
+
+            if (!string.IsNullOrWhiteSpace(matchingPath))
+            {
+                return matchingPath;
+            }
+        }
+
+        return normalizedVolume;
     }
 
     private async Task FlushQueueAsync(CancellationToken cancellationToken)
@@ -459,9 +493,13 @@ internal sealed class FileServerAgent
         return events
             .Where(item =>
             {
-                var eventPath = NormalizePathPrefix(item.Path);
-                return !string.IsNullOrWhiteSpace(eventPath)
-                    && roots.Any(root => eventPath.StartsWith(root, StringComparison.OrdinalIgnoreCase));
+                var candidates = new[] { NormalizePathPrefix(item.Path), NormalizePathPrefix(item.PreviousPath) }
+                    .Where(path => !string.IsNullOrWhiteSpace(path))
+                    .ToArray();
+
+                return candidates.Length > 0
+                    && roots.Any(root =>
+                        candidates.Any(candidate => candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase)));
             })
             .ToArray();
     }
@@ -522,6 +560,7 @@ internal sealed class FileServerAgent
             ProcessName: item.ProcessName,
             FileSizeBytes: item.FileSizeBytes,
             Extension: item.Extension,
+            FileReferenceId: item.FileReferenceId,
             Result: item.Result,
             Severity: item.Severity,
             Source: item.Source);
@@ -548,6 +587,7 @@ internal sealed class FileServerAgent
             ProcessName: item.ProcessName,
             FileSizeBytes: item.FileSizeBytes,
             Extension: item.Extension,
+            FileReferenceId: item.FileReferenceId,
             Result: item.Result,
             Severity: item.Severity,
             Source: item.Source);
@@ -812,6 +852,7 @@ internal sealed record CollectedFileEvent(
     string? ProcessName,
     long? FileSizeBytes,
     string? Extension,
+    string? FileReferenceId,
     string Result,
     string Severity,
     string Source)
