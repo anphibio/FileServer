@@ -2272,8 +2272,9 @@ function refineDisplayEvents(events: DisplayEvent[]) {
   const normalized = events.map((event) => normalizeTransitionDirection(event, events));
   const inferred = inferDisplayTransitions(normalized);
   const withInferredRenames = inferMissingRenamesBeforeMoves(inferred);
+  const withResolvedUsers = resolveUnknownDisplayUsers(withInferredRenames);
 
-  return withInferredRenames.filter((event, _, allEvents) =>
+  return withResolvedUsers.filter((event, _, allEvents) =>
     !isTransientDisplayNoise(event)
     && !isRedundantDisplayDeleted(event, allEvents)
     && !isSuspiciousMoveEcho(event, allEvents)
@@ -2283,6 +2284,43 @@ function refineDisplayEvents(events: DisplayEvent[]) {
     && !isRedundantDisplayCreateEcho(event, allEvents)
     && !isRedundantDisplayChangedEcho(event, allEvents)
   );
+}
+
+function resolveUnknownDisplayUsers(events: DisplayEvent[]) {
+  const userWindowMs = 60_000;
+
+  return events.map((event) => {
+    if (event.user !== "UNKNOWN") {
+      return event;
+    }
+
+    const eventTime = new Date(event.timestampUtc).getTime();
+    const userCandidate = events
+      .filter((candidate) =>
+        candidate.id !== event.id
+        && candidate.server === event.server
+        && candidate.share === event.share
+        && candidate.user !== "UNKNOWN"
+        && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= userWindowMs
+        && hasRelatedDisplayPath(event, candidate))
+      .sort((left, right) =>
+        Math.abs(new Date(left.timestampUtc).getTime() - eventTime)
+        - Math.abs(new Date(right.timestampUtc).getTime() - eventTime))[0];
+
+    return userCandidate ? { ...event, user: userCandidate.user } : event;
+  });
+}
+
+function hasRelatedDisplayPath(left: FileAuditEvent, right: FileAuditEvent) {
+  const leftPaths = [left.path, left.previousPath].filter(Boolean).map((path) => normalizePath(path));
+  const rightPaths = [right.path, right.previousPath].filter(Boolean).map((path) => normalizePath(path));
+
+  return leftPaths.some((leftPath) =>
+    rightPaths.some((rightPath) =>
+      leftPath === rightPath
+      || rightPath.startsWith(`${leftPath}\\`)
+      || leftPath.startsWith(`${rightPath}\\`)
+      || normalizePath(getParentPath(leftPath)) === normalizePath(getParentPath(rightPath))));
 }
 
 function inferMissingRenamesBeforeMoves(events: DisplayEvent[]) {
