@@ -733,6 +733,180 @@ test("suppresses destination folder create echoes when moving items into it", ()
   ]);
 });
 
+test("synthesizes descendant deletions after a folder with known children is moved", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-created",
+      timestampUtc: "2026-07-01T04:43:13.000Z",
+      path: "C:\\Corporativo\\teste",
+      action: "created",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "child-created",
+      timestampUtc: "2026-07-01T04:43:13.000Z",
+      path: "C:\\Corporativo\\teste\\Example txt file.txt",
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "folder-moved",
+      timestampUtc: "2026-07-01T04:44:47.000Z",
+      path: "C:\\Corporativo\\Example folder\\teste",
+      previousPath: "C:\\Corporativo\\teste",
+      action: "moved",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "folder-deleted",
+      timestampUtc: "2026-07-01T05:22:49.000Z",
+      path: "C:\\Corporativo\\Example folder\\teste",
+      action: "deleted",
+      source: "windows-security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  const deleted = display
+    .filter((event) => event.displayAction === "Excluído")
+    .map((event) => event.path)
+    .sort();
+
+  assert.deepEqual(deleted, [
+    "C:\\Corporativo\\Example folder\\teste",
+    "C:\\Corporativo\\Example folder\\teste\\Example txt file.txt"
+  ]);
+});
+
+test("does not revive descendants from an earlier deleted folder with the same name", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "old-folder-created",
+      timestampUtc: "2026-07-01T04:00:00.000Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "created",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "old-child-created",
+      timestampUtc: "2026-07-01T04:00:01.000Z",
+      path: "C:\\Corporativo\\Example folder\\old-child.txt",
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "old-folder-deleted",
+      timestampUtc: "2026-07-01T04:10:00.000Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "deleted",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "new-folder-created",
+      timestampUtc: "2026-07-01T04:20:00.000Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "created",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "new-folder-deleted",
+      timestampUtc: "2026-07-01T04:30:00.000Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "deleted",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  const latestDeleted = display
+    .filter((event) => event.displayAction === "Excluído")
+    .filter((event) => event.timestampUtc === "2026-07-01T04:30:00.000Z")
+    .map((event) => event.path)
+    .sort();
+
+  assert.deepEqual(latestDeleted, ["C:\\Corporativo\\Example folder"]);
+});
+
+test("reconstructs a folder move from security log signals and keeps descendants live", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-created",
+      timestampUtc: "2026-07-01T04:43:13.000Z",
+      path: "C:\\Corporativo\\teste",
+      action: "created",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "child-created",
+      timestampUtc: "2026-07-01T04:43:13.000Z",
+      path: "C:\\Corporativo\\teste\\Atesto.docx",
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "source-delete",
+      timestampUtc: "2026-07-01T05:06:56.330Z",
+      path: "C:\\Corporativo\\teste",
+      action: "deleted",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-folder-touch",
+      timestampUtc: "2026-07-01T05:06:56.330Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-access",
+      timestampUtc: "2026-07-01T05:06:56.347Z",
+      path: "C:\\Corporativo\\Example folder\\teste",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "ambiguous-usn-rename",
+      timestampUtc: "2026-07-01T05:06:56.000Z",
+      path: "C:\\Corporativo\\teste",
+      previousPath: "C:\\Corporativo\\teste",
+      action: "renamed",
+      source: "usn-journal",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-delete",
+      timestampUtc: "2026-07-01T05:22:49.000Z",
+      path: "C:\\Corporativo\\Example folder\\teste",
+      action: "deleted",
+      source: "windows-security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  const moved = display
+    .filter((event) => event.displayAction === "Movido")
+    .map((event) => [event.previousPath, event.path]);
+  const deleted = display
+    .filter((event) => event.displayAction === "Excluído")
+    .map((event) => event.path)
+    .sort();
+
+  assert.deepEqual(moved, [["C:\\Corporativo\\teste", "C:\\Corporativo\\Example folder\\teste"]]);
+  assert.deepEqual(deleted, [
+    "C:\\Corporativo\\Example folder\\teste",
+    "C:\\Corporativo\\Example folder\\teste\\Atesto.docx"
+  ]);
+});
+
 test("keeps moved provisional office document as moved", () => {
   const display = buildDisplayEvents([
     buildEvent({

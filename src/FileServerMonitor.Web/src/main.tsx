@@ -284,7 +284,7 @@ function App() {
     try {
       const [healthResult, eventsResult, alertsResult, alertRulesResult, agentsResult, pathsResult, summaryResult, anomaliesResult, auditResult] = await Promise.all([
         fetchJson<HealthResponse>("/health"),
-        fetchJson<FileAuditEvent[]>("/api/events?take=500"),
+        fetchJson<FileAuditEvent[]>("/api/events?take=5000"),
         fetchJson<FileServerAlert[]>("/api/alerts?take=100"),
         fetchJson<AlertRuleConfig[]>("/api/alert-rules"),
         fetchJson<AgentHealth[]>("/api/agents/health"),

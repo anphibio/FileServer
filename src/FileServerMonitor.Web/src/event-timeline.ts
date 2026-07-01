@@ -282,17 +282,11 @@ function getKnownLiveDescendantsBeforeDelete(folderDelete: DisplayEvent, events:
   for (const event of ordered) {
     if (event.action === "renamed" || event.action === "moved") {
       if (event.previousPath) {
+        relocateKnownLiveDescendants(livePaths, event.previousPath, event.path);
         livePaths.delete(normalizePath(event.previousPath));
       }
 
-      if (isDescendantPath(event.path, folderPath)) {
-        livePaths.set(normalizePath(event.path), event.path);
-      }
-
-      continue;
-    }
-
-    if (!isDescendantPath(event.path, folderPath)) {
+      livePaths.set(normalizePath(event.path), event.path);
       continue;
     }
 
@@ -302,11 +296,51 @@ function getKnownLiveDescendantsBeforeDelete(folderDelete: DisplayEvent, events:
     }
 
     if (event.action === "deleted") {
+      if (isFolderEvent(event)) {
+        removeKnownLivePathTree(livePaths, event.path);
+        continue;
+      }
+
       livePaths.delete(normalizePath(event.path));
     }
   }
 
-  return [...livePaths.values()];
+  return [...livePaths.values()].filter((path) => isDescendantPath(path, folderPath));
+}
+
+function removeKnownLivePathTree(livePaths: Map<string, string>, deletedPath: string) {
+  const deletedRoot = normalizePath(deletedPath);
+
+  for (const [normalizedPath, originalPath] of [...livePaths]) {
+    if (normalizedPath === deletedRoot || isDescendantPath(originalPath, deletedRoot)) {
+      livePaths.delete(normalizedPath);
+    }
+  }
+}
+
+function relocateKnownLiveDescendants(livePaths: Map<string, string>, previousPath: string, nextPath: string) {
+  const previousRoot = normalizePath(previousPath);
+  const nextRoot = normalizePath(nextPath);
+  const movedDescendants: Array<[string, string]> = [];
+
+  for (const [normalizedPath, originalPath] of livePaths) {
+    if (!isDescendantPath(originalPath, previousRoot)) {
+      continue;
+    }
+
+    const suffix = originalPath.slice(previousPath.length);
+    movedDescendants.push([normalizedPath, `${nextPath}${suffix}`]);
+  }
+
+  for (const [oldNormalizedPath, newPath] of movedDescendants) {
+    livePaths.delete(oldNormalizedPath);
+    livePaths.set(normalizePath(newPath), newPath);
+  }
+
+  if (livePaths.has(previousRoot)) {
+    livePaths.delete(previousRoot);
+    livePaths.set(nextRoot, nextPath);
+  }
 }
 
 function hasExplicitDescendantDelete(path: string, deleteTime: number, events: DisplayEvent[]) {
@@ -1422,31 +1456,30 @@ function tryBuildSecurityLogRenameTransition(
   const deleted = relevant.find(({ event }) =>
     event.action === "deleted"
     && event.source.includes("windows-security-log")
-    && isFileLikePath(event.path));
+    && sameObjectShape(event.path, current.path));
   if (!deleted) {
     return null;
   }
 
   const deletedTime = new Date(deleted.event.timestampUtc).getTime();
-  const deletedParent = normalizePath(getParentPath(deleted.event.path));
+  const targetParent = normalizePath(getParentPath(current.path));
   const deletedExtension = getPathExtension(deleted.event.path);
   const target = relevant.find(({ event }) =>
     event.action === "accessed"
     && event.source.includes("windows-security-log")
-    && isFileLikePath(event.path)
-    && normalizePath(getParentPath(event.path)) === deletedParent
-    && getPathExtension(event.path) === deletedExtension
+    && sameObjectShape(event.path, deleted.event.path)
     && !pathsReferToSameItem(event.path, deleted.event.path)
     && normalizeUser(event.user) === normalizeUser(deleted.event.user)
     && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500
-    && isLikelyRenameLeafVariant(deleted.event.path, event.path));
+    && isLikelySecurityTransitionTarget(deleted.event.path, event.path, deletedExtension));
   if (!target) {
     return null;
   }
 
+  const resolvedTargetParent = normalizePath(getParentPath(target.event.path));
   const hasParentTouch = relevant.some(({ event }) =>
     (event.action === "created_or_appended" || event.action === "modified")
-    && normalizePath(event.path) === deletedParent
+    && (normalizePath(event.path) === resolvedTargetParent || normalizePath(event.path) === targetParent)
     && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500);
   if (!hasParentTouch) {
     return null;
@@ -1456,21 +1489,39 @@ function tryBuildSecurityLogRenameTransition(
     .filter(({ event }) =>
       event.id === deleted.event.id
       || normalizePath(event.path) === normalizePath(target.event.path)
-      || (normalizePath(event.path) === deletedParent && (event.action === "created_or_appended" || event.action === "modified")))
+      || (normalizePath(event.path) === resolvedTargetParent && (event.action === "created_or_appended" || event.action === "modified"))
+      || ((event.action === "renamed" || event.action === "moved")
+        && pathsReferToSameItem(event.previousPath, deleted.event.path)
+        && (pathsReferToSameItem(event.path, deleted.event.path) || pathsReferToSameItem(event.path, target.event.path))))
     .map(({ clusterIndex }) => clusterIndex);
 
+  const action = isMove(deleted.event.path, target.event.path) ? "moved" : "renamed";
   return {
     consumedIndexes,
     event: {
       ...target.event,
       id: `${deleted.event.id}-${target.event.id}-security-rename`,
       timestampUtc: deleted.event.timestampUtc,
-      action: "renamed",
+      action,
       previousPath: deleted.event.path,
-      displayAction: "Renomeado",
+      displayAction: action === "moved" ? "Movido" : "Renomeado",
       displayTarget: getLeafName(target.event.path)
     } satisfies DisplayEvent
   };
+}
+
+function sameObjectShape(leftPath: string, rightPath: string) {
+  return isFileLikePath(leftPath) === isFileLikePath(rightPath);
+}
+
+function isLikelySecurityTransitionTarget(previousPath: string, nextPath: string, previousExtension: string) {
+  if (isFileLikePath(previousPath)) {
+    return normalizePath(getParentPath(nextPath)) === normalizePath(getParentPath(previousPath))
+      && getPathExtension(nextPath) === previousExtension
+      && isLikelyRenameLeafVariant(previousPath, nextPath);
+  }
+
+  return getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();
 }
 
 function shouldConsumeTransitionEvent(

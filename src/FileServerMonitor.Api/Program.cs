@@ -166,7 +166,7 @@ app.MapGet("/api/events", async (
         Path: path,
         FromUtc: fromUtc,
         ToUtc: toUtc,
-        Take: take is > 0 and <= 500 ? take.Value : 100);
+        Take: take is > 0 and <= 5_000 ? take.Value : 100);
 
     var events = await repository.QueryAsync(query, cancellationToken);
 
