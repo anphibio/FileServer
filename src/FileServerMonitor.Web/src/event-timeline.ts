@@ -137,6 +137,7 @@ function refineDisplayEvents(events: DisplayEvent[], rawEvents: FileAuditEvent[]
     && !isRedundantDisplayProvisionalCreate(event, allEvents)
     && !isRedundantDisplayRenameAfterCreate(event, allEvents)
     && !isRedundantDisplayCreateEcho(event, allEvents)
+    && !isRedundantDisplayAccessedEcho(event, allEvents)
     && !isRedundantDisplayChangedEcho(event, allEvents)
   );
 }
@@ -598,6 +599,19 @@ function isRedundantDisplayChangedEcho(event: DisplayEvent, allEvents: DisplayEv
       || candidate.action === "created"
       || candidate.action === "created_or_appended"
       || candidate.action === "deleted"));
+}
+
+function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
+  if (event.action !== "accessed") {
+    return false;
+  }
+
+  const eventTime = new Date(event.timestampUtc).getTime();
+  return allEvents.some((candidate) =>
+    candidate.id !== event.id
+    && (candidate.action === "created" || candidate.action === "created_or_appended")
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 2_000
+    && normalizePath(candidate.path) === normalizePath(event.path));
 }
 
 function deduplicateRawEvents(events: FileAuditEvent[]) {

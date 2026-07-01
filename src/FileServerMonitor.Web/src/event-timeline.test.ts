@@ -140,6 +140,28 @@ test("keeps accessed events with the file name visible", () => {
   assert.equal(display[0]?.displayTarget, "Novo Documento.txt");
 });
 
+test("does not let a near creation access echo replace the creation", () => {
+  const path = "C:\\Corporativo\\codex-create-action\\01-single-file.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "created",
+      timestampUtc: "2026-07-01T02:04:50.000Z",
+      path,
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "accessed-echo",
+      timestampUtc: "2026-07-01T02:04:50.640Z",
+      path,
+      action: "accessed",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => event.displayAction), ["Criação"]);
+});
+
 test("keeps a folder deletion when recursive cleanup also deletes its children", () => {
   const display = buildDisplayEvents([
     buildEvent({
