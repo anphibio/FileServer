@@ -606,6 +606,41 @@ test("does not synthesize creation when a rename origin has a nearby delete echo
   ]);
 });
 
+test("keeps a default-named folder rename as rename", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-rename-access",
+      timestampUtc: "2026-07-01T04:02:42.840Z",
+      path: "C:\\Corporativo\\Nova pasta - 10",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "folder-rename-delete-echo",
+      timestampUtc: "2026-07-01T04:02:42.840Z",
+      path: "C:\\Corporativo\\Nova pasta",
+      action: "deleted",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "folder-rename",
+      timestampUtc: "2026-07-01T04:02:42.000Z",
+      path: "C:\\Corporativo\\Nova pasta - 10",
+      previousPath: "C:\\Corporativo\\Nova pasta",
+      action: "renamed",
+      source: "usn-journal",
+      objectType: "folder",
+      user: "UNKNOWN"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.previousPath, event.displayAction]), [
+    ["C:\\Corporativo\\Nova pasta - 10", "C:\\Corporativo\\Nova pasta", "Renomeado"]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;

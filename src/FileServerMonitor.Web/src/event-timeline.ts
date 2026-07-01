@@ -523,7 +523,7 @@ function normalizeProvisionalCreateTransitions(events: DisplayEvent[]) {
       return event;
     }
 
-    const provisionalOrigin = isProvisionalDocumentName(event.previousPath) || isProvisionalFolderName(event.previousPath);
+  const provisionalOrigin = isProvisionalDocumentName(event.previousPath);
     if (!provisionalOrigin) {
       return event;
     }
@@ -803,7 +803,7 @@ function isRedundantDisplayRenameAfterCreate(event: DisplayEvent, allEvents: Dis
     return false;
   }
 
-  if (!isProvisionalDocumentName(event.previousPath) && !isProvisionalFolderName(event.previousPath)) {
+  if (!isProvisionalDocumentName(event.previousPath)) {
     return false;
   }
 
@@ -1176,7 +1176,7 @@ function isRedundantRenameAfterCreation(
     return false;
   }
 
-  const provisionalOrigin = isProvisionalDocumentName(current.previousPath) || isProvisionalFolderName(current.previousPath);
+  const provisionalOrigin = isProvisionalDocumentName(current.previousPath);
   if (!provisionalOrigin) {
     return false;
   }
@@ -1342,7 +1342,7 @@ function tryBuildExplicitTransition(
   }
 
   const nextPath = current.path;
-  const isProvisionalOrigin = isProvisionalDocumentName(previousPath) || isProvisionalFolderName(previousPath);
+  const isProvisionalOrigin = isProvisionalDocumentName(previousPath);
   const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
   const displayAction = isProvisionalOrigin
     ? "Criação"
