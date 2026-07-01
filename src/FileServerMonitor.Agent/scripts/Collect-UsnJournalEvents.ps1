@@ -20,6 +20,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $ptBrCulture = [System.Globalization.CultureInfo]::GetCultureInfo("pt-BR")
 $enUsCulture = [System.Globalization.CultureInfo]::GetCultureInfo("en-US")
@@ -185,6 +186,31 @@ function Resolve-PathByFileId {
     return $null
 }
 
+function Resolve-FileIdByPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    try {
+        $output = & fsutil file queryfileid $Path 2>$null
+
+        foreach ($line in @($output)) {
+            $text = [string]$line
+            $match = [regex]::Match($text, '0x([0-9A-Fa-f]+)')
+
+            if ($match.Success) {
+                return Normalize-ReferenceId -Value $match.Groups[1].Value
+            }
+        }
+    } catch {
+        return $null
+    }
+
+    return $null
+}
+
 function Add-ResolvedPath {
     param(
         [hashtable]$Map,
@@ -282,6 +308,7 @@ $parsedRecords = foreach ($record in $records) {
         $timestampText = $null
         $fileId = $null
         $parentFileId = $null
+        $fileAttributes = $null
 
         foreach ($property in $record.PSObject.Properties) {
             switch -Regex ($property.Name) {
@@ -291,6 +318,7 @@ $parsedRecords = foreach ($record in $records) {
                 "Time.*Stamp|Date.*Time|Carimbo.*data.*hora" { if ($null -eq $timestampText) { $timestampText = [string]$property.Value } }
                 "File.*Reference|File.*ID|ID do arquivo" { if ($null -eq $fileId) { $fileId = [string]$property.Value } }
                 "Parent.*Reference|Parent.*ID|ID do arquivo pai" { if ($null -eq $parentFileId) { $parentFileId = [string]$property.Value } }
+                "File.*Attributes$|Atributos.*arquivo" { if ($null -eq $fileAttributes) { $fileAttributes = [string]$property.Value } }
             }
         }
 
@@ -309,6 +337,7 @@ $parsedRecords = foreach ($record in $records) {
             objectType = "unknown"
             action = Convert-ReasonToAction -Reason $reason
             reason = $reason
+            fileAttributes = $fileAttributes
             fileId = Normalize-ReferenceId -Value $fileId
             parentFileId = Normalize-ReferenceId -Value $parentFileId
             fileName = $fileName
@@ -329,7 +358,7 @@ $parsedRecords = foreach ($record in $records) {
     }
 }
 
-$scanLimit = [Math]::Max($MaxEvents * 20, $MaxEvents)
+$scanLimit = [Math]::Max($MaxEvents * 250, 5000)
 $selectedRecords = @(
     $parsedRecords |
         Sort-Object { [long]$_.usn } |
@@ -350,15 +379,9 @@ if (-not [string]::IsNullOrWhiteSpace($KnownPathByFileIdJson)) {
     }
 }
 
-foreach ($record in $selectedRecords) {
-    foreach ($id in @($record.parentFileId, $record.fileId)) {
-        if ([string]::IsNullOrWhiteSpace($id) -or $currentPathByFileId.ContainsKey($id)) {
-            continue
-        }
-
-        $resolved = Resolve-PathByFileId -Volume $normalizedVolume -FileId $id
-        Add-ResolvedPath -Map $currentPathByFileId -FileId $id -Path $resolved -BasePath $normalizedBasePath
-    }
+if ([string]::IsNullOrWhiteSpace($RawCsvPath)) {
+    $baseFileId = Resolve-FileIdByPath -Path $normalizedBasePath
+    Add-ResolvedPath -Map $currentPathByFileId -FileId $baseFileId -Path $normalizedBasePath -BasePath $normalizedBasePath
 }
 
 $hydratedRecords = foreach ($record in $selectedRecords) {
@@ -414,7 +437,13 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
     }
 
     $extension = Get-Extension -Path $resolvedPath
-    $objectType = if ([string]::IsNullOrWhiteSpace($extension)) { "unknown" } else { "file" }
+    $objectType = if ($record.fileAttributes -match "Directory|Diretório|Diretorio") {
+        "folder"
+    } elseif ([string]::IsNullOrWhiteSpace($extension)) {
+        "unknown"
+    } else {
+        "file"
+    }
 
     [pscustomobject]@{
         cursorType = "usn"
