@@ -508,6 +508,38 @@ test("synthesizes initial creation from a normal rename previous path", () => {
   assert.equal(display[1]?.path, "E:\\Corporativo\\teste-rename-origem.txt");
 });
 
+test("suppresses access echoes immediately after a normal rename", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "rename-access-later",
+      timestampUtc: "2026-07-01T03:37:06.887Z",
+      path: "C:\\Corporativo\\codex-client-check-010.txt",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "rename-access",
+      timestampUtc: "2026-07-01T03:37:05.873Z",
+      path: "C:\\Corporativo\\codex-client-check-010.txt",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "rename-final",
+      timestampUtc: "2026-07-01T03:37:05.000Z",
+      path: "C:\\Corporativo\\codex-client-check-010.txt",
+      previousPath: "C:\\Corporativo\\codex-client-check-01.txt",
+      action: "renamed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\codex-client-check-010.txt", "Renomeado"],
+    ["C:\\Corporativo\\codex-client-check-01.txt", "Criação"]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;

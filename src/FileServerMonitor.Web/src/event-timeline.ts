@@ -890,7 +890,10 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
   const eventTime = new Date(event.timestampUtc).getTime();
   return allEvents.some((candidate) =>
     candidate.id !== event.id
-    && (candidate.action === "created" || candidate.action === "created_or_appended")
+    && (candidate.action === "created"
+      || candidate.action === "created_or_appended"
+      || candidate.action === "renamed"
+      || candidate.action === "moved")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
     && pathsReferToSameItem(candidate.path, event.path));
 }
