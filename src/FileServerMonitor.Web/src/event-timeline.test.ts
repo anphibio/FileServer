@@ -18,6 +18,10 @@ function buildEvent(overrides: Partial<FileAuditEvent> & Pick<FileAuditEvent, "i
   };
 }
 
+function getTestParentPath(path: string) {
+  return path.split("\\").slice(0, -1).join("\\");
+}
+
 test("promotes direct final-name creations in the full timeline pipeline", () => {
   const display = buildDisplayEvents([
     buildEvent({
@@ -373,6 +377,65 @@ test("keeps deletion of an empty Windows default-named folder", () => {
 
   assert.deepEqual(display.map((event) => event.displayAction), ["Excluído"]);
   assert.equal(display[0]?.path, path);
+});
+
+test("synthesizes descendant deletions when Windows only reports recursive folder deletes", () => {
+  const paths = [
+    "C:\\Corporativo\\Anderson Fábio Costa Bandeira - Sobreaviso XX-2026.xlsx",
+    "C:\\Corporativo\\codex-client-check-01.txt",
+    "C:\\Corporativo\\codex-client-check-02.md",
+    "C:\\Corporativo\\codex-client-check-03.yml",
+    "C:\\Corporativo\\Modelo Relatório Tecnico.docx",
+    "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx",
+    "C:\\Corporativo\\Example folder",
+    "C:\\Corporativo\\Example folder\\Another example txt file.txt",
+    "C:\\Corporativo\\Example folder\\Example txt file.txt",
+    "C:\\Corporativo\\Nova pasta",
+    "C:\\Corporativo\\teste",
+    "C:\\Corporativo\\teste\\Another example txt file.txt",
+    "C:\\Corporativo\\teste\\Atesto_Datacom_XXX-2026.docx",
+    "C:\\Corporativo\\teste\\Atesto_Wenet_XXX2025.docx",
+    "C:\\Corporativo\\teste\\Example txt file.txt"
+  ];
+  const rootFiles = paths.filter((path) => getTestParentPath(path) === "C:\\Corporativo" && path.includes("."));
+  const deletedFolders = [
+    "C:\\Corporativo\\Example folder",
+    "C:\\Corporativo\\Nova pasta",
+    "C:\\Corporativo\\teste"
+  ];
+  const display = buildDisplayEvents([
+    ...paths.map((path, index) => buildEvent({
+      id: `created-${index}`,
+      timestampUtc: "2026-07-01T02:20:12.000Z",
+      path,
+      objectType: path.includes(".") ? "file" : "folder",
+      action: "created",
+      source: "usn-journal"
+    })),
+    ...rootFiles.map((path, index) => buildEvent({
+      id: `root-file-deleted-${index}`,
+      timestampUtc: "2026-07-01T02:31:32.000Z",
+      path,
+      objectType: "file",
+      action: "deleted",
+      source: "usn-journal"
+    })),
+    ...deletedFolders.map((path, index) => buildEvent({
+      id: `folder-deleted-${index}`,
+      timestampUtc: "2026-07-01T02:31:32.000Z",
+      path,
+      objectType: "folder",
+      action: "deleted",
+      source: "usn-journal+security-log"
+    }))
+  ]);
+
+  const deleted = display
+    .filter((event) => event.displayAction === "Excluído")
+    .map((event) => event.path)
+    .sort();
+
+  assert.deepEqual(deleted, paths.sort());
 });
 
 test("keeps folder creation when files are created inside it in the same batch", () => {

@@ -36,13 +36,6 @@ Set-Content -Path (Join-Path \$root "05-tree\\sub-b\\child-b.xlsx") -Value "chil
 
 Start-Sleep -Seconds 3
 
-Remove-Item (Join-Path \$root "01-single-file.txt") -Force
-Remove-Item (Join-Path \$root "02-many-files\\a.txt") -Force
-Remove-Item (Join-Path \$root "02-many-files\\b.md") -Force
-Remove-Item (Join-Path \$root "02-many-files\\c.yml") -Force
-Remove-Item (Join-Path \$root "03-empty-folder") -Recurse -Force
-Remove-Item (Join-Path \$root "04-folder-with-file") -Recurse -Force
-Remove-Item (Join-Path \$root "05-tree") -Recurse -Force
 Remove-Item \$root -Recurse -Force
 
 Write-Output \$root

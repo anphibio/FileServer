@@ -125,12 +125,14 @@ function refineDisplayEvents(events: DisplayEvent[], rawEvents: FileAuditEvent[]
   const withProvisionalCreates = normalizeProvisionalCreateTransitions(events);
   const withResolvedUsers = resolveUnknownDisplayUsers(withProvisionalCreates);
   const withSyntheticCreations = synthesizeLikelyCreations(withResolvedUsers, rawEvents);
-  const withPromotedCreations = promoteLikelyInitialCreations(withSyntheticCreations);
+  const withSyntheticDeletes = synthesizeLikelyDescendantDeletions(withSyntheticCreations);
+  const withPromotedCreations = promoteLikelyInitialCreations(withSyntheticDeletes);
 
   return withPromotedCreations.filter((event, _, allEvents) =>
     !isTransientDisplayNoise(event)
     && !isRedundantDisplayPermissionEcho(event, allEvents)
     && !isRedundantDisplayDeleted(event, allEvents)
+    && !isRedundantDisplayDeletedDuplicate(event, allEvents)
     && !isRedundantDisplayProvisionalDelete(event, allEvents)
     && !isSuspiciousMoveEcho(event, allEvents)
     && !isRedundantDisplayFolderChangedEcho(event, allEvents)
@@ -228,6 +230,102 @@ function buildSyntheticCreationEvent(event: FileAuditEvent, path: string, timest
     displayAction: "Criação",
     displayTarget: getLeafName(path)
   } satisfies DisplayEvent;
+}
+
+function synthesizeLikelyDescendantDeletions(events: DisplayEvent[]) {
+  const synthetic = new Map<string, DisplayEvent>();
+
+  for (const event of events) {
+    if (event.action !== "deleted" || !isFolderEvent(event)) {
+      continue;
+    }
+
+    const eventTime = new Date(event.timestampUtc).getTime();
+    const descendants = getKnownLiveDescendantsBeforeDelete(event, events);
+
+    for (const descendantPath of descendants) {
+      if (hasExplicitDescendantDelete(descendantPath, eventTime, events)) {
+        continue;
+      }
+
+      const candidate = buildSyntheticDeletionEvent(event, descendantPath);
+      synthetic.set(getSyntheticDeletionKey(candidate), candidate);
+    }
+  }
+
+  if (synthetic.size === 0) {
+    return events;
+  }
+
+  return [...events, ...synthetic.values()].sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime());
+}
+
+function getKnownLiveDescendantsBeforeDelete(folderDelete: DisplayEvent, events: DisplayEvent[]) {
+  const folderPath = normalizePath(folderDelete.path);
+  const deleteTime = new Date(folderDelete.timestampUtc).getTime();
+  const livePaths = new Map<string, string>();
+  const ordered = [...events]
+    .filter((event) => event.id !== folderDelete.id)
+    .filter((event) => new Date(event.timestampUtc).getTime() < deleteTime)
+    .sort((left, right) => new Date(left.timestampUtc).getTime() - new Date(right.timestampUtc).getTime());
+
+  for (const event of ordered) {
+    if (event.action === "renamed" || event.action === "moved") {
+      if (event.previousPath) {
+        livePaths.delete(normalizePath(event.previousPath));
+      }
+
+      if (isDescendantPath(event.path, folderPath)) {
+        livePaths.set(normalizePath(event.path), event.path);
+      }
+
+      continue;
+    }
+
+    if (!isDescendantPath(event.path, folderPath)) {
+      continue;
+    }
+
+    if (event.action === "created" || event.action === "created_or_appended") {
+      livePaths.set(normalizePath(event.path), event.path);
+      continue;
+    }
+
+    if (event.action === "deleted") {
+      livePaths.delete(normalizePath(event.path));
+    }
+  }
+
+  return [...livePaths.values()];
+}
+
+function hasExplicitDescendantDelete(path: string, deleteTime: number, events: DisplayEvent[]) {
+  const normalizedPath = normalizePath(path);
+
+  return events.some((event) =>
+    event.action === "deleted"
+    && !event.id.includes("-synthetic-deleted-")
+    && normalizePath(event.path) === normalizedPath
+    && Math.abs(new Date(event.timestampUtc).getTime() - deleteTime) <= 60_000);
+}
+
+function buildSyntheticDeletionEvent(folderDelete: DisplayEvent, path: string) {
+  return {
+    ...folderDelete,
+    id: `${folderDelete.id}-synthetic-deleted-${normalizePath(path)}`,
+    path,
+    previousPath: null,
+    objectType: isFileLikePath(path) ? "file" : "folder",
+    action: "deleted",
+    displayAction: "Excluído",
+    displayTarget: getLeafName(path)
+  } satisfies DisplayEvent;
+}
+
+function getSyntheticDeletionKey(event: DisplayEvent) {
+  const timestamp = new Date(event.timestampUtc);
+  timestamp.setMilliseconds(0);
+  return ["synthetic-deleted", normalizePath(event.path), timestamp.toISOString()].join("|");
 }
 
 function hasDisplayCreation(events: DisplayEvent[], path: string) {
@@ -550,6 +648,39 @@ function isRedundantDisplayDeleted(event: DisplayEvent, allEvents: DisplayEvent[
     && normalizePath(candidate.previousPath) === normalizePath(event.path));
 }
 
+function isRedundantDisplayDeletedDuplicate(event: DisplayEvent, allEvents: DisplayEvent[]) {
+  if (event.action !== "deleted") {
+    return false;
+  }
+
+  const eventTime = new Date(event.timestampUtc).getTime();
+  return allEvents.some((candidate) => {
+    if (candidate.id === event.id || candidate.action !== "deleted") {
+      return false;
+    }
+
+    if (Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) > 5_000) {
+      return false;
+    }
+
+    if (!pathsReferToSameItem(candidate.path, event.path)) {
+      return false;
+    }
+
+    if (hasReplacementCharacter(event.path) !== hasReplacementCharacter(candidate.path)) {
+      return hasReplacementCharacter(event.path);
+    }
+
+    const candidateWeight = getEventWeight(candidate);
+    const eventWeight = getEventWeight(event);
+    if (candidateWeight !== eventWeight) {
+      return candidateWeight > eventWeight;
+    }
+
+    return new Date(candidate.timestampUtc).getTime() < eventTime;
+  });
+}
+
 function isRedundantDisplayProvisionalDelete(event: DisplayEvent, allEvents: DisplayEvent[]) {
   if (event.action !== "deleted") {
     return false;
@@ -563,6 +694,16 @@ function isRedundantDisplayProvisionalDelete(event: DisplayEvent, allEvents: Dis
   const eventTime = new Date(event.timestampUtc).getTime();
   const eventParent = normalizePath(getParentPath(event.path));
   const eventExtension = getPathExtension(event.path);
+
+  const samePathCreation = allEvents.some((candidate) =>
+    candidate.id !== event.id
+    && (candidate.action === "created" || candidate.action === "created_or_appended")
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 300_000
+    && pathsReferToSameItem(candidate.path, event.path));
+
+  if (samePathCreation) {
+    return false;
+  }
 
   return allEvents.some((candidate) => {
     if (candidate.id === event.id) {
@@ -877,8 +1018,18 @@ function isLikelyFolderPath(path: string) {
   return !getLeafName(path).includes(".");
 }
 
+function isFolderEvent(event: FileAuditEvent) {
+  return event.objectType === "folder"
+    || event.objectType === "directory"
+    || isLikelyFolderPath(event.path);
+}
+
 function isFileLikePath(path: string) {
   return getLeafName(path).includes(".");
+}
+
+function isDescendantPath(path: string, parentPath: string) {
+  return normalizePath(path).startsWith(`${parentPath}\\`);
 }
 
 function getPathExtension(path: string) {
