@@ -212,6 +212,42 @@ test("collapses folder delete duplicates when security and usn timestamps differ
   assert.equal(display[0]?.user, "FILESERVER\\AnphibiO");
 });
 
+test("keeps deletion of an empty Windows default-named folder", () => {
+  const path = "C:\\Corporativo\\Nova pasta";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "nova-pasta-security-accessed",
+      timestampUtc: "2026-07-01T01:29:06.723Z",
+      path,
+      objectType: "file",
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    }),
+    buildEvent({
+      id: "nova-pasta-security-delete",
+      timestampUtc: "2026-07-01T01:29:06.810Z",
+      path,
+      objectType: "file",
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    }),
+    buildEvent({
+      id: "nova-pasta-usn-delete",
+      timestampUtc: "2026-07-01T01:29:06.000Z",
+      path,
+      objectType: "folder",
+      action: "deleted",
+      source: "usn-journal+security-log",
+      user: "FILESERVER\\AnphibiO"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => event.displayAction), ["Excluído"]);
+  assert.equal(display[0]?.path, path);
+});
+
 test("keeps initial creation before a normal rename", () => {
   const display = buildDisplayEvents([
     buildEvent({

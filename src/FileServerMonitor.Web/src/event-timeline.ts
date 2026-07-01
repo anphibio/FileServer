@@ -816,7 +816,7 @@ function isProvisionalDocumentNoise(
     return shouldSuppressProvisionalCreate(current, ordered);
   }
 
-  if (current.action === "deleted" && provisionalKind === "text") {
+  if (current.action === "deleted") {
     return false;
   }
 
