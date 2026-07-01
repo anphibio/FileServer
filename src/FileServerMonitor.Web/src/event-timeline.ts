@@ -645,7 +645,7 @@ function isRedundantDisplayDeleted(event: DisplayEvent, allEvents: DisplayEvent[
     candidate.id !== event.id
     && (candidate.action === "renamed" || candidate.action === "moved")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.previousPath) === normalizePath(event.path));
+    && pathsReferToSameItem(candidate.previousPath, event.path));
 }
 
 function isRedundantDisplayDeletedDuplicate(event: DisplayEvent, allEvents: DisplayEvent[]) {

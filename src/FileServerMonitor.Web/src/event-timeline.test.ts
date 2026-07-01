@@ -540,6 +540,31 @@ test("suppresses access echoes immediately after a normal rename", () => {
   ]);
 });
 
+test("suppresses security delete echoes after a rename with mojibake accents", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "rename-delete-echo",
+      timestampUtc: "2026-07-01T03:46:02.947Z",
+      path: "C:\\Corporativo\\Modelo Relat�rio Tecnico.docx",
+      action: "deleted",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "rename-final",
+      timestampUtc: "2026-07-01T03:46:02.000Z",
+      path: "C:\\Corporativo\\Modelo Relatório Tecnico20.docx",
+      previousPath: "C:\\Corporativo\\Modelo Relatório Tecnico.docx",
+      action: "renamed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\Modelo Relatório Tecnico20.docx", "Renomeado"],
+    ["C:\\Corporativo\\Modelo Relatório Tecnico.docx", "Criação"]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
