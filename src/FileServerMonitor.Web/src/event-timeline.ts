@@ -828,6 +828,10 @@ function isRedundantDisplayFolderChangedEcho(event: DisplayEvent, allEvents: Dis
     return false;
   }
 
+  if (event.source.includes("usn-journal")) {
+    return true;
+  }
+
   const folderPath = normalizePath(event.path);
   const eventTime = new Date(event.timestampUtc).getTime();
   return allEvents.some((candidate) =>
@@ -1418,6 +1422,11 @@ function tryBuildExplicitTransition(
     return null;
   }
 
+  const ambiguousTransition = tryBuildAmbiguousSamePathTransition(current, relevant);
+  if (ambiguousTransition) {
+    return ambiguousTransition;
+  }
+
   const previousPath = current.previousPath ?? "";
   const isFileTransition = isFileLikePath(current.path) && isFileLikePath(previousPath);
   const isFolderTransition = isLikelyFolderPath(current.path) && isLikelyFolderPath(previousPath);
@@ -1450,6 +1459,61 @@ function tryBuildExplicitTransition(
       path: nextPath,
       displayAction,
       displayTarget: getLeafName(nextPath)
+    } satisfies DisplayEvent
+  };
+}
+
+function tryBuildAmbiguousSamePathTransition(
+  current: FileAuditEvent,
+  relevant: Array<{ event: FileAuditEvent; clusterIndex: number }>
+) {
+  if (!current.previousPath || !pathsReferToSameItem(current.previousPath, current.path)) {
+    return null;
+  }
+
+  const currentTime = new Date(current.timestampUtc).getTime();
+  const target = relevant.find(({ event }) =>
+    event.id !== current.id
+    && event.action === "accessed"
+    && event.source.includes("windows-security-log")
+    && sameObjectShape(event.path, current.path)
+    && !pathsReferToSameItem(event.path, current.path)
+    && getLeafName(event.path).toLowerCase() === getLeafName(current.path).toLowerCase()
+    && Math.abs(new Date(event.timestampUtc).getTime() - currentTime) <= 2_500);
+  if (!target) {
+    return null;
+  }
+
+  const targetParent = normalizePath(getParentPath(target.event.path));
+  const hasParentTouch = relevant.some(({ event }) =>
+    event.id !== current.id
+    && (event.action === "created_or_appended" || event.action === "modified")
+    && normalizePath(event.path) === targetParent
+    && Math.abs(new Date(event.timestampUtc).getTime() - currentTime) <= 2_500);
+  if (!hasParentTouch) {
+    return null;
+  }
+
+  const consumedIndexes = relevant
+    .filter(({ event }) =>
+      event.id === current.id
+      || (normalizePath(event.path) === normalizePath(target.event.path)
+        && Math.abs(new Date(event.timestampUtc).getTime() - currentTime) <= 2_500)
+      || (normalizePath(event.path) === targetParent
+        && (event.action === "created_or_appended" || event.action === "modified")
+        && Math.abs(new Date(event.timestampUtc).getTime() - currentTime) <= 2_500))
+    .map(({ clusterIndex }) => clusterIndex);
+
+  return {
+    consumedIndexes,
+    event: {
+      ...target.event,
+      id: `${current.id}-${target.event.id}-ambiguous-move`,
+      timestampUtc: current.timestampUtc,
+      action: "moved",
+      previousPath: current.previousPath,
+      displayAction: "Movido",
+      displayTarget: getLeafName(target.event.path)
     } satisfies DisplayEvent
   };
 }
@@ -1513,13 +1577,19 @@ function tryBuildSecurityLogRenameTransition(
   }
 
   const consumedIndexes = relevant
-    .filter(({ event }) =>
-      event.id === deleted.event.id
-      || normalizePath(event.path) === normalizePath(target.event.path)
-      || (normalizePath(event.path) === resolvedTargetParent && (event.action === "created_or_appended" || event.action === "modified"))
-      || ((event.action === "renamed" || event.action === "moved")
-        && pathsReferToSameItem(event.previousPath, deleted.event.path)
-        && (pathsReferToSameItem(event.path, deleted.event.path) || pathsReferToSameItem(event.path, target.event.path))))
+    .filter(({ event }) => {
+      const eventTime = new Date(event.timestampUtc).getTime();
+      return event.id === deleted.event.id
+        || (normalizePath(event.path) === normalizePath(target.event.path)
+          && Math.abs(eventTime - deletedTime) <= 2_500)
+        || (normalizePath(event.path) === resolvedTargetParent
+          && (event.action === "created_or_appended" || event.action === "modified")
+          && Math.abs(eventTime - deletedTime) <= 2_500)
+        || ((event.action === "renamed" || event.action === "moved")
+          && Math.abs(eventTime - deletedTime) <= 2_500
+          && pathsReferToSameItem(event.previousPath, deleted.event.path)
+          && (pathsReferToSameItem(event.path, deleted.event.path) || pathsReferToSameItem(event.path, target.event.path)));
+    })
     .map(({ clusterIndex }) => clusterIndex);
 
   const action = isMove(deleted.event.path, target.event.path) ? "moved" : "renamed";
@@ -1543,9 +1613,14 @@ function sameObjectShape(leftPath: string, rightPath: string) {
 
 function isLikelySecurityTransitionTarget(previousPath: string, nextPath: string, previousExtension: string) {
   if (isFileLikePath(previousPath)) {
-    return normalizePath(getParentPath(nextPath)) === normalizePath(getParentPath(previousPath))
-      && getPathExtension(nextPath) === previousExtension
-      && isLikelyRenameLeafVariant(previousPath, nextPath);
+    if (getPathExtension(nextPath) !== previousExtension) {
+      return false;
+    }
+
+    const sameParent = normalizePath(getParentPath(nextPath)) === normalizePath(getParentPath(previousPath));
+    return sameParent
+      ? isLikelyRenameLeafVariant(previousPath, nextPath)
+      : getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();
   }
 
   return getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();

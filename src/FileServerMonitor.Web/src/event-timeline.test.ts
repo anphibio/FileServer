@@ -1001,6 +1001,140 @@ test("keeps rename after moving a provisional office document as rename", () => 
   ]);
 });
 
+test("reconstructs a file move from security delete and destination access", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "source-delete",
+      timestampUtc: "2026-07-01T20:25:22.930Z",
+      path: "C:\\Corporativo\\codex-client-check-01.txt",
+      action: "deleted",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-parent-touch",
+      timestampUtc: "2026-07-01T20:25:22.930Z",
+      path: "C:\\Corporativo\\Nova pasta - 40",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-access",
+      timestampUtc: "2026-07-01T20:25:22.933Z",
+      path: "C:\\Corporativo\\Nova pasta - 40\\codex-client-check-01.txt",
+      action: "accessed",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.previousPath, event.path]), [
+    [
+      "Movido",
+      "C:\\Corporativo\\codex-client-check-01.txt",
+      "C:\\Corporativo\\Nova pasta - 40\\codex-client-check-01.txt"
+    ]
+  ]);
+});
+
+test("reconstructs a folder move from security delete and destination access despite same-path usn rename", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "source-delete",
+      timestampUtc: "2026-07-01T20:25:29.640Z",
+      path: "C:\\Corporativo\\teste",
+      action: "deleted",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-parent-touch",
+      timestampUtc: "2026-07-01T20:25:29.643Z",
+      path: "C:\\Corporativo\\Nova pasta - 40",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-access",
+      timestampUtc: "2026-07-01T20:25:29.643Z",
+      path: "C:\\Corporativo\\Nova pasta - 40\\teste",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "ambiguous-usn",
+      timestampUtc: "2026-07-01T20:25:29.000Z",
+      path: "C:\\Corporativo\\teste",
+      previousPath: "C:\\Corporativo\\teste",
+      action: "renamed",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.previousPath, event.path]), [
+    [
+      "Movido",
+      "C:\\Corporativo\\teste",
+      "C:\\Corporativo\\Nova pasta - 40\\teste"
+    ]
+  ]);
+});
+
+test("reconstructs a folder move from same-path usn rename and destination access", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "target-parent-touch",
+      timestampUtc: "2026-07-01T20:25:29.643Z",
+      path: "C:\\Corporativo\\Nova pasta - 40",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "target-access",
+      timestampUtc: "2026-07-01T20:25:29.643Z",
+      path: "C:\\Corporativo\\Nova pasta - 40\\teste",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "ambiguous-usn",
+      timestampUtc: "2026-07-01T20:25:29.000Z",
+      path: "C:\\Corporativo\\teste",
+      previousPath: "C:\\Corporativo\\teste",
+      action: "renamed",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.previousPath, event.path]), [
+    [
+      "Movido",
+      "C:\\Corporativo\\teste",
+      "C:\\Corporativo\\Nova pasta - 40\\teste"
+    ]
+  ]);
+});
+
+test("suppresses standalone folder modified echoes", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-modified",
+      timestampUtc: "2026-07-01T20:22:31.000Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "modified",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.deepEqual(display, []);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
