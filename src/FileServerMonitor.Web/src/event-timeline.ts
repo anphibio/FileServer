@@ -67,6 +67,14 @@ export function buildDisplayEvents(events: FileAuditEvent[]) {
       continue;
     }
 
+    const securityLogTransition = tryBuildSecurityLogRenameTransition(current, cluster);
+    if (securityLogTransition) {
+      securityLogTransition.consumedIndexes.forEach((clusterIndex) => consumed.add(clusterIndex));
+      emittedSemanticKeys.add(getSemanticEventKey(securityLogTransition.event));
+      display.push(securityLogTransition.event);
+      continue;
+    }
+
     if (isProvisionalDocumentNoise(current, ordered)) {
       consumed.add(index);
       continue;
@@ -1052,6 +1060,24 @@ function getPathExtension(path: string) {
   return index >= 0 ? leaf.slice(index).toLowerCase() : "";
 }
 
+function getPathStem(path: string) {
+  const leaf = getLeafName(path).toLowerCase();
+  const index = leaf.lastIndexOf(".");
+  return index >= 0 ? leaf.slice(0, index) : leaf;
+}
+
+function isLikelyRenameLeafVariant(previousPath: string, nextPath: string) {
+  const previousStem = getPathStem(previousPath);
+  const nextStem = getPathStem(nextPath);
+
+  if (!previousStem || previousStem === nextStem || !nextStem.startsWith(previousStem)) {
+    return false;
+  }
+
+  const suffix = nextStem.slice(previousStem.length);
+  return /^[\s._() -]*\d+[\s._() -]*$/.test(suffix);
+}
+
 function isRootOnlyNoise(
   event: FileAuditEvent,
   cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
@@ -1363,6 +1389,72 @@ function tryBuildExplicitTransition(
       path: nextPath,
       displayAction,
       displayTarget: getLeafName(nextPath)
+    } satisfies DisplayEvent
+  };
+}
+
+function tryBuildSecurityLogRenameTransition(
+  current: FileAuditEvent,
+  relevant: Array<{ event: FileAuditEvent; clusterIndex: number }>
+) {
+  if (!current.source.includes("windows-security-log")) {
+    return null;
+  }
+
+  if (current.action !== "accessed" && current.action !== "deleted") {
+    return null;
+  }
+
+  const deleted = relevant.find(({ event }) =>
+    event.action === "deleted"
+    && event.source.includes("windows-security-log")
+    && isFileLikePath(event.path));
+  if (!deleted) {
+    return null;
+  }
+
+  const deletedTime = new Date(deleted.event.timestampUtc).getTime();
+  const deletedParent = normalizePath(getParentPath(deleted.event.path));
+  const deletedExtension = getPathExtension(deleted.event.path);
+  const target = relevant.find(({ event }) =>
+    event.action === "accessed"
+    && event.source.includes("windows-security-log")
+    && isFileLikePath(event.path)
+    && normalizePath(getParentPath(event.path)) === deletedParent
+    && getPathExtension(event.path) === deletedExtension
+    && !pathsReferToSameItem(event.path, deleted.event.path)
+    && normalizeUser(event.user) === normalizeUser(deleted.event.user)
+    && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500
+    && isLikelyRenameLeafVariant(deleted.event.path, event.path));
+  if (!target) {
+    return null;
+  }
+
+  const hasParentTouch = relevant.some(({ event }) =>
+    (event.action === "created_or_appended" || event.action === "modified")
+    && normalizePath(event.path) === deletedParent
+    && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500);
+  if (!hasParentTouch) {
+    return null;
+  }
+
+  const consumedIndexes = relevant
+    .filter(({ event }) =>
+      event.id === deleted.event.id
+      || normalizePath(event.path) === normalizePath(target.event.path)
+      || (normalizePath(event.path) === deletedParent && (event.action === "created_or_appended" || event.action === "modified")))
+    .map(({ clusterIndex }) => clusterIndex);
+
+  return {
+    consumedIndexes,
+    event: {
+      ...target.event,
+      id: `${deleted.event.id}-${target.event.id}-security-rename`,
+      timestampUtc: deleted.event.timestampUtc,
+      action: "renamed",
+      previousPath: deleted.event.path,
+      displayAction: "Renomeado",
+      displayTarget: getLeafName(target.event.path)
     } satisfies DisplayEvent
   };
 }

@@ -641,6 +641,48 @@ test("keeps a default-named folder rename as rename", () => {
   ]);
 });
 
+test("reconstructs a nested file rename from security delete and access signals", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "nested-rename-access-later",
+      timestampUtc: "2026-07-01T04:11:05.397Z",
+      path: "C:\\Corporativo\\Example folder\\Another example txt file - 20.txt",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "nested-rename-parent-touch",
+      timestampUtc: "2026-07-01T04:11:04.390Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "nested-rename-delete",
+      timestampUtc: "2026-07-01T04:11:04.390Z",
+      path: "C:\\Corporativo\\Example folder\\Another example txt file.txt",
+      action: "deleted",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "nested-rename-access",
+      timestampUtc: "2026-07-01T04:11:04.390Z",
+      path: "C:\\Corporativo\\Example folder\\Another example txt file - 20.txt",
+      action: "accessed",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.previousPath, event.displayAction]), [
+    [
+      "C:\\Corporativo\\Example folder\\Another example txt file - 20.txt",
+      "C:\\Corporativo\\Example folder\\Another example txt file.txt",
+      "Renomeado"
+    ]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
