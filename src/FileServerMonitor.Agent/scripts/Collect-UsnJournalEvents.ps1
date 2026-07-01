@@ -11,7 +11,11 @@ param(
 
     [string]$ServerName = $env:COMPUTERNAME,
 
-    [string]$DefaultShare = "FileServer"
+    [string]$DefaultShare = "FileServer",
+
+    [string]$RawCsvPath,
+
+    [string]$KnownPathByFileIdJson
 )
 
 Set-StrictMode -Version Latest
@@ -108,7 +112,7 @@ function Join-ResolvedPath {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ParentPath)) {
-        return Join-Path $ParentPath $Name
+        return "$($ParentPath.TrimEnd('\', '/'))\$($Name.TrimStart('\', '/'))"
     }
 
     return $null
@@ -233,12 +237,16 @@ $normalizedBasePath = if ([string]::IsNullOrWhiteSpace($BasePath)) {
     Normalize-Volume -Value $BasePath
 }
 
-# fsutil usn readjournal e suportado no Windows Server 2022. A opcao csv existe em builds modernos
-# e facilita uma coleta inicial sem P/Invoke. Uma etapa posterior pode substituir isso por leitura nativa.
-$arguments = @("usn", "readjournal", $normalizedVolume, "startusn=$StartUsn", "csv")
-$raw = & fsutil @arguments 2>&1
+$raw = if ([string]::IsNullOrWhiteSpace($RawCsvPath)) {
+    # fsutil usn readjournal e suportado no Windows Server 2022. A opcao csv existe em builds modernos
+    # e facilita uma coleta inicial sem P/Invoke. Uma etapa posterior pode substituir isso por leitura nativa.
+    $arguments = @("usn", "readjournal", $normalizedVolume, "startusn=$StartUsn", "csv")
+    & fsutil @arguments 2>&1
+} else {
+    Get-Content -Path $RawCsvPath
+}
 
-if ($LASTEXITCODE -ne 0) {
+if ([string]::IsNullOrWhiteSpace($RawCsvPath) -and $LASTEXITCODE -ne 0) {
     throw "fsutil usn readjournal falhou para o volume '$normalizedVolume': $raw"
 }
 
@@ -321,14 +329,26 @@ $parsedRecords = foreach ($record in $records) {
     }
 }
 
+$scanLimit = [Math]::Max($MaxEvents * 20, $MaxEvents)
 $selectedRecords = @(
     $parsedRecords |
         Sort-Object { [long]$_.usn } |
-        Select-Object -First $MaxEvents
+        Select-Object -First $scanLimit
 )
 
 $currentPathByFileId = @{}
 $pendingRenameOldPathByFileId = @{}
+
+if (-not [string]::IsNullOrWhiteSpace($KnownPathByFileIdJson)) {
+    try {
+        $knownPaths = $KnownPathByFileIdJson | ConvertFrom-Json
+        foreach ($property in $knownPaths.PSObject.Properties) {
+            Add-ResolvedPath -Map $currentPathByFileId -FileId $property.Name -Path ([string]$property.Value) -BasePath $normalizedBasePath
+        }
+    } catch {
+        throw "KnownPathByFileIdJson invalido: $($_.Exception.Message)"
+    }
+}
 
 foreach ($record in $selectedRecords) {
     foreach ($id in @($record.parentFileId, $record.fileId)) {
@@ -421,7 +441,7 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
     }
 }
 
-$result = @($hydratedRecords)
+$result = @($hydratedRecords | Select-Object -First $MaxEvents)
 
 if ($result.Count -eq 0) {
     Write-Output "[]"
