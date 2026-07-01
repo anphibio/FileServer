@@ -438,6 +438,7 @@ function App() {
           <Dashboard
             health={health}
             events={events}
+            displayEvents={displayedEvents}
             openAlerts={openAlerts}
             criticalAlerts={criticalAlerts}
             offlineAgents={offlineAgents}
@@ -470,6 +471,7 @@ function App() {
 function Dashboard({
   health,
   events,
+  displayEvents,
   openAlerts,
   criticalAlerts,
   offlineAgents,
@@ -481,6 +483,7 @@ function Dashboard({
 }: {
   health: HealthResponse | null;
   events: FileAuditEvent[];
+  displayEvents: DisplayEvent[];
   openAlerts: FileServerAlert[];
   criticalAlerts: FileServerAlert[];
   offlineAgents: AgentHealth[];
@@ -490,7 +493,7 @@ function Dashboard({
   onSummaryFiltersChange: (filters: ActivitySummaryFilters) => void;
   onNotify: (notice: Notice | null) => void;
 }) {
-  const latestEvents = events.slice(0, 8);
+  const latestEvents = displayEvents.slice(0, 8);
   const highestAnomaly = getHighestAnomaly(baselineAnomalies);
   const posture = getOperationalPosture(openAlerts.length, criticalAlerts.length, offlineAgents.length, highestAnomaly);
   const updateFilter = (field: keyof ActivitySummaryFilters, value: string) => {
@@ -607,7 +610,7 @@ function Dashboard({
 
       <section className="split-grid">
         <Panel title="Eventos Recentes" subtitle="Linha curta para leitura operacional rápida.">
-          <EventTable events={latestEvents} compact />
+          <EventTable events={latestEvents} compact precomputed />
         </Panel>
         <Panel title="Alertas Recentes" subtitle="Itens abertos mais recentes e mais acionáveis.">
           <AlertList alerts={openAlerts.slice(0, 8)} />
