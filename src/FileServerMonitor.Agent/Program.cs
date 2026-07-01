@@ -181,9 +181,10 @@ internal sealed class FileServerAgent
             : collected;
 
         var filtered = FilterByRemoteConfig(output)
-            .OrderByDescending(item => item.TimestampUtc)
+            .OrderBy(item => item.Usn ?? long.MaxValue)
+            .ThenBy(item => item.RecordId ?? long.MaxValue)
+            .ThenBy(item => item.TimestampUtc)
             .Take(_options.BatchSize)
-            .OrderBy(item => item.TimestampUtc)
             .ToArray();
 
         Console.WriteLine($"Coleta final: brutos={collected.Count}; pos-correlacao={output.Count}; pos-filtro={filtered.Length}");

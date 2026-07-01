@@ -209,7 +209,7 @@ $filter = @{
 try {
     $events = Get-WinEvent -FilterHashtable $filter -MaxEvents ([Math]::Max($MaxEvents * 4, $MaxEvents)) |
         Where-Object { $_.RecordId -gt $LastRecordId } |
-        Sort-Object RecordId -Descending |
+        Sort-Object RecordId |
         Select-Object -First $MaxEvents
 } catch [System.Diagnostics.Eventing.Reader.EventLogNotFoundException] {
     $events = @()
@@ -265,7 +265,7 @@ $result = foreach ($event in $events) {
 }
 
 if ($null -eq $result) {
-    @() | ConvertTo-Json -Depth 8
+    Write-Output "[]"
 } else {
     @($result) | ConvertTo-Json -Depth 8
 }

@@ -407,6 +407,31 @@ select {
   overflow-x: auto;
 }
 
+.pagination-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-top: 1px solid #edf1f5;
+  background: #fbfdff;
+}
+
+.pagination-summary,
+.pagination-page {
+  color: #637083;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pagination-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

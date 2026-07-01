@@ -142,25 +142,71 @@ public sealed class EventCorrelator
                 var pair = ordered[pairIndex];
                 var oldEvent = current.Action.Equals("renamed_old", StringComparison.OrdinalIgnoreCase) ? current : pair;
                 var newEvent = current.Action.Equals("renamed_new", StringComparison.OrdinalIgnoreCase) ? current : pair;
+                var finalTransition = CollapseRenameChain(ordered, oldEvent, newEvent, index, pairIndex);
 
-                foreach (var noiseIndex in FindRenameNoiseIndexes(ordered, oldEvent, newEvent, index, pairIndex))
+                foreach (var consumedIndex in finalTransition.ConsumedIndexes)
                 {
-                    consumed.Add(noiseIndex);
+                    consumed.Add(consumedIndex);
                 }
 
-                yield return newEvent with
+                yield return finalTransition.NewEvent with
                 {
-                    PreviousPath = oldEvent.Path,
-                    Action = ClassifyPathTransition(oldEvent.Path, newEvent.Path),
-                    ObjectType = PromoteObjectType(oldEvent.ObjectType, newEvent.ObjectType)
+                    PreviousPath = finalTransition.OldEvent.Path,
+                    Action = ClassifyPathTransition(finalTransition.OldEvent.Path, finalTransition.NewEvent.Path),
+                    ObjectType = PromoteObjectType(finalTransition.OldEvent.ObjectType, finalTransition.NewEvent.ObjectType)
                 };
-
-                consumed.Add(pairIndex);
                 continue;
             }
 
             yield return current with { Action = "renamed" };
         }
+    }
+
+    private RenameTransition CollapseRenameChain(
+        CollectedFileEvent[] ordered,
+        CollectedFileEvent oldEvent,
+        CollectedFileEvent newEvent,
+        int currentIndex,
+        int pairIndex)
+    {
+        var consumedIndexes = new HashSet<int> { pairIndex };
+        foreach (var noiseIndex in FindRenameNoiseIndexes(ordered, oldEvent, newEvent, currentIndex, pairIndex))
+        {
+            consumedIndexes.Add(noiseIndex);
+        }
+
+        if (string.IsNullOrWhiteSpace(newEvent.FileReferenceId))
+        {
+            return new RenameTransition(oldEvent, newEvent, consumedIndexes);
+        }
+
+        while (IsProvisionalDocumentPath(newEvent.Path))
+        {
+            var nextOldIndex = FindNextRenameOldIndex(ordered, newEvent, currentIndex, consumedIndexes);
+            if (nextOldIndex < 0)
+            {
+                break;
+            }
+
+            var nextOldEvent = ordered[nextOldIndex];
+            var nextPairIndex = FindRenamePairIndex(ordered, nextOldEvent, nextOldIndex);
+            if (nextPairIndex < 0)
+            {
+                break;
+            }
+
+            var nextNewEvent = ordered[nextPairIndex];
+            consumedIndexes.Add(nextOldIndex);
+            consumedIndexes.Add(nextPairIndex);
+            foreach (var noiseIndex in FindRenameNoiseIndexes(ordered, nextOldEvent, nextNewEvent, nextOldIndex, nextPairIndex))
+            {
+                consumedIndexes.Add(noiseIndex);
+            }
+
+            newEvent = nextNewEvent;
+        }
+
+        return new RenameTransition(oldEvent, newEvent, consumedIndexes);
     }
 
     private static bool IsRenameMarker(string action)
@@ -260,6 +306,14 @@ public sealed class EventCorrelator
 
     private static string GetCorrelatedAction(CollectedFileEvent usnEvent, CollectedFileEvent securityEvent)
     {
+        if ((usnEvent.Action.Equals("changed", StringComparison.OrdinalIgnoreCase)
+                || usnEvent.Action.Equals("modified", StringComparison.OrdinalIgnoreCase))
+            && securityEvent.Action.Equals("accessed", StringComparison.OrdinalIgnoreCase)
+            && NormalizePath(usnEvent.Path).Equals(NormalizePath(securityEvent.Path), StringComparison.OrdinalIgnoreCase))
+        {
+            return "accessed";
+        }
+
         if ((usnEvent.Action.Equals("changed", StringComparison.OrdinalIgnoreCase)
                 || usnEvent.Action.Equals("modified", StringComparison.OrdinalIgnoreCase))
             && securityEvent.Action.Equals("created_or_appended", StringComparison.OrdinalIgnoreCase)
@@ -407,6 +461,33 @@ public sealed class EventCorrelator
         return candidates?.candidateIndex ?? -1;
     }
 
+    private int FindNextRenameOldIndex(
+        CollectedFileEvent[] ordered,
+        CollectedFileEvent currentNewEvent,
+        int currentIndex,
+        IReadOnlySet<int> consumedIndexes)
+    {
+        var currentPath = NormalizePath(currentNewEvent.Path);
+
+        return ordered
+            .Select((candidate, candidateIndex) => new { candidate, candidateIndex })
+            .Where(item => item.candidateIndex != currentIndex)
+            .Where(item => !consumedIndexes.Contains(item.candidateIndex))
+            .Where(item => item.candidate.CursorType.Equals("usn", StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.Action.Equals("renamed_old", StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.Equals(item.candidate.Volume, currentNewEvent.Volume, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.Server.Equals(currentNewEvent.Server, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.Share.Equals(currentNewEvent.Share, StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.Equals(item.candidate.FileReferenceId, currentNewEvent.FileReferenceId, StringComparison.OrdinalIgnoreCase))
+            .Where(item => NormalizePath(item.candidate.Path).Equals(currentPath, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.TimestampUtc >= currentNewEvent.TimestampUtc)
+            .Where(item => (item.candidate.TimestampUtc - currentNewEvent.TimestampUtc).Duration() <= _correlationWindow)
+            .OrderBy(item => item.candidate.TimestampUtc)
+            .ThenBy(item => item.candidate.Usn ?? long.MaxValue)
+            .Select(item => item.candidateIndex)
+            .FirstOrDefault(-1);
+    }
+
     private static string PromoteObjectType(string currentType, string nextType)
     {
         if (string.Equals(nextType, "file", StringComparison.OrdinalIgnoreCase)
@@ -518,4 +599,9 @@ public sealed class EventCorrelator
             ? string.Empty
             : path.Trim().Replace('/', '\\').TrimEnd('\\');
     }
+
+    private sealed record RenameTransition(
+        CollectedFileEvent OldEvent,
+        CollectedFileEvent NewEvent,
+        IReadOnlyCollection<int> ConsumedIndexes);
 }

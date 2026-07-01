@@ -7,6 +7,7 @@ var tests = new (string Name, Action Test)[]
     ("dispara alerta de alteracao de permissao", RaisesPermissionChangeAlert),
     ("dispara alerta de ransomware por extensao suspeita", RaisesRansomwareAlertBySuspiciousExtension),
     ("correlaciona USN com Security Log por caminho", CorrelatesUsnWithSecurityLogByPath),
+    ("preserva acesso quando Security Log confirma leitura", PreservesAccessWhenSecurityLogConfirmsRead),
     ("prefere melhor correspondencia por caminho", PrefersBestPathMatch),
     ("nao correlaciona fora da janela", DoesNotCorrelateOutsideWindow),
     ("consolida rename do USN e suprime ruido do security log", CollapsesUsnRenameAndSuppressesSecurityNoise),
@@ -14,10 +15,14 @@ var tests = new (string Name, Action Test)[]
     ("infere rename a partir de ruído do USN com o mesmo file id", InfersRenameFromUsnNoiseWithSameFileId),
     ("trata nome provisorio de bitmap como criacao final", TreatsBitmapProvisionalRenameAsFinalCreation),
     ("trata nome provisorio do Office como criacao final", TreatsOfficeProvisionalRenameAsFinalCreation),
+    ("trata nome provisorio do PowerPoint como criacao final", TreatsPowerPointProvisionalRenameAsFinalCreation),
+    ("colapsa cadeia provisoria de bitmap em uma criacao final", CollapsesBitmapProvisionalChainIntoSingleFinalCreation),
     ("trata alteracao de nome provisorio como criacao quando security log confirma criacao", TreatsProvisionalChangeAsCreationWhenSecurityShowsCreation),
     ("trata nome provisorio mantido como criacao", TreatsKeptProvisionalNameAsCreation),
     ("classifica rename entre pastas como movimentacao", ClassifiesCrossFolderRenameAsMove),
-    ("nao correlaciona arquivos diferentes por proximidade", DoesNotCorrelateDifferentFilesByTiming)
+    ("nao correlaciona arquivos diferentes por proximidade", DoesNotCorrelateDifferentFilesByTiming),
+    ("nao cruza bitmaps provisorios repetidos", DoesNotCrossCorrelateRepeatedBitmapProvisionals),
+    ("nao cruza planilhas provisorias repetidas", DoesNotCrossCorrelateRepeatedExcelProvisionals)
 };
 
 var failures = new List<string>();
@@ -127,6 +132,22 @@ static void CorrelatesUsnWithSecurityLogByPath()
     Assert(usn.User == "EMPRESA\\maria.silva", "Usuario do USN deveria ser enriquecido pelo Security Log.");
     Assert(usn.ProcessName == "EXCEL.EXE", "Processo deveria ser enriquecido pelo Security Log.");
     Assert(usn.Source == "usn-journal+security-log", "Fonte deveria indicar correlacao.");
+}
+
+static void PreservesAccessWhenSecurityLogConfirmsRead()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\Novo Documento.txt", "EMPRESA\\maria.silva", "security-log", "notepad.exe", action: "accessed", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Novo Documento.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "changed", usn: 100, fileReferenceId: "access-1")
+    };
+
+    var correlated = correlator.Correlate(events).Single(item => item.CursorType == "usn");
+
+    Assert(correlated.Action == "accessed", "Leitura confirmada pelo Security Log deveria aparecer como acesso, nao alteracao.");
+    Assert(correlated.User == "EMPRESA\\maria.silva", "Acesso deveria herdar usuario do Security Log.");
 }
 
 static void PrefersBestPathMatch()
@@ -265,6 +286,48 @@ static void TreatsOfficeProvisionalRenameAsFinalCreation()
     Assert(created.User == "EMPRESA\\maria.silva", "Criacao Office deveria herdar usuario do Security Log.");
 }
 
+static void TreatsPowerPointProvisionalRenameAsFinalCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\Novo(a) Apresenta\u00E7\u00E3o do Microsoft PowerPoint.pptx", "EMPRESA\\maria.silva", "security-log", "POWERPNT.EXE", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Novo(a) Apresenta\u00E7\u00E3o do Microsoft PowerPoint.pptx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "pptx-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\Apresentacao Final.pptx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "pptx-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var created = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(created.Action == "created", "Rename de nome provisorio PowerPoint deveria virar criacao final.");
+    Assert(created.Path == "\\\\FS01\\Dados\\Apresentacao Final.pptx", "Criacao PowerPoint deveria apontar para o nome final.");
+    Assert(created.PreviousPath is null, "Criacao PowerPoint nao deveria expor caminho anterior provisorio.");
+    Assert(created.User == "EMPRESA\\maria.silva", "Criacao PowerPoint deveria herdar usuario do Security Log.");
+}
+
+static void CollapsesBitmapProvisionalChainIntoSingleFinalCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\New Bitmap Image.bmp", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(50), "\\\\FS01\\Dados\\New Bitmap Image.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "bmp-chain-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(100), "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "bmp-chain-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(150), "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 102, fileReferenceId: "bmp-chain-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\Teste Bitmap Final.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 103, fileReferenceId: "bmp-chain-1")
+    };
+
+    var correlated = correlator.Correlate(events).Where(item => item.CursorType == "usn").ToArray();
+
+    Assert(correlated.Length == 1, "Cadeia provisoria deveria virar um unico evento final.");
+    Assert(correlated[0].Action == "created", "Cadeia provisoria deveria virar criacao final.");
+    Assert(correlated[0].Path == "\\\\FS01\\Dados\\Teste Bitmap Final.bmp", "Criacao final deveria apontar para o ultimo nome.");
+    Assert(correlated[0].PreviousPath is null, "Criacao final nao deveria expor etapas provisorias.");
+    Assert(correlated[0].User == "EMPRESA\\maria.silva", "Criacao final deveria manter o usuario enriquecido.");
+}
+
 static void TreatsProvisionalChangeAsCreationWhenSecurityShowsCreation()
 {
     var timestamp = DateTimeOffset.UtcNow;
@@ -336,6 +399,54 @@ static void DoesNotCorrelateDifferentFilesByTiming()
 
     Assert(correlated.All(item => item.Action != "renamed" && item.Action != "moved"), "Arquivos diferentes nao deveriam virar transicao.");
     Assert(correlated.Any(item => item.Path == "\\\\FS01\\Dados\\Nova Imagem de Bitmap.bmp"), "Evento do bitmap deveria permanecer independente.");
+}
+
+static void DoesNotCrossCorrelateRepeatedBitmapProvisionals()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\New Bitmap Image.bmp", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(50), "\\\\FS01\\Dados\\New Bitmap Image.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "bmp-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(80), "\\\\FS01\\Dados\\teste-bmp-01.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "bmp-1"),
+        BuildCollectedEvent("security", timestamp.AddMilliseconds(120), "\\\\FS01\\Dados\\New Bitmap Image (2).bmp", "EMPRESA\\maria.silva", "security-log", "explorer.exe", action: "created_or_appended", recordId: 11),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(160), "\\\\FS01\\Dados\\New Bitmap Image (2).bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 102, fileReferenceId: "bmp-2"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\teste-bmp-02.bmp", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 103, fileReferenceId: "bmp-2")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var createdEvents = correlated.Where(item => item.CursorType == "usn").OrderBy(item => item.Path).ToArray();
+
+    Assert(createdEvents.Length == 2, "Bitmaps provisorios repetidos deveriam resultar em duas criacoes finais.");
+    Assert(createdEvents.All(item => item.Action == "created"), "Bitmaps provisorios repetidos deveriam virar criacao final.");
+    Assert(createdEvents.Any(item => item.Path == "\\\\FS01\\Dados\\teste-bmp-01.bmp"), "Primeiro bitmap deveria permanecer independente.");
+    Assert(createdEvents.Any(item => item.Path == "\\\\FS01\\Dados\\teste-bmp-02.bmp"), "Segundo bitmap deveria permanecer independente.");
+    Assert(createdEvents.All(item => item.PreviousPath is null), "Criacoes finais nao deveriam expor nomes provisorios.");
+}
+
+static void DoesNotCrossCorrelateRepeatedExcelProvisionals()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel.xlsx", "EMPRESA\\maria.silva", "security-log", "EXCEL.EXE", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(50), "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel.xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "xlsx-1"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(80), "\\\\FS01\\Dados\\teste-xlsx-01.xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "xlsx-1"),
+        BuildCollectedEvent("security", timestamp.AddMilliseconds(120), "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel (2).xlsx", "EMPRESA\\maria.silva", "security-log", "EXCEL.EXE", action: "created_or_appended", recordId: 11),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(160), "\\\\FS01\\Dados\\Novo(a) Planilha do Microsoft Excel (2).xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 102, fileReferenceId: "xlsx-2"),
+        BuildCollectedEvent("usn", timestamp.AddMilliseconds(200), "\\\\FS01\\Dados\\teste-xlsx-02.xlsx", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 103, fileReferenceId: "xlsx-2")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var createdEvents = correlated.Where(item => item.CursorType == "usn").OrderBy(item => item.Path).ToArray();
+
+    Assert(createdEvents.Length == 2, "Planilhas provisorias repetidas deveriam resultar em duas criacoes finais.");
+    Assert(createdEvents.All(item => item.Action == "created"), "Planilhas provisorias repetidas deveriam virar criacao final.");
+    Assert(createdEvents.Any(item => item.Path == "\\\\FS01\\Dados\\teste-xlsx-01.xlsx"), "Primeira planilha deveria permanecer independente.");
+    Assert(createdEvents.Any(item => item.Path == "\\\\FS01\\Dados\\teste-xlsx-02.xlsx"), "Segunda planilha deveria permanecer independente.");
+    Assert(createdEvents.All(item => item.PreviousPath is null), "Criacoes finais nao deveriam expor nomes provisorios.");
 }
 
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)

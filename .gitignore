@@ -14,3 +14,7 @@ obj/
 TestResults/
 publish/
 node_modules/
+**/dist/
+*.tsbuildinfo
+Logs/
+docs/superpowers/

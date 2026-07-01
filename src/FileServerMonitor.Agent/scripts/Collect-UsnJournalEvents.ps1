@@ -46,27 +46,27 @@ function Convert-ReasonToAction {
         return "changed"
     }
 
-    if ($Reason -match "FILE_CREATE|NAMED_DATA_EXTEND|Criação de arquivo|Criacao de arquivo") {
+    if ($Reason -match "FILE_CREATE|NAMED_DATA_EXTEND|File create|Criação de arquivo|Criacao de arquivo") {
         return "created"
     }
 
-    if ($Reason -match "FILE_DELETE|Arquivo morto|Exclusão|Exclusao") {
+    if ($Reason -match "FILE_DELETE|File delete|Arquivo morto|Exclusão|Exclusao") {
         return "deleted"
     }
 
-    if ($Reason -match "RENAME_OLD_NAME|Renomear: nome antigo") {
+    if ($Reason -match "RENAME_OLD_NAME|Rename: old name|Renomear: nome antigo") {
         return "renamed_old"
     }
 
-    if ($Reason -match "RENAME_NEW_NAME|Renomear: novo nome") {
+    if ($Reason -match "RENAME_NEW_NAME|Rename: new name|Renomear: novo nome") {
         return "renamed_new"
     }
 
-    if ($Reason -match "SECURITY_CHANGE|Alteração de segurança|Alteracao de seguranca") {
+    if ($Reason -match "SECURITY_CHANGE|Security change|Alteração de segurança|Alteracao de seguranca") {
         return "permission_changed"
     }
 
-    if ($Reason -match "DATA_OVERWRITE|DATA_EXTEND|DATA_TRUNCATION|BASIC_INFO_CHANGE|Extensao de dados|Extensão de dados|Fechar|Alteração de ID de objeto|Alteracao de ID de objeto") {
+    if ($Reason -match "DATA_OVERWRITE|DATA_EXTEND|DATA_TRUNCATION|BASIC_INFO_CHANGE|Data overwrite|Data extend|Data truncation|Basic info change|Close|Extensao de dados|Extensão de dados|Fechar|Alteração de ID de objeto|Alteracao de ID de objeto") {
         return "modified"
     }
 
@@ -96,12 +96,11 @@ function Normalize-ReferenceId {
 function Join-ResolvedPath {
     param(
         [string]$ParentPath,
-        [string]$Name,
-        [string]$FallbackBasePath
+        [string]$Name
     )
 
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        return "$FallbackBasePath\"
+        return $null
     }
 
     if ([System.IO.Path]::IsPathRooted($Name)) {
@@ -112,7 +111,93 @@ function Join-ResolvedPath {
         return Join-Path $ParentPath $Name
     }
 
-    return Join-Path $FallbackBasePath $Name
+    return $null
+}
+
+function Normalize-ResolvedPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    $normalized = $Path.Trim()
+
+    if ($normalized.StartsWith("\\?\")) {
+        $normalized = $normalized.Substring(4)
+    }
+
+    return $normalized.TrimEnd('\', '/')
+}
+
+function Test-PathUnderBase {
+    param(
+        [string]$Path,
+        [string]$BasePath
+    )
+
+    $normalizedPath = Normalize-ResolvedPath -Path $Path
+    $normalizedBase = Normalize-ResolvedPath -Path $BasePath
+
+    if ([string]::IsNullOrWhiteSpace($normalizedPath) -or [string]::IsNullOrWhiteSpace($normalizedBase)) {
+        return $false
+    }
+
+    return [string]::Equals($normalizedPath, $normalizedBase, [System.StringComparison]::OrdinalIgnoreCase) `
+        -or $normalizedPath.StartsWith("$normalizedBase\", [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-PathByFileId {
+    param(
+        [string]$Volume,
+        [string]$FileId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FileId)) {
+        return $null
+    }
+
+    try {
+        $queryId = $FileId.Trim()
+
+        if (-not $queryId.StartsWith("0x", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $queryId = "0x$queryId"
+        }
+
+        $output = & fsutil file queryFileNameById $Volume $queryId 2>$null
+
+        foreach ($line in @($output)) {
+            $text = [string]$line
+            $match = [regex]::Match($text, '(\\\\\?\\[A-Za-z]:\\.*)$')
+
+            if ($match.Success) {
+                return Normalize-ResolvedPath -Path $match.Groups[1].Value
+            }
+        }
+    } catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Add-ResolvedPath {
+    param(
+        [hashtable]$Map,
+        [string]$FileId,
+        [string]$Path,
+        [string]$BasePath
+    )
+
+    $normalizedPath = Normalize-ResolvedPath -Path $Path
+
+    if ([string]::IsNullOrWhiteSpace($FileId) -or [string]::IsNullOrWhiteSpace($normalizedPath)) {
+        return
+    }
+
+    if (Test-PathUnderBase -Path $normalizedPath -BasePath $BasePath) {
+        $Map[$FileId] = $normalizedPath
+    }
 }
 
 function Is-MoveTransition {
@@ -160,7 +245,7 @@ if ($LASTEXITCODE -ne 0) {
 $lines = @($raw) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
 if ($lines.Count -eq 0) {
-    @() | ConvertTo-Json -Depth 8
+    Write-Output "[]"
     return
 }
 
@@ -175,7 +260,7 @@ for ($index = 0; $index -lt $lines.Count; $index++) {
 }
 
 if ($headerIndex -lt 0) {
-    @() | ConvertTo-Json -Depth 8
+    Write-Output "[]"
     return
 }
 
@@ -238,29 +323,45 @@ $parsedRecords = foreach ($record in $records) {
 
 $selectedRecords = @(
     $parsedRecords |
-        Sort-Object { [long]$_.usn } -Descending |
-        Select-Object -First $MaxEvents |
-        Sort-Object { [long]$_.usn }
+        Sort-Object { [long]$_.usn } |
+        Select-Object -First $MaxEvents
 )
 
 $currentPathByFileId = @{}
 $pendingRenameOldPathByFileId = @{}
+
+foreach ($record in $selectedRecords) {
+    foreach ($id in @($record.parentFileId, $record.fileId)) {
+        if ([string]::IsNullOrWhiteSpace($id) -or $currentPathByFileId.ContainsKey($id)) {
+            continue
+        }
+
+        $resolved = Resolve-PathByFileId -Volume $normalizedVolume -FileId $id
+        Add-ResolvedPath -Map $currentPathByFileId -FileId $id -Path $resolved -BasePath $normalizedBasePath
+    }
+}
+
 $hydratedRecords = foreach ($record in $selectedRecords) {
     $knownPath = if (-not [string]::IsNullOrWhiteSpace($record.fileId)) { $currentPathByFileId[$record.fileId] } else { $null }
     $parentPath = if (-not [string]::IsNullOrWhiteSpace($record.parentFileId)) { $currentPathByFileId[$record.parentFileId] } else { $null }
-    $resolvedPath = Join-ResolvedPath -ParentPath $parentPath -Name $record.fileName -FallbackBasePath $normalizedBasePath
+    $resolvedPath = Join-ResolvedPath -ParentPath $parentPath -Name $record.fileName
+
+    if ([string]::IsNullOrWhiteSpace($resolvedPath) -and $record.action -ne "renamed_old") {
+        $resolvedPath = $knownPath
+    }
+
+    $resolvedPath = Normalize-ResolvedPath -Path $resolvedPath
+
+    if (-not (Test-PathUnderBase -Path $resolvedPath -BasePath $normalizedBasePath)) {
+        continue
+    }
+
     $resolvedAction = $record.action
     $previousPath = $null
 
-    if (($record.action -eq "changed" -or $record.action -eq "modified" -or $record.action -eq "created") `
-        -and -not [string]::IsNullOrWhiteSpace($knownPath) `
-        -and -not [string]::Equals($knownPath, $resolvedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $previousPath = $knownPath
-        $resolvedAction = if (Is-MoveTransition -PreviousPath $knownPath -CurrentPath $resolvedPath) { "moved" } else { $record.action }
-    }
-
     if ($record.action -eq "renamed_old") {
-        $pendingRenameOldPathByFileId[$record.fileId] = if (-not [string]::IsNullOrWhiteSpace($knownPath)) { $knownPath } else { $resolvedPath }
+        $pendingRenameOldPathByFileId[$record.fileId] = $resolvedPath
+        continue
     }
 
     if ($record.action -eq "renamed_new") {
@@ -272,6 +373,10 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
             -and -not [string]::Equals($knownPath, $resolvedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             $previousPath = $knownPath
             $resolvedAction = if (Is-MoveTransition -PreviousPath $knownPath -CurrentPath $resolvedPath) { "moved" } else { "renamed" }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($previousPath)) {
+            continue
         }
     }
 
@@ -319,7 +424,7 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
 $result = @($hydratedRecords)
 
 if ($result.Count -eq 0) {
-    @() | ConvertTo-Json -Depth 8
+    Write-Output "[]"
 } else {
     $result | ConvertTo-Json -Depth 8
 }

@@ -19,6 +19,10 @@ import {
   Trash2
 } from "lucide-react";
 import "./styles.css";
+import {
+  buildDisplayEvents as buildTimelineDisplayEvents,
+  type FileAuditEvent as TimelineFileAuditEvent
+} from "./event-timeline";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 const apiKey = import.meta.env.VITE_API_KEY ?? "";
@@ -57,6 +61,15 @@ type FileAuditEvent = {
 type DisplayEvent = FileAuditEvent & {
   displayAction?: string;
   displayTarget?: string;
+};
+
+type PaginationState = {
+  page: number;
+  totalPages: number;
+  pageItems: number;
+  totalItems: number;
+  onPrevious: () => void;
+  onNext: () => void;
 };
 
 type FileServerAlert = {
@@ -244,6 +257,8 @@ const defaultInvestigationFilters: InvestigationFilters = {
   toDate: ""
 };
 
+const EVENTS_PAGE_SIZE = 25;
+
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -259,6 +274,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [eventFilter, setEventFilter] = useState("");
+  const [eventsPage, setEventsPage] = useState(1);
   const [summaryFilters, setSummaryFilters] = useState<ActivitySummaryFilters>(defaultSummaryFilters);
 
   async function loadData() {
@@ -268,7 +284,7 @@ function App() {
     try {
       const [healthResult, eventsResult, alertsResult, alertRulesResult, agentsResult, pathsResult, summaryResult, anomaliesResult, auditResult] = await Promise.all([
         fetchJson<HealthResponse>("/health"),
-        fetchJson<FileAuditEvent[]>("/api/events?take=100"),
+        fetchJson<FileAuditEvent[]>("/api/events?take=500"),
         fetchJson<FileServerAlert[]>("/api/alerts?take=100"),
         fetchJson<AlertRuleConfig[]>("/api/alert-rules"),
         fetchJson<AgentHealth[]>("/api/agents/health"),
@@ -326,6 +342,35 @@ function App() {
         .some((value) => value.toLowerCase().includes(filter))
     );
   }, [eventFilter, events]);
+  const displayedEvents = useMemo(() => buildTimelineDisplayEvents(filteredEvents as TimelineFileAuditEvent[]) as DisplayEvent[], [filteredEvents]);
+  const totalDisplayedEventCount = displayedEvents.length;
+  const totalEventPages = Math.max(1, Math.ceil(totalDisplayedEventCount / EVENTS_PAGE_SIZE));
+  const safeEventsPage = Math.min(eventsPage, totalEventPages);
+  const visibleDisplayedEvents = useMemo(
+    () => displayedEvents.slice((safeEventsPage - 1) * EVENTS_PAGE_SIZE, safeEventsPage * EVENTS_PAGE_SIZE),
+    [displayedEvents, safeEventsPage]
+  );
+  const displayedEventCount = visibleDisplayedEvents.length;
+
+  useEffect(() => {
+    setEventsPage((current) => Math.min(current, totalEventPages));
+  }, [totalEventPages]);
+
+  useEffect(() => {
+    setEventsPage(1);
+  }, [eventFilter]);
+
+  const eventPagination = useMemo<PaginationState>(
+    () => ({
+      page: safeEventsPage,
+      totalPages: totalEventPages,
+      pageItems: visibleDisplayedEvents.length,
+      totalItems: totalDisplayedEventCount,
+      onPrevious: () => setEventsPage((current) => Math.max(1, current - 1)),
+      onNext: () => setEventsPage((current) => Math.min(totalEventPages, current + 1))
+    }),
+    [safeEventsPage, totalEventPages, visibleDisplayedEvents.length, totalDisplayedEventCount]
+  );
 
   return (
     <main className="app-shell">
@@ -342,7 +387,7 @@ function App() {
           <TabButton icon={<Activity size={18} />} active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} meta={health?.status === "ok" ? "ok" : "..."}>
             Dashboard
           </TabButton>
-          <TabButton icon={<FileClock size={18} />} active={activeTab === "events"} onClick={() => setActiveTab("events")} meta={filteredEvents.length.toLocaleString("pt-BR")}>
+          <TabButton icon={<FileClock size={18} />} active={activeTab === "events"} onClick={() => setActiveTab("events")} meta={`${displayedEventCount.toLocaleString("pt-BR")}/${totalDisplayedEventCount.toLocaleString("pt-BR")}`}>
             Eventos
           </TabButton>
           <TabButton icon={<Search size={18} />} active={activeTab === "investigation"} onClick={() => setActiveTab("investigation")} meta="até 500">
@@ -371,7 +416,7 @@ function App() {
           </div>
           <div className="topbar-actions">
             <div className="topbar-pills" aria-label="Resumo rápido">
-              <span className="pill">eventos {events.length.toLocaleString("pt-BR")}</span>
+              <span className="pill">eventos {displayedEventCount.toLocaleString("pt-BR")}/{totalDisplayedEventCount.toLocaleString("pt-BR")}</span>
               <span className={`badge ${criticalAlerts.length > 0 ? "critical" : openAlerts.length > 0 ? "warning" : "low"}`}>
                 alertas {openAlerts.length.toLocaleString("pt-BR")}
               </span>
@@ -405,7 +450,7 @@ function App() {
         )}
 
         {activeTab === "events" && (
-          <EventsView events={filteredEvents} filter={eventFilter} onFilterChange={setEventFilter} onNotify={setNotice} />
+          <EventsView events={visibleDisplayedEvents} filter={eventFilter} onFilterChange={setEventFilter} onNotify={setNotice} pagination={eventPagination} />
         )}
 
         {activeTab === "investigation" && <InvestigationView onNotify={setNotice} />}
@@ -623,12 +668,14 @@ function EventsView({
   events,
   filter,
   onFilterChange,
-  onNotify
+  onNotify,
+  pagination
 }: {
   events: FileAuditEvent[];
   filter: string;
   onFilterChange: (value: string) => void;
   onNotify: (notice: Notice | null) => void;
+  pagination: PaginationState;
 }) {
   return (
     <div className="view-stack">
@@ -647,7 +694,7 @@ function EventsView({
         </button>
       </div>
       <Panel title="Linha do Tempo">
-        <EventTable events={events} />
+        <EventTable events={events} precomputed pagination={pagination} />
       </Panel>
     </div>
   );
@@ -659,8 +706,20 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
   const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const uniqueUsers = useMemo(() => new Set(events.map((event) => event.user).filter(Boolean)).size, [events]);
-  const dominantAction = useMemo(() => getTopEventAction(events), [events]);
+  const displayEvents = useMemo(() => buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[], [events]);
+  const [page, setPage] = useState(1);
+  const uniqueUsers = useMemo(() => new Set(displayEvents.map((event) => event.user).filter(Boolean)).size, [displayEvents]);
+  const dominantAction = useMemo(() => getTopEventAction(displayEvents), [displayEvents]);
+  const totalPages = Math.max(1, Math.ceil(displayEvents.length / EVENTS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const visibleDisplayEvents = useMemo(
+    () => displayEvents.slice((safePage - 1) * EVENTS_PAGE_SIZE, safePage * EVENTS_PAGE_SIZE),
+    [displayEvents, safePage]
+  );
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -683,11 +742,13 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
 
     try {
       const result = await fetchJson<FileAuditEvent[]>(buildInvestigationUrl(filters));
+      const displayResult = buildTimelineDisplayEvents(result as TimelineFileAuditEvent[]) as DisplayEvent[];
       setEvents(result);
+      setPage(1);
       setSearched(true);
       onNotify({
-        tone: result.length > 0 ? "success" : "warning",
-        message: result.length > 0 ? `Investigação atualizada com ${result.length.toLocaleString("pt-BR")} evento(s).` : "Nenhum evento encontrado no recorte consultado."
+        tone: displayResult.length > 0 ? "success" : "warning",
+        message: displayResult.length > 0 ? `Investigação atualizada com ${displayResult.length.toLocaleString("pt-BR")} evento(s).` : "Nenhum evento encontrado no recorte consultado."
       });
     } catch (searchError) {
       setError(searchError instanceof Error ? searchError.message : "Falha ao consultar eventos.");
@@ -701,15 +762,15 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
       <section className="executive-grid">
         <ExecutiveCard
           title="Eventos Encontrados"
-          value={searched ? events.length.toLocaleString("pt-BR") : "-"}
+          value={searched ? displayEvents.length.toLocaleString("pt-BR") : "-"}
           detail={searched ? "Resultado do último recorte consultado." : "Faça a primeira busca para abrir a linha investigativa."}
-          tone={events.length > 0 ? "warning" : "neutral"}
+          tone={displayEvents.length > 0 ? "warning" : "neutral"}
         />
         <ExecutiveCard
           title="Usuários no Recorte"
           value={searched ? uniqueUsers.toLocaleString("pt-BR") : "-"}
           detail={dominantAction ? `Ação dominante: ${dominantAction}.` : "Sem ação dominante até o momento."}
-          tone={events.length > 100 ? "danger" : "neutral"}
+          tone={displayEvents.length > 100 ? "danger" : "neutral"}
         />
         <ExecutiveCard
           title="Escopo Atual"
@@ -785,7 +846,22 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
       {error && <div className="error-banner">{error}</div>}
 
       <Panel title="Linha do Tempo Investigativa" subtitle="Eventos completos para rastrear autoria, origem, processo e movimento do arquivo.">
-        {searched ? <InvestigationTable events={events} /> : <EmptyState text="Preencha os filtros e consulte para iniciar a investigação." />}
+        {searched ? (
+          <InvestigationTable
+            events={visibleDisplayEvents}
+            precomputed
+            pagination={{
+              page: safePage,
+              totalPages,
+              pageItems: visibleDisplayEvents.length,
+              totalItems: displayEvents.length,
+              onPrevious: () => setPage((current) => Math.max(1, current - 1)),
+              onNext: () => setPage((current) => Math.min(totalPages, current + 1))
+            }}
+          />
+        ) : (
+          <EmptyState text="Preencha os filtros e consulte para iniciar a investigação." />
+        )}
       </Panel>
     </div>
   );
@@ -1514,8 +1590,21 @@ function AdminAuditView({ entries }: { entries: AdminAuditEntry[] }) {
   );
 }
 
-function EventTable({ events, compact = false }: { events: FileAuditEvent[]; compact?: boolean }) {
-  const displayEvents = useMemo(() => buildDisplayEvents(events), [events]);
+function EventTable({
+  events,
+  compact = false,
+  precomputed = false,
+  pagination
+}: {
+  events: FileAuditEvent[];
+  compact?: boolean;
+  precomputed?: boolean;
+  pagination?: PaginationState;
+}) {
+  const displayEvents = useMemo<DisplayEvent[]>(
+    () => (precomputed ? (events as DisplayEvent[]) : buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[]),
+    [events, precomputed]
+  );
 
   return (
     <div className="table-wrap">
@@ -1563,12 +1652,24 @@ function EventTable({ events, compact = false }: { events: FileAuditEvent[]; com
         </tbody>
       </table>
       {displayEvents.length === 0 && <EmptyState text="Nenhum evento encontrado." />}
+      {pagination && pagination.totalItems > 0 && <PaginationFooter pagination={pagination} />}
     </div>
   );
 }
 
-function InvestigationTable({ events }: { events: FileAuditEvent[] }) {
-  const displayEvents = useMemo(() => buildDisplayEvents(events), [events]);
+function InvestigationTable({
+  events,
+  precomputed = false,
+  pagination
+}: {
+  events: FileAuditEvent[];
+  precomputed?: boolean;
+  pagination?: PaginationState;
+}) {
+  const displayEvents = useMemo<DisplayEvent[]>(
+    () => (precomputed ? (events as DisplayEvent[]) : buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[]),
+    [events, precomputed]
+  );
 
   return (
     <div className="table-wrap">
@@ -1606,6 +1707,28 @@ function InvestigationTable({ events }: { events: FileAuditEvent[] }) {
         </tbody>
       </table>
       {displayEvents.length === 0 && <EmptyState text="Nenhum evento encontrado para os filtros informados." />}
+      {pagination && pagination.totalItems > 0 && <PaginationFooter pagination={pagination} />}
+    </div>
+  );
+}
+
+function PaginationFooter({ pagination }: { pagination: PaginationState }) {
+  return (
+    <div className="pagination-footer">
+      <span className="pagination-summary">
+        Mostrando {pagination.pageItems.toLocaleString("pt-BR")} de {pagination.totalItems.toLocaleString("pt-BR")} registro(s)
+      </span>
+      <div className="pagination-actions">
+        <button className="text-button" type="button" onClick={pagination.onPrevious} disabled={pagination.page <= 1}>
+          Anterior
+        </button>
+        <span className="pagination-page">
+          Página {pagination.page.toLocaleString("pt-BR")} de {pagination.totalPages.toLocaleString("pt-BR")}
+        </span>
+        <button className="text-button" type="button" onClick={pagination.onNext} disabled={pagination.page >= pagination.totalPages}>
+          Próxima
+        </button>
+      </div>
     </div>
   );
 }
@@ -2054,7 +2177,7 @@ async function downloadBaselineAnomaliesCsv(filters: ActivitySummaryFilters, onN
 
 async function downloadEventsCsv(onNotify: (notice: Notice | null) => void) {
   try {
-    await downloadCsv(`${apiBaseUrl}/api/events/export.csv?take=1000`, `fileserver-events-${new Date().toISOString().slice(0, 10)}.csv`);
+    await downloadCsv(`${apiBaseUrl}/api/events/export.csv?take=10000`, `fileserver-events-${new Date().toISOString().slice(0, 10)}.csv`);
     onNotify({ tone: "success", message: "Exportação de eventos iniciada." });
   } catch (error) {
     console.error(error);
@@ -2118,1165 +2241,6 @@ function titleForTab(tab: Tab) {
   return titles[tab];
 }
 
-function buildDisplayEvents(events: FileAuditEvent[]) {
-  const ordered = deduplicateRawEvents(events).sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime());
-  const consumed = new Set<number>();
-  const display: DisplayEvent[] = [];
-  const emittedSemanticKeys = new Set<string>();
-  const correlationWindowMs = 15_000;
-
-  for (let index = 0; index < ordered.length; index++) {
-    if (consumed.has(index)) {
-      continue;
-    }
-
-    const current = ordered[index];
-    const cluster = ordered
-      .map((event, clusterIndex) => ({ event, clusterIndex }))
-      .filter(({ clusterIndex }) => !consumed.has(clusterIndex))
-      .filter(({ event }) => event.server === current.server && event.share === current.share)
-      .filter(({ event }) => Math.abs(new Date(event.timestampUtc).getTime() - new Date(current.timestampUtc).getTime()) <= correlationWindowMs);
-
-    if (isOperationalNoise(current)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isTransientRenameNoise(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    const explicitTransition = tryBuildExplicitTransition(
-      current,
-      cluster.filter(({ event }) => !isOperationalNoise(event))
-    );
-    if (explicitTransition) {
-      explicitTransition.consumedIndexes.forEach((clusterIndex) => consumed.add(clusterIndex));
-      emittedSemanticKeys.add(getSemanticEventKey(explicitTransition.event));
-      display.push(explicitTransition.event);
-      continue;
-    }
-
-    if (isProvisionalDocumentNoise(current, ordered)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isRedundantRenameAfterCreation(current, ordered)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isRedundantDeletedNoise(current, cluster) || isRedundantCreationNoise(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isRootOnlyNoise(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isRedundantParentCreate(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isUnknownUsnNoise(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    if (isRedundantChangedNoise(current, cluster)) {
-      consumed.add(index);
-      continue;
-    }
-
-    const displayEvent = {
-      ...current,
-      displayAction: formatAction(current.action, current),
-      displayTarget: shouldShowActionTarget(current) ? getLeafName(current.path) : undefined
-    } satisfies DisplayEvent;
-    const semanticKey = getSemanticEventKey(displayEvent);
-
-    if (emittedSemanticKeys.has(semanticKey)) {
-      consumed.add(index);
-      continue;
-    }
-
-    emittedSemanticKeys.add(semanticKey);
-    display.push(displayEvent);
-  }
-
-  return refineDisplayEvents(display);
-}
-
-function refineDisplayEvents(events: DisplayEvent[]) {
-  const withProvisionalCreates = normalizeProvisionalCreateTransitions(events);
-  const withResolvedUsers = resolveUnknownDisplayUsers(withProvisionalCreates);
-
-  return withResolvedUsers.filter((event, _, allEvents) =>
-    !isTransientDisplayNoise(event)
-    && !isRedundantDisplayDeleted(event, allEvents)
-    && !isSuspiciousMoveEcho(event, allEvents)
-    && !isRedundantDisplayFolderChangedEcho(event, allEvents)
-    && !isRedundantDisplayProvisionalCreate(event, allEvents)
-    && !isRedundantDisplayRenameAfterCreate(event, allEvents)
-    && !isRedundantDisplayCreateEcho(event, allEvents)
-    && !isRedundantDisplayChangedEcho(event, allEvents)
-  );
-}
-
-function normalizeProvisionalCreateTransitions(events: DisplayEvent[]) {
-  return events.map((event) => {
-    if ((event.action !== "renamed" && event.action !== "moved") || !event.previousPath) {
-      return event;
-    }
-
-    const provisionalOrigin = isProvisionalDocumentName(event.previousPath) || isProvisionalFolderName(event.previousPath);
-    if (!provisionalOrigin) {
-      return event;
-    }
-
-    return {
-      ...event,
-      action: "created",
-      previousPath: null,
-      displayAction: "Criação",
-      displayTarget: getLeafName(event.path)
-    } satisfies DisplayEvent;
-  });
-}
-
-function resolveUnknownDisplayUsers(events: DisplayEvent[]) {
-  const userWindowMs = 60_000;
-
-  return events.map((event) => {
-    if (event.user !== "UNKNOWN") {
-      return event;
-    }
-
-    const eventTime = new Date(event.timestampUtc).getTime();
-    const userCandidate = events
-      .filter((candidate) =>
-        candidate.id !== event.id
-        && candidate.server === event.server
-        && candidate.share === event.share
-        && candidate.user !== "UNKNOWN"
-        && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= userWindowMs
-        && hasRelatedDisplayPath(event, candidate))
-      .sort((left, right) =>
-        Math.abs(new Date(left.timestampUtc).getTime() - eventTime)
-        - Math.abs(new Date(right.timestampUtc).getTime() - eventTime))[0];
-
-    return userCandidate ? { ...event, user: userCandidate.user } : event;
-  });
-}
-
-function hasRelatedDisplayPath(left: FileAuditEvent, right: FileAuditEvent) {
-  const leftPaths = [left.path, left.previousPath].filter(isPresentString).map((path) => normalizePath(path));
-  const rightPaths = [right.path, right.previousPath].filter(isPresentString).map((path) => normalizePath(path));
-
-  return leftPaths.some((leftPath) =>
-    rightPaths.some((rightPath) =>
-      leftPath === rightPath
-      || rightPath.startsWith(`${leftPath}\\`)
-      || leftPath.startsWith(`${rightPath}\\`)
-      || normalizePath(getParentPath(leftPath)) === normalizePath(getParentPath(rightPath))));
-}
-
-function isPresentString(value: string | null | undefined): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function inferMissingRenamesBeforeMoves(events: DisplayEvent[]) {
-  const synthetic: DisplayEvent[] = [];
-  const renameWindowMs = 120_000;
-
-  for (const moveEvent of events) {
-    const movePreviousPath = moveEvent.previousPath ?? "";
-    if (moveEvent.action !== "moved" || !movePreviousPath || !isFileLikePath(movePreviousPath)) {
-      continue;
-    }
-
-    const moveTime = new Date(moveEvent.timestampUtc).getTime();
-    const alreadyHasRename = events.some((event) =>
-      event.id !== moveEvent.id
-      && event.action === "renamed"
-      && normalizePath(event.path) === normalizePath(movePreviousPath)
-      && Math.abs(new Date(event.timestampUtc).getTime() - moveTime) <= renameWindowMs);
-
-    if (alreadyHasRename) {
-      continue;
-    }
-
-    const createdBeforeMove = events
-      .filter((event) =>
-        (event.action === "created" || event.action === "created_or_appended")
-        && isFileLikePath(event.path)
-        && normalizePath(event.path) !== normalizePath(movePreviousPath)
-        && normalizePath(getParentPath(event.path)) === normalizePath(getParentPath(movePreviousPath))
-        && getExtension(getLeafName(event.path)) === getExtension(getLeafName(movePreviousPath))
-        && new Date(event.timestampUtc).getTime() <= moveTime
-        && moveTime - new Date(event.timestampUtc).getTime() <= renameWindowMs)
-      .sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime())[0];
-
-    if (!createdBeforeMove) {
-      continue;
-    }
-
-    synthetic.push({
-      ...moveEvent,
-      id: `${moveEvent.id}-inferred-rename-before-move`,
-      action: "renamed",
-      previousPath: createdBeforeMove.path,
-      path: movePreviousPath,
-      timestampUtc: new Date(Math.max(new Date(createdBeforeMove.timestampUtc).getTime() + 1_000, moveTime - 1_000)).toISOString(),
-      source: moveEvent.source,
-      displayAction: "Renomeado",
-      displayTarget: getLeafName(movePreviousPath)
-    });
-  }
-
-  return [...events, ...synthetic]
-    .sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime());
-}
-
-function isTransientDisplayNoise(event: DisplayEvent) {
-  if (isTransientArtifactPath(event.path) || isTransientArtifactPath(event.previousPath ?? "")) {
-    return true;
-  }
-
-  if ((event.action === "moved" || event.action === "renamed") && event.previousPath) {
-    const currentParentSegments = normalizePath(getParentPath(event.path)).split("\\").filter(Boolean);
-    const previousParentSegments = normalizePath(getParentPath(event.previousPath)).split("\\").filter(Boolean);
-
-    if (currentParentSegments.some(isTransientContainerSegment) || previousParentSegments.some(isTransientContainerSegment)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function normalizeTransitionDirection(event: DisplayEvent, events: DisplayEvent[]) {
-  if ((event.action !== "moved" && event.action !== "renamed") || !event.previousPath) {
-    return event;
-  }
-
-  const previousPath = event.previousPath ?? "";
-  const nearbyDeletedOnCurrentPath = events.some((candidate) =>
-    candidate.id !== event.id
-    && candidate.action === "deleted"
-    && candidate.user === event.user
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.path) === normalizePath(event.path));
-
-  const nearbyDeletedOnPreviousPath = events.some((candidate) =>
-    candidate.id !== event.id
-    && candidate.action === "deleted"
-    && candidate.user === event.user
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.path) === normalizePath(previousPath));
-
-  if (nearbyDeletedOnCurrentPath && !nearbyDeletedOnPreviousPath) {
-    const swappedPrevious = event.path;
-    const swappedCurrent = previousPath;
-    return {
-      ...event,
-      action: isMove(swappedPrevious, swappedCurrent) ? "moved" : "renamed",
-      previousPath: swappedPrevious,
-      path: swappedCurrent,
-      displayAction: isMove(swappedPrevious, swappedCurrent) ? "Movido" : "Renomeado",
-      displayTarget: getLeafName(swappedCurrent)
-    };
-  }
-
-  return event;
-}
-
-function inferDisplayTransitions(events: DisplayEvent[]) {
-  const ordered = [...events].sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime());
-  const suppressedIds = new Set<string>();
-  const synthetic: DisplayEvent[] = [];
-  const transitionWindowMs = 30_000;
-
-  const folderTransitions = ordered.filter((event) =>
-    (event.action === "created"
-      || event.action === "created_or_appended"
-      || event.action === "changed"
-      || event.action === "modified")
-    && isLikelyFolderPath(event.path));
-  const deletedFiles = ordered.filter((event) =>
-    event.action === "deleted"
-    && isFileLikePath(event.path));
-
-  for (const folder of folderTransitions) {
-    const folderParent = normalizePath(getParentPath(folder.path));
-    const folderTime = new Date(folder.timestampUtc).getTime();
-    const movedFrom = deletedFiles
-      .filter((deletedEvent) =>
-        !suppressedIds.has(deletedEvent.id)
-        && normalizePath(getParentPath(deletedEvent.path)) === folderParent
-        && Math.abs(new Date(deletedEvent.timestampUtc).getTime() - folderTime) <= transitionWindowMs)
-      .sort((left, right) =>
-        Math.abs(new Date(left.timestampUtc).getTime() - folderTime)
-        - Math.abs(new Date(right.timestampUtc).getTime() - folderTime))[0];
-
-    if (!movedFrom) {
-      continue;
-    }
-
-    const nextPath = `${folder.path}\\${getLeafName(movedFrom.path)}`;
-    suppressedIds.add(movedFrom.id);
-    synthetic.push({
-      ...movedFrom,
-      id: `${movedFrom.id}-moved-to-folder`,
-      action: "moved",
-      previousPath: movedFrom.path,
-      path: nextPath,
-      source: "usn-journal+security-log",
-      displayAction: "Movido",
-      displayTarget: getLeafName(nextPath)
-    });
-  }
-
-  const transitionTargets = [...synthetic, ...ordered.filter((event) => event.action === "renamed" || event.action === "moved")];
-  for (const transition of transitionTargets) {
-    if (!transition.previousPath || !isFileLikePath(transition.previousPath)) {
-      continue;
-    }
-
-    const transitionPreviousPath = transition.previousPath;
-    const transitionPrevious = normalizePath(transitionPreviousPath);
-    const transitionParent = normalizePath(getParentPath(transitionPreviousPath));
-    const transitionTime = new Date(transition.timestampUtc).getTime();
-    const renameFrom = deletedFiles
-      .filter((deletedEvent) =>
-        !suppressedIds.has(deletedEvent.id)
-        && normalizePath(deletedEvent.path) !== transitionPrevious
-        && normalizePath(getParentPath(deletedEvent.path)) === transitionParent
-        && getExtension(getLeafName(deletedEvent.path)) === getExtension(getLeafName(transitionPreviousPath))
-        && Math.abs(new Date(deletedEvent.timestampUtc).getTime() - transitionTime) <= transitionWindowMs)
-      .sort((left, right) =>
-        Math.abs(new Date(left.timestampUtc).getTime() - transitionTime)
-        - Math.abs(new Date(right.timestampUtc).getTime() - transitionTime))[0];
-
-    if (!renameFrom) {
-      continue;
-    }
-
-    suppressedIds.add(renameFrom.id);
-    synthetic.push({
-      ...transition,
-      id: `${transition.id}-renamed-before-transition`,
-      action: "renamed",
-      previousPath: renameFrom.path,
-      path: transitionPreviousPath,
-      timestampUtc: renameFrom.timestampUtc,
-      user: renameFrom.user !== "UNKNOWN" ? renameFrom.user : transition.user,
-      source: "usn-journal+security-log",
-      displayAction: "Renomeado",
-      displayTarget: getLeafName(transitionPreviousPath)
-    });
-  }
-
-  for (const deletedEvent of ordered) {
-    if (suppressedIds.has(deletedEvent.id) || deletedEvent.action !== "deleted" || !isFileLikePath(deletedEvent.path)) {
-      continue;
-    }
-
-    const deletedTime = new Date(deletedEvent.timestampUtc).getTime();
-    const renameTo = deletedFiles
-      .filter((candidate) =>
-        candidate.id !== deletedEvent.id
-        && !suppressedIds.has(candidate.id)
-        && normalizePath(candidate.path) !== normalizePath(deletedEvent.path)
-        && normalizePath(getParentPath(candidate.path)) === normalizePath(getParentPath(deletedEvent.path))
-        && getExtension(getLeafName(candidate.path)) === getExtension(getLeafName(deletedEvent.path))
-        && Math.abs(new Date(candidate.timestampUtc).getTime() - deletedTime) <= transitionWindowMs)
-      .sort((left, right) =>
-        Math.abs(new Date(left.timestampUtc).getTime() - deletedTime)
-        - Math.abs(new Date(right.timestampUtc).getTime() - deletedTime))[0];
-
-    if (renameTo) {
-      suppressedIds.add(deletedEvent.id);
-      suppressedIds.add(renameTo.id);
-      synthetic.push({
-        ...renameTo,
-        id: `${renameTo.id}-renamed-from-delete-pair`,
-        action: "renamed",
-        previousPath: deletedEvent.path,
-        path: renameTo.path,
-        timestampUtc: deletedEvent.timestampUtc,
-        source: "usn-journal+security-log",
-        displayAction: "Renomeado",
-        displayTarget: getLeafName(renameTo.path)
-      });
-    }
-  }
-
-  return [...ordered.filter((event) => !suppressedIds.has(event.id)), ...synthetic]
-    .sort((left, right) => new Date(right.timestampUtc).getTime() - new Date(left.timestampUtc).getTime());
-}
-
-function isRedundantDisplayDeleted(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "deleted") {
-    return false;
-  }
-
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && (candidate.action === "renamed" || candidate.action === "moved")
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.previousPath) === normalizePath(event.path));
-}
-
-function isSuspiciousMoveEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "moved" || !event.previousPath) {
-    return false;
-  }
-
-  const previousPath = event.previousPath;
-  const currentParent = normalizePath(getParentPath(event.path));
-  const previousParent = normalizePath(getParentPath(previousPath));
-  if (!previousParent.startsWith(`${currentParent}\\`)) {
-    return false;
-  }
-
-  const eventTime = new Date(event.timestampUtc).getTime();
-  const deletedPrevious = allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && candidate.action === "deleted"
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 30_000
-    && normalizePath(candidate.path) === normalizePath(previousPath));
-
-  const destinationSignalWindowMs = 8_000;
-  const destinationSignal = allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && candidate.action !== "deleted"
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= destinationSignalWindowMs
-    && normalizePath(candidate.path) === normalizePath(event.path));
-
-  return deletedPrevious && !destinationSignal;
-}
-
-function isRedundantDisplayFolderChangedEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (!isLikelyFolderPath(event.path)) {
-    return false;
-  }
-
-  if (event.action !== "changed" && event.action !== "modified") {
-    return false;
-  }
-
-  const folderPath = normalizePath(event.path);
-  const eventTime = new Date(event.timestampUtc).getTime();
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && candidate.action === "moved"
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 30_000
-    && normalizePath(getParentPath(candidate.path)) === folderPath);
-}
-
-function isRedundantDisplayProvisionalCreate(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "created" && event.action !== "created_or_appended") {
-    return false;
-  }
-
-  if (!isProvisionalDocumentName(event.path) && !isProvisionalFolderName(event.path)) {
-    return false;
-  }
-
-  const parentPath = normalizePath(getParentPath(event.path));
-  const eventTime = new Date(event.timestampUtc).getTime();
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 45_000
-    && normalizePath(getParentPath(candidate.path)) === parentPath
-    && (candidate.action === "created" || candidate.action === "renamed" || candidate.action === "moved")
-    && isRelatedToProvisionalCreate(event, candidate));
-}
-
-function isRelatedToProvisionalCreate(provisionalCreate: DisplayEvent, candidate: DisplayEvent) {
-  if (!isProvisionalDocumentName(candidate.path) && !isProvisionalFolderName(candidate.path)) {
-    return true;
-  }
-
-  if (!candidate.previousPath) {
-    return false;
-  }
-
-  return hasSameProvisionalFamily(provisionalCreate.path, candidate.previousPath);
-}
-
-function isRedundantDisplayRenameAfterCreate(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "renamed" && event.action !== "moved") {
-    return false;
-  }
-
-  if (!event.previousPath) {
-    return false;
-  }
-
-  if (!isProvisionalDocumentName(event.previousPath) && !isProvisionalFolderName(event.previousPath)) {
-    return false;
-  }
-
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && (candidate.action === "created" || candidate.action === "created_or_appended")
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.path) === normalizePath(event.path));
-}
-
-function isRedundantDisplayCreateEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "created" && event.action !== "created_or_appended") {
-    return false;
-  }
-
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && (candidate.action === "renamed" || candidate.action === "moved")
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.path) === normalizePath(event.path));
-}
-
-function isRedundantDisplayChangedEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
-  if (event.action !== "changed" && event.action !== "modified") {
-    return false;
-  }
-
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && (
-      normalizePath(candidate.path) === normalizePath(event.path)
-      || normalizePath(candidate.previousPath) === normalizePath(event.path)
-    )
-    && (candidate.action === "renamed"
-      || candidate.action === "moved"
-      || candidate.action === "created"
-      || candidate.action === "created_or_appended"
-      || candidate.action === "deleted"));
-}
-
-function deduplicateRawEvents(events: FileAuditEvent[]) {
-  const grouped = new Map<string, FileAuditEvent>();
-
-  for (const event of events) {
-    const timestamp = new Date(event.timestampUtc);
-    timestamp.setMilliseconds(0);
-    const key = [
-      event.user,
-      event.source,
-      event.action,
-      event.path,
-      event.previousPath ?? "",
-      timestamp.toISOString()
-    ].join("|");
-
-    const existing = grouped.get(key);
-
-    if (!existing || getEventWeight(event) > getEventWeight(existing)) {
-      grouped.set(key, event);
-    }
-  }
-
-  return [...grouped.values()];
-}
-
-function getEventWeight(event: FileAuditEvent) {
-  const sourceWeight = event.source.includes("usn-journal+security-log")
-    ? 30
-    : event.source.includes("usn-journal")
-      ? 20
-      : 10;
-  const actionWeight = event.action === "moved" || event.action === "renamed"
-    ? 30
-    : event.action === "deleted"
-      ? 20
-      : event.action === "created_or_appended" || event.action === "created"
-        ? 15
-        : 5;
-
-  return sourceWeight + actionWeight;
-}
-
-function getSemanticEventKey(event: FileAuditEvent) {
-  const timestamp = new Date(event.timestampUtc);
-  timestamp.setMilliseconds(0);
-
-  const effectiveAction =
-    event.action === "changed" || event.action === "modified"
-      ? "changed"
-      : event.action;
-
-  return [
-    event.user,
-    event.source.includes("usn-journal") ? "usn" : event.source,
-    effectiveAction,
-    normalizePath(event.path),
-    normalizePath(event.previousPath),
-    timestamp.toISOString()
-  ].join("|");
-}
-
-function getParentPath(path: string) {
-  const segments = path.split("\\");
-  return segments.length > 1 ? segments.slice(0, -1).join("\\") : path;
-}
-
-function isRenameLikeAction(action: string) {
-  return action === "renamed" || action === "changed" || action === "modified";
-}
-
-function isMove(previousPath: string, nextPath: string) {
-  return getParentPath(previousPath).toLowerCase() !== getParentPath(nextPath).toLowerCase();
-}
-
-function isOperationalNoise(event: FileAuditEvent) {
-  const path = event.path.toLowerCase();
-  const previousPath = (event.previousPath ?? "").toLowerCase();
-
-  return path.endsWith("\\appsettings.agent.json")
-    || path.endsWith("\\agent-state.json")
-    || path.endsWith("\\pending-events.ndjson")
-    || path.includes("\\logs\\")
-    || path.endsWith("\\logs")
-    || isTransientArtifactPath(event.path)
-    || isTransientArtifactPath(previousPath);
-}
-
-function isLikelyFolderPath(path: string) {
-  return !getLeafName(path).includes(".");
-}
-
-function isFileLikePath(path: string) {
-  return getLeafName(path).includes(".");
-}
-
-function isRootOnlyNoise(
-  event: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (!isLikelyFolderPath(event.path)) {
-    return false;
-  }
-
-  if (isShareRootPath(event)) {
-    return true;
-  }
-
-  return cluster.some(({ event: candidate }) =>
-    candidate.id !== event.id
-    && isFileLikePath(candidate.path)
-    && normalizePath(getParentPath(candidate.path)) === normalizePath(event.path)
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000);
-}
-
-function isShareRootPath(event: FileAuditEvent) {
-  const shareName = event.share.trim().toLowerCase();
-  if (!shareName) {
-    return false;
-  }
-
-  const leafName = getLeafName(event.path).toLowerCase();
-  if (leafName !== shareName) {
-    return false;
-  }
-
-  const parentPath = normalizePath(getParentPath(event.path));
-  return /^[a-z]:$/i.test(parentPath)
-    || /^\\\\[^\\]+$/.test(parentPath);
-}
-
-function isRedundantParentCreate(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  return current.source === "windows-security-log"
-    && current.action === "created_or_appended"
-    && cluster.some(({ event }) =>
-      event.id !== current.id
-      && event.server === current.server
-      && event.share === current.share
-      && event.user === current.user
-      && (event.action === "deleted" || isRenameLikeAction(event.action))
-      && getParentPath(event.path) === current.path);
-}
-
-function isUnknownUsnNoise(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  return current.source === "usn-journal"
-    && current.user === "UNKNOWN"
-    && (current.action === "changed" || current.action === "modified")
-    && cluster.some(({ event }) =>
-      event.id !== current.id
-      && event.path === current.path
-      && event.source !== "usn-journal"
-      && event.action !== "changed"
-      && event.action !== "modified");
-}
-
-function isProvisionalDocumentNoise(
-  current: FileAuditEvent,
-  ordered: FileAuditEvent[]
-) {
-  const isProvisionalName = isProvisionalDocumentName(current.path) || isProvisionalFolderName(current.path);
-  if (!isProvisionalName) {
-    return false;
-  }
-
-  if (current.action === "created" || current.action === "created_or_appended") {
-    return true;
-  }
-
-  const currentParent = getParentPath(current.path);
-  const currentTime = new Date(current.timestampUtc).getTime();
-
-  return ordered.some((event) => {
-    if (event.id === current.id) {
-      return false;
-    }
-
-    if (Math.abs(new Date(event.timestampUtc).getTime() - currentTime) > 15_000) {
-      return false;
-    }
-
-    if (!isFileLikePath(event.path) && !isLikelyFolderPath(event.path)) {
-      return false;
-    }
-
-    if (getParentPath(event.path) !== currentParent) {
-      return false;
-    }
-
-    if (isProvisionalDocumentName(event.path)) {
-      return false;
-    }
-
-    if (isProvisionalFolderName(event.path)) {
-      return false;
-    }
-
-    return event.action === "renamed"
-      || event.action === "moved"
-      || event.action === "deleted"
-      || event.action === "created"
-      || event.action === "created_or_appended"
-      || event.action === "changed"
-      || event.action === "modified";
-  });
-}
-
-function isRedundantRenameAfterCreation(
-  current: FileAuditEvent,
-  ordered: FileAuditEvent[]
-) {
-  if (current.action !== "renamed") {
-    return false;
-  }
-
-  if (!current.previousPath) {
-    return false;
-  }
-
-  const provisionalOrigin = isProvisionalDocumentName(current.previousPath) || isProvisionalFolderName(current.previousPath);
-  if (!provisionalOrigin) {
-    return false;
-  }
-
-  const currentPath = normalizePath(current.path);
-  const currentTime = new Date(current.timestampUtc).getTime();
-
-  return ordered.some((event) =>
-    event.id !== current.id
-    && Math.abs(new Date(event.timestampUtc).getTime() - currentTime) <= 15_000
-    && (event.action === "created" || event.action === "created_or_appended")
-    && normalizePath(event.path) === currentPath);
-}
-
-function isRedundantDeletedNoise(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (current.action !== "deleted") {
-    return false;
-  }
-
-  const currentPath = normalizePath(current.path);
-  return cluster.some(({ event }) => {
-    if (event.id === current.id) {
-      return false;
-    }
-
-    if (event.action !== "renamed" && event.action !== "moved" && event.action !== "created") {
-      return false;
-    }
-
-    return normalizePath(event.previousPath) === currentPath
-      || normalizePath(event.path) === currentPath;
-  });
-}
-
-function isRedundantCreationNoise(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (current.action !== "created_or_appended" && current.action !== "created") {
-    return false;
-  }
-
-  const currentPath = normalizePath(current.path);
-  return cluster.some(({ event }) => {
-    if (event.id === current.id) {
-      return false;
-    }
-
-    if (event.action !== "renamed" && event.action !== "moved" && event.action !== "created") {
-      return false;
-    }
-
-    return normalizePath(event.path) === currentPath
-      || normalizePath(event.previousPath) === currentPath;
-  });
-}
-
-function isTransientRenameNoise(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (current.action !== "renamed" && current.action !== "moved") {
-    return false;
-  }
-
-  const touchesTransientArtifact =
-    isTransientArtifactPath(current.path)
-    || isTransientArtifactPath(current.previousPath ?? "");
-
-  if (!touchesTransientArtifact) {
-    return false;
-  }
-
-  return cluster.some(({ event }) =>
-    event.id !== current.id
-    && event.action === "deleted"
-    && isFileLikePath(event.path)
-    && (
-      normalizePath(event.path).startsWith(normalizePath(current.previousPath))
-      || normalizePath(event.path).startsWith(normalizePath(current.path))
-      || normalizePath(getParentPath(event.path)) === normalizePath(current.previousPath)
-    ));
-}
-
-function isRedundantChangedNoise(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (!current.source.includes("usn-journal")) {
-    return false;
-  }
-
-  if (current.action !== "changed" && current.action !== "modified") {
-    return false;
-  }
-
-  const currentPath = normalizePath(current.path);
-  const currentTimestamp = new Date(current.timestampUtc).getTime();
-  const strongerEvent = cluster.find(({ event }) => {
-    if (event.id === current.id) {
-      return false;
-    }
-
-    const touchesSamePath =
-      normalizePath(event.path) === currentPath
-      || normalizePath(event.previousPath) === currentPath;
-
-    if (!touchesSamePath) {
-      return false;
-    }
-
-    if (event.action === "renamed" || event.action === "moved" || event.action === "deleted") {
-      return true;
-    }
-
-    if ((event.action === "created" || event.action === "created_or_appended")
-      && isFileLikePath(event.path)) {
-      return true;
-    }
-
-    if (!event.source.includes("usn-journal")) {
-      return false;
-    }
-
-    if (event.action !== "changed" && event.action !== "modified") {
-      return false;
-    }
-
-    return new Date(event.timestampUtc).getTime() > currentTimestamp;
-  });
-
-  return Boolean(strongerEvent);
-}
-
-function tryBuildFileTransition(
-  current: FileAuditEvent,
-  cluster: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  const relevant = cluster.filter(({ event }) => !isOperationalNoise(event));
-  const explicitTransition = tryBuildExplicitTransition(current, relevant);
-  if (explicitTransition) {
-    return explicitTransition;
-  }
-
-  const securityDeleted = relevant
-    .filter(({ event }) =>
-      event.source === "windows-security-log"
-      && event.action === "deleted"
-      && isFileLikePath(event.path))
-    .map(({ event, clusterIndex }) => ({ event, clusterIndex }));
-  const usnCandidates = relevant
-    .filter(({ event }) =>
-      event.source.includes("usn-journal")
-      && (event.action === "changed" || event.action === "modified" || event.action === "renamed" || event.action === "moved")
-      && isFileLikePath(event.path)
-      && !isTransientArtifactPath(event.path))
-    .map(({ event, clusterIndex }) => ({ event, clusterIndex }));
-
-  for (const deleted of securityDeleted) {
-    const match = usnCandidates
-      .filter(({ event }) => normalizePath(event.path) !== normalizePath(deleted.event.path))
-      .map(({ event, clusterIndex }) => ({
-        event,
-        clusterIndex,
-        score: getTransitionScore(deleted.event.path, event.path)
-      }))
-      .filter((candidate) => candidate.score > 0)
-      .sort((left, right) => right.score - left.score)[0];
-
-    if (!match) {
-      continue;
-    }
-
-    const previousPath = deleted.event.path;
-    const nextPath = match.event.path;
-    const isProvisionalOrigin = isProvisionalDocumentName(previousPath) || isProvisionalFolderName(previousPath);
-    const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
-    const displayAction = isProvisionalOrigin
-      ? "Criação"
-      : action === "moved"
-        ? "Movido"
-        : "Renomeado";
-    const consumedIndexes = relevant
-      .filter(({ event }) => shouldConsumeTransitionEvent(event, previousPath, nextPath))
-      .map(({ clusterIndex }) => clusterIndex);
-
-    return {
-      consumedIndexes,
-      event: {
-        ...match.event,
-        id: `${match.event.id}-${action}`,
-        action: isProvisionalOrigin ? "created" : action,
-        previousPath: isProvisionalOrigin ? null : previousPath,
-        path: nextPath,
-        user: deleted.event.user !== "UNKNOWN" ? deleted.event.user : match.event.user,
-        source: match.event.source.includes("security-log") ? match.event.source : "usn-journal+security-log",
-        displayAction,
-        displayTarget: getLeafName(nextPath)
-      } satisfies DisplayEvent
-    };
-  }
-
-  return null;
-}
-
-function tryBuildExplicitTransition(
-  current: FileAuditEvent,
-  relevant: Array<{ event: FileAuditEvent; clusterIndex: number }>
-) {
-  if (!current.previousPath) {
-    return null;
-  }
-
-  if (current.action !== "renamed" && current.action !== "moved") {
-    return null;
-  }
-
-  const previousPath = current.previousPath ?? "";
-  const isFileTransition = isFileLikePath(current.path) && isFileLikePath(previousPath);
-  const isFolderTransition = isLikelyFolderPath(current.path) && isLikelyFolderPath(previousPath);
-
-  if (!isFileTransition && !isFolderTransition) {
-    return null;
-  }
-
-  const nextPath = current.path;
-  const isProvisionalOrigin = isProvisionalDocumentName(previousPath) || isProvisionalFolderName(previousPath);
-  const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
-  const displayAction = isProvisionalOrigin
-    ? "Criação"
-    : action === "moved"
-      ? "Movido"
-      : "Renomeado";
-  const consumedIndexes = relevant
-    .filter(({ event }) => shouldConsumeTransitionEvent(event, previousPath, nextPath))
-    .map(({ clusterIndex }) => clusterIndex);
-
-  return {
-    consumedIndexes,
-      event: {
-        ...current,
-        id: `${current.id}-${action}-explicit`,
-        action: isProvisionalOrigin ? "created" : action,
-        previousPath: isProvisionalOrigin ? null : previousPath,
-        path: nextPath,
-        displayAction,
-        displayTarget: getLeafName(nextPath)
-      } satisfies DisplayEvent
-  };
-}
-
-function shouldConsumeTransitionEvent(
-  event: FileAuditEvent,
-  previousPath: string,
-  nextPath: string
-) {
-  const normalizedPath = normalizePath(event.path);
-  const normalizedPrevious = normalizePath(event.previousPath);
-  const normalizedTransitionPrevious = normalizePath(previousPath);
-  const normalizedTransitionNext = normalizePath(nextPath);
-
-  if (event.action === "renamed" || event.action === "moved") {
-    return normalizedPath === normalizedTransitionNext
-      && normalizedPrevious === normalizedTransitionPrevious;
-  }
-
-  return normalizedPath === normalizedTransitionPrevious
-    || normalizedPath === normalizedTransitionNext
-    || normalizedPrevious === normalizedTransitionPrevious
-    || normalizedPrevious === normalizedTransitionNext
-    || (event.action === "created_or_appended" && normalizedPath === normalizedTransitionNext);
-}
-
-function getTransitionScore(previousPath: string, nextPath: string) {
-  const previousLeaf = getLeafName(previousPath).toLowerCase();
-  const nextLeaf = getLeafName(nextPath).toLowerCase();
-
-  if (previousLeaf === nextLeaf && previousLeaf !== "") {
-    return 100;
-  }
-
-  const previousExtension = getExtension(previousLeaf);
-  const nextExtension = getExtension(nextLeaf);
-  const previousParent = getParentPath(previousPath).toLowerCase();
-  const nextParent = getParentPath(nextPath).toLowerCase();
-
-  if (previousExtension && previousExtension === nextExtension && previousParent === nextParent) {
-    return 80;
-  }
-
-  if (previousExtension && previousExtension === nextExtension) {
-    return 60;
-  }
-
-  return 0;
-}
-
-function getExtension(value: string) {
-  const index = value.lastIndexOf(".");
-  return index >= 0 ? value.slice(index) : "";
-}
-
-function isTransientArtifactPath(path: string) {
-  const normalized = normalizePath(path);
-  const leaf = getLeafName(path).toLowerCase();
-  const segments = normalized.split("\\").filter(Boolean);
-  const hasTransientContainer = segments.some(isTransientContainerSegment);
-
-  return hasTransientContainer
-    || leaf.startsWith("$")
-    || leaf.startsWith("~$")
-    || leaf === "thumbs.db"
-    || leaf === "desktop.ini"
-    || leaf.endsWith(".tmp")
-    || leaf === "volumejoblock.bin"
-    || leaf.startsWith("optimizationstate.xml")
-    || leaf.startsWith("chunkstorestatistics.xml")
-    || leaf.startsWith("changes.optimization.");
-}
-
-function isTransientContainerSegment(segment: string) {
-  return segment === "$recycle.bin"
-    || /^\$i[a-z0-9]{5,}$/i.test(segment)
-    || /^\$r[a-z0-9]{5,}$/i.test(segment)
-    || /^\$[a-z0-9]{7,}$/i.test(segment);
-}
-
-function isProvisionalDocumentName(path: string) {
-  return getProvisionalDocumentKind(path) !== null;
-}
-
-function hasSameProvisionalFamily(leftPath: string, rightPath: string) {
-  const leftKind = getProvisionalDocumentKind(leftPath);
-  const rightKind = getProvisionalDocumentKind(rightPath);
-  return leftKind !== null && leftKind === rightKind;
-}
-
-function getProvisionalDocumentKind(path: string) {
-  const baseLeaf = getLeafName(path)
-    .toLowerCase()
-    .replace(/ \(\d+\)(?=\.[^.]+$)/, "");
-
-  const provisionalKinds: Array<[string, RegExp[]]> = [
-    ["text", [
-      /^novo documento de texto\.txt$/,
-      /^new text document\.txt$/
-    ]],
-    ["excel", [
-      /^novo\(a\) planilha do microsoft excel.*\.xlsx$/,
-      /^new microsoft excel worksheet.*\.xlsx$/
-    ]],
-    ["word", [
-      /^novo\(a\) documento do microsoft word.*\.docx$/,
-      /^new microsoft word document.*\.docx$/
-    ]],
-    ["powerpoint", [
-      /^novo\(a\) apresenta.*microsoft powerpoint.*\.pptx$/,
-      /^new microsoft powerpoint presentation.*\.pptx$/
-    ]],
-    ["publisher", [
-      /^novo\(a\).*microsoft publisher document.*\.pub$/,
-      /^new microsoft publisher document.*\.pub$/
-    ]],
-    ["bitmap", [
-      /^nova imagem de bitmap.*\.bmp$/,
-      /^new bitmap image.*\.bmp$/
-    ]]
-  ];
-
-  return provisionalKinds.find(([, patterns]) =>
-    patterns.some((pattern) => pattern.test(baseLeaf)))?.[0] ?? null;
-}
-
-function isProvisionalFolderName(path: string) {
-  const leaf = getLeafName(path).toLowerCase();
-  return leaf === "nova pasta"
-    || leaf === "new folder";
-}
-
-function normalizePath(path?: string | null) {
-  return (path ?? "").trim().replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase();
-}
-
-function getLeafName(path: string) {
-  const segments = path.split("\\").filter(Boolean);
-  return segments[segments.length - 1] ?? path;
-}
-
 function formatSource(event: FileAuditEvent) {
   if (event.sourceHost || event.sourceIp) {
     return [event.sourceHost, event.sourceIp].filter(Boolean).join(" · ");
@@ -3293,7 +2257,7 @@ function formatSource(event: FileAuditEvent) {
 }
 
 function formatAction(action: string, event?: FileAuditEvent) {
-  if (action === "renamed" && event?.previousPath && isMove(event.previousPath, event.path)) {
+  if (action === "renamed" && event?.previousPath && isCrossFolderRename(event.previousPath, event.path)) {
     return "Movido";
   }
 
@@ -3314,8 +2278,15 @@ function formatAction(action: string, event?: FileAuditEvent) {
   return labels[action] ?? action;
 }
 
-function shouldShowActionTarget(event: FileAuditEvent) {
-  return event.action !== "accessed";
+function isCrossFolderRename(previousPath: string, nextPath: string) {
+  return getDisplayParentPath(previousPath).toLowerCase() !== getDisplayParentPath(nextPath).toLowerCase();
+}
+
+function getDisplayParentPath(path: string) {
+  const normalized = path.trim().replaceAll("/", "\\").replace(/\\+$/, "");
+  const separatorIndex = normalized.lastIndexOf("\\");
+
+  return separatorIndex <= 0 ? normalized : normalized.slice(0, separatorIndex);
 }
 
 function getHighestAnomaly(response: BaselineAnomalyResponse | null) {
