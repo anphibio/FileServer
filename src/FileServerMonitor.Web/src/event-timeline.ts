@@ -177,7 +177,7 @@ function getSyntheticCreationCandidate(
   displayEvents: DisplayEvent[],
   rawEvents: FileAuditEvent[]
 ) {
-  if ((rawEvent.action === "moved" || rawEvent.action === "renamed")
+  if (rawEvent.action === "renamed"
     && rawEvent.previousPath
     && rawEvent.source.includes("security-log")
     && isFileLikePath(rawEvent.previousPath)
@@ -527,11 +527,11 @@ function isStrongLifecycleAction(action: string) {
 
 function normalizeProvisionalCreateTransitions(events: DisplayEvent[]) {
   return events.map((event) => {
-    if ((event.action !== "renamed" && event.action !== "moved") || !event.previousPath) {
+    if (event.action !== "renamed" || !event.previousPath) {
       return event;
     }
 
-  const provisionalOrigin = isProvisionalDocumentName(event.previousPath);
+    const provisionalOrigin = isProvisionalDocumentName(event.previousPath);
     if (!provisionalOrigin) {
       return event;
     }
@@ -825,6 +825,19 @@ function isRedundantDisplayRenameAfterCreate(event: DisplayEvent, allEvents: Dis
 function isRedundantDisplayCreateEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
   if (event.action !== "created" && event.action !== "created_or_appended") {
     return false;
+  }
+
+  if (isLikelyFolderPath(event.path)) {
+    const eventTime = new Date(event.timestampUtc).getTime();
+    const folderPath = normalizePath(event.path);
+    const movedIntoFolder = allEvents.some((candidate) =>
+      candidate.id !== event.id
+      && candidate.action === "moved"
+      && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
+      && normalizePath(getParentPath(candidate.path)) === folderPath);
+    if (movedIntoFolder) {
+      return true;
+    }
   }
 
   if (event.source === "windows-security-log" && hasReplacementCharacter(event.path)) {
@@ -1369,7 +1382,7 @@ function tryBuildExplicitTransition(
   }
 
   const nextPath = current.path;
-  const isProvisionalOrigin = isProvisionalDocumentName(previousPath);
+  const isProvisionalOrigin = current.action === "renamed" && isProvisionalDocumentName(previousPath);
   const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
   const displayAction = isProvisionalOrigin
     ? "Criação"

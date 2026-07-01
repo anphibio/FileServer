@@ -708,6 +708,52 @@ test("suppresses access echoes immediately before a folder deletion", () => {
   ]);
 });
 
+test("suppresses destination folder create echoes when moving items into it", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "destination-create-echo",
+      timestampUtc: "2026-07-01T04:44:36.763Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "created_or_appended",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "file-moved",
+      timestampUtc: "2026-07-01T04:44:36.000Z",
+      path: "C:\\Corporativo\\Example folder\\Modelo Relatório Tecnico.docx",
+      previousPath: "C:\\Corporativo\\Modelo Relatório Tecnico.docx",
+      action: "moved",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\Example folder\\Modelo Relatório Tecnico.docx", "Movido"]
+  ]);
+});
+
+test("keeps moved provisional office document as moved", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "office-moved",
+      timestampUtc: "2026-07-01T04:44:43.000Z",
+      path: "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      previousPath: "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      action: "moved",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.previousPath, event.displayAction]), [
+    [
+      "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      "Movido"
+    ]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
