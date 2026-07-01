@@ -162,6 +162,36 @@ test("does not let a near creation access echo replace the creation", () => {
   assert.deepEqual(display.map((event) => event.displayAction), ["Criação"]);
 });
 
+test("suppresses access and mojibake security creation echoes near a usn creation", () => {
+  const correctPath = "C:\\Corporativo\\Anderson Fábio Costa Bandeira - Sobreaviso XX-2026.xlsx";
+  const mojibakePath = "C:\\Corporativo\\Anderson F�bio Costa Bandeira - Sobreaviso XX-2026.xlsx";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "accessed-echo",
+      timestampUtc: "2026-07-01T02:12:03.923Z",
+      path: mojibakePath,
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "security-created-echo",
+      timestampUtc: "2026-07-01T02:12:02.903Z",
+      path: mojibakePath,
+      action: "created_or_appended",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "usn-created",
+      timestampUtc: "2026-07-01T02:12:02.000Z",
+      path: correctPath,
+      action: "created",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [[correctPath, "Criação"]]);
+});
+
 test("keeps a folder deletion when recursive cleanup also deletes its children", () => {
   const display = buildDisplayEvents([
     buildEvent({

@@ -570,6 +570,16 @@ function isRedundantDisplayCreateEcho(event: DisplayEvent, allEvents: DisplayEve
     return false;
   }
 
+  if (event.source === "windows-security-log" && hasReplacementCharacter(event.path)) {
+    const eventTime = new Date(event.timestampUtc).getTime();
+    return allEvents.some((candidate) =>
+      candidate.id !== event.id
+      && candidate.source.includes("usn-journal")
+      && (candidate.action === "created" || candidate.action === "created_or_appended")
+      && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
+      && pathsReferToSameItem(candidate.path, event.path));
+  }
+
   const provisionalOrigin = isProvisionalDocumentName(event.path) || isProvisionalFolderName(event.path);
   if (!provisionalOrigin) {
     return false;
@@ -610,8 +620,8 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
   return allEvents.some((candidate) =>
     candidate.id !== event.id
     && (candidate.action === "created" || candidate.action === "created_or_appended")
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 2_000
-    && normalizePath(candidate.path) === normalizePath(event.path));
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
+    && pathsReferToSameItem(candidate.path, event.path));
 }
 
 function deduplicateRawEvents(events: FileAuditEvent[]) {
@@ -1144,6 +1154,37 @@ function isProvisionalFolderName(path: string) {
 
 function normalizePath(path?: string | null) {
   return (path ?? "").trim().replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function pathsReferToSameItem(left?: string | null, right?: string | null) {
+  const normalizedLeft = normalizePath(left);
+  const normalizedRight = normalizePath(right);
+
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+
+  if (!hasReplacementCharacter(normalizedLeft) && !hasReplacementCharacter(normalizedRight)) {
+    return false;
+  }
+
+  if (normalizedLeft.length !== normalizedRight.length) {
+    return false;
+  }
+
+  for (let index = 0; index < normalizedLeft.length; index++) {
+    const leftChar = normalizedLeft[index];
+    const rightChar = normalizedRight[index];
+    if (leftChar !== rightChar && leftChar !== "�" && rightChar !== "�") {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function hasReplacementCharacter(value?: string | null) {
+  return (value ?? "").includes("�");
 }
 
 function getLeafName(path: string) {
