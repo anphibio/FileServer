@@ -13,7 +13,9 @@ ps_script="$(mktemp)"
 cat > "${ps_script}" <<PS
 \$ErrorActionPreference = "Stop"
 \$root = "${ROOT_PATH}"
+\$source = Join-Path \$env:TEMP "${ROOT_NAME}-source"
 Remove-Item \$root -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item \$source -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path \$root | Out-Null
 
 Set-Content -Path (Join-Path \$root "01-single-file.txt") -Value "single" -Encoding UTF8
@@ -42,6 +44,13 @@ New-Item -ItemType File -Path (Join-Path \$root "06-default-names\\Nova Imagem d
 New-Item -ItemType File -Path (Join-Path \$root "06-default-names\\Novo(a) Planilha do Microsoft Excel.xlsx") -Force | Out-Null
 New-Item -ItemType File -Path (Join-Path \$root "06-default-names\\Novo(a) Documento do Microsoft Word.docx") -Force | Out-Null
 New-Item -ItemType File -Path (Join-Path \$root "06-default-names\\Novo(a) Apresentação do Microsoft PowerPoint.pptx") -Force | Out-Null
+
+New-Item -ItemType Directory -Path (Join-Path \$source "copied-sub") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path \$source "empty-copied-folder") -Force | Out-Null
+Set-Content -Path (Join-Path \$source "copied-file.txt") -Value "copied" -Encoding UTF8
+Set-Content -Path (Join-Path \$source "copied-sub\\copied-child.docx") -Value "copied child" -Encoding UTF8
+Copy-Item -LiteralPath \$source -Destination (Join-Path \$root "07-copied-tree") -Recurse -Force
+Remove-Item \$source -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output \$root
 PS
@@ -80,7 +89,12 @@ cat > "${expected_json}" <<JSON
   "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\06-default-names\\\\Nova Imagem de Bitmap.bmp",
   "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\06-default-names\\\\Novo(a) Planilha do Microsoft Excel.xlsx",
   "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\06-default-names\\\\Novo(a) Documento do Microsoft Word.docx",
-  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\06-default-names\\\\Novo(a) Apresentação do Microsoft PowerPoint.pptx"
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\06-default-names\\\\Novo(a) Apresentação do Microsoft PowerPoint.pptx",
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\07-copied-tree",
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\07-copied-tree\\\\copied-file.txt",
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\07-copied-tree\\\\copied-sub",
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\07-copied-tree\\\\copied-sub\\\\copied-child.docx",
+  "C:\\\\Corporativo\\\\${ROOT_NAME}\\\\07-copied-tree\\\\empty-copied-folder"
 ]
 JSON
 
