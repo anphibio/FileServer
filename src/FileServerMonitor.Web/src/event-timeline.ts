@@ -171,6 +171,7 @@ function getSyntheticCreationCandidate(
 ) {
   if ((rawEvent.action === "moved" || rawEvent.action === "renamed")
     && rawEvent.previousPath
+    && rawEvent.source.includes("security-log")
     && isFileLikePath(rawEvent.previousPath)
     && !isProvisionalDocumentName(rawEvent.previousPath)
     && !isProvisionalFolderName(rawEvent.previousPath)) {
@@ -178,7 +179,8 @@ function getSyntheticCreationCandidate(
     if (!hasDisplayCreation(displayEvents, originPath)
       && !hasLikelyInitialDisplayCreation(displayEvents, originPath)
       && !hasDisplayTransitionDestination(displayEvents, originPath, rawEvent.timestampUtc)
-      && !hasEarlierStrongRawHistory(originPath, rawEvent.timestampUtc, rawEvents)) {
+      && !hasEarlierStrongRawHistory(originPath, rawEvent.timestampUtc, rawEvents)
+      && !hasNearbyRawDelete(originPath, rawEvent.timestampUtc, rawEvents)) {
       return buildSyntheticCreationEvent(rawEvent, rawEvent.previousPath, -1_000);
     }
   }
@@ -382,6 +384,15 @@ function hasEarlierStrongRawHistory(path: string, timestampUtc: string, rawEvent
 
     return !isIgnorableEarlierRawLifecycle(candidate, path);
   });
+}
+
+function hasNearbyRawDelete(path: string, timestampUtc: string, rawEvents: FileAuditEvent[]) {
+  const eventTime = new Date(timestampUtc).getTime();
+
+  return rawEvents.some((candidate) =>
+    candidate.action === "deleted"
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
+    && pathsReferToSameItem(candidate.path, path));
 }
 
 function hasEarlierNonDeletedStrongRawHistory(path: string, timestampUtc: string, rawEvents: FileAuditEvent[]) {

@@ -560,8 +560,49 @@ test("suppresses security delete echoes after a rename with mojibake accents", (
   ]);
 
   assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
-    ["C:\\Corporativo\\Modelo Relatório Tecnico20.docx", "Renomeado"],
-    ["C:\\Corporativo\\Modelo Relatório Tecnico.docx", "Criação"]
+    ["C:\\Corporativo\\Modelo Relatório Tecnico20.docx", "Renomeado"]
+  ]);
+});
+
+test("does not synthesize creation for usn-only rename origins", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "rename-usn-only",
+      timestampUtc: "2026-07-01T03:54:14.000Z",
+      path: "C:\\Corporativo\\codex-client-check-30.txt",
+      previousPath: "C:\\Corporativo\\codex-client-check-01020.txt",
+      action: "renamed",
+      source: "usn-journal",
+      user: "UNKNOWN"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\codex-client-check-30.txt", "Renomeado"]
+  ]);
+});
+
+test("does not synthesize creation when a rename origin has a nearby delete echo", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "rename-origin-delete-echo",
+      timestampUtc: "2026-07-01T03:54:06.683Z",
+      path: "C:\\Corporativo\\codex-client-check-02.md",
+      action: "deleted",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "rename-final",
+      timestampUtc: "2026-07-01T03:54:06.000Z",
+      path: "C:\\Corporativo\\codex-client-check-30.md",
+      previousPath: "C:\\Corporativo\\codex-client-check-02.md",
+      action: "renamed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\codex-client-check-30.md", "Renomeado"]
   ]);
 });
 
