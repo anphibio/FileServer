@@ -570,6 +570,11 @@ function normalizeProvisionalCreateTransitions(events: DisplayEvent[]) {
       return event;
     }
 
+    if (hasDisplayTransitionDestination(events, event.previousPath, event.timestampUtc)
+      || hasDisplayCreation(events, normalizePath(event.previousPath))) {
+      return event;
+    }
+
     return {
       ...event,
       action: "created",
@@ -954,6 +959,7 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
   }
 
   const eventTime = new Date(event.timestampUtc).getTime();
+  const eventPath = normalizePath(event.path);
   return allEvents.some((candidate) =>
     candidate.id !== event.id
     && (candidate.action === "created"
@@ -962,7 +968,12 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
       || candidate.action === "moved"
       || candidate.action === "deleted")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
-    && pathsReferToSameItem(candidate.path, event.path));
+    && (
+      pathsReferToSameItem(candidate.path, event.path)
+      || pathsReferToSameItem(candidate.previousPath, event.path)
+      || eventPath === normalizePath(getParentPath(candidate.path))
+      || eventPath === normalizePath(getParentPath(candidate.previousPath ?? ""))
+    ));
 }
 
 function deduplicateRawEvents(events: FileAuditEvent[]) {
@@ -1416,7 +1427,9 @@ function tryBuildExplicitTransition(
   }
 
   const nextPath = current.path;
-  const isProvisionalOrigin = current.action === "renamed" && isProvisionalDocumentName(previousPath);
+  const isProvisionalOrigin = current.action === "renamed"
+    && isProvisionalDocumentName(previousPath)
+    && !hasNearbyTransitionDestination(relevant, previousPath, current.timestampUtc);
   const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
   const displayAction = isProvisionalOrigin
     ? "Criação"
@@ -1439,6 +1452,20 @@ function tryBuildExplicitTransition(
       displayTarget: getLeafName(nextPath)
     } satisfies DisplayEvent
   };
+}
+
+function hasNearbyTransitionDestination(
+  relevant: Array<{ event: FileAuditEvent; clusterIndex: number }>,
+  path: string,
+  beforeUtc: string
+) {
+  const normalizedPath = normalizePath(path);
+  const beforeTime = new Date(beforeUtc).getTime();
+
+  return relevant.some(({ event }) =>
+    (event.action === "renamed" || event.action === "moved")
+    && normalizePath(event.path) === normalizedPath
+    && new Date(event.timestampUtc).getTime() <= beforeTime);
 }
 
 function tryBuildSecurityLogRenameTransition(

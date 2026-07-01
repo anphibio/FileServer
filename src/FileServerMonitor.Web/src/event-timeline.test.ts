@@ -928,6 +928,79 @@ test("keeps moved provisional office document as moved", () => {
   ]);
 });
 
+test("suppresses parent and origin access echoes around a move", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "source-access",
+      timestampUtc: "2026-07-01T05:40:53.357Z",
+      path: "C:\\Corporativo\\codex-client-check-02 - rename.md",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-access",
+      timestampUtc: "2026-07-01T05:40:53.363Z",
+      path: "C:\\Corporativo\\Example folder\\codex-client-check-02 - rename.md",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "parent-access",
+      timestampUtc: "2026-07-01T05:40:53.370Z",
+      path: "C:\\Corporativo\\Example folder",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "file-move",
+      timestampUtc: "2026-07-01T05:40:53.000Z",
+      path: "C:\\Corporativo\\Example folder\\codex-client-check-02 - rename.md",
+      previousPath: "C:\\Corporativo\\codex-client-check-02 - rename.md",
+      action: "moved",
+      source: "usn-journal"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.path]), [
+    ["Movido", "C:\\Corporativo\\Example folder\\codex-client-check-02 - rename.md"]
+  ]);
+});
+
+test("keeps rename after moving a provisional office document as rename", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "office-move",
+      timestampUtc: "2026-07-01T05:40:27.000Z",
+      path: "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      previousPath: "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      action: "moved",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "office-rename",
+      timestampUtc: "2026-07-01T05:40:37.000Z",
+      path: "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel- rename.xlsx",
+      previousPath: "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      action: "renamed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.previousPath, event.path]), [
+    [
+      "Renomeado",
+      "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel- rename.xlsx"
+    ],
+    [
+      "Movido",
+      "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx",
+      "C:\\Corporativo\\Example folder\\Novo(a) Planilha do Microsoft Excel.xlsx"
+    ]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
