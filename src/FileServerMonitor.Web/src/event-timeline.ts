@@ -912,7 +912,8 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
     && (candidate.action === "created"
       || candidate.action === "created_or_appended"
       || candidate.action === "renamed"
-      || candidate.action === "moved")
+      || candidate.action === "moved"
+      || candidate.action === "deleted")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
     && pathsReferToSameItem(candidate.path, event.path));
 }

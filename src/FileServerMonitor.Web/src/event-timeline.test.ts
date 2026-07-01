@@ -683,6 +683,31 @@ test("reconstructs a nested file rename from security delete and access signals"
   ]);
 });
 
+test("suppresses access echoes immediately before a folder deletion", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "delete-access-echo",
+      timestampUtc: "2026-07-01T04:24:31.843Z",
+      path: "C:\\Corporativo\\Nova pasta -30",
+      action: "accessed",
+      source: "windows-security-log",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "delete-final",
+      timestampUtc: "2026-07-01T04:24:31.000Z",
+      path: "C:\\Corporativo\\Nova pasta -30",
+      action: "deleted",
+      source: "usn-journal+security-log",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
+    ["C:\\Corporativo\\Nova pasta -30", "Excluído"]
+  ]);
+});
+
 test("keeps predictable scenario lifecycle without permission or intermediate rename noise", () => {
   const base = "E:\\Corporativo\\Cenario";
   const copied = `${base}\\03-Movimentacao\\arquivo-copiado.txt`;
