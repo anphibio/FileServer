@@ -162,6 +162,29 @@ test("keeps a folder deletion when recursive cleanup also deletes its children",
   assert.equal(display.some((event) => event.path === "E:\\Corporativo\\RH" && event.displayAction === "Excluído"), true);
 });
 
+test("collapses duplicate security and usn delete events for the same path", () => {
+  const path = "E:\\Corporativo\\delete-suite\\arquivo-a.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "delete-security",
+      timestampUtc: "2026-07-01T00:48:31.453Z",
+      path,
+      action: "deleted",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "delete-correlated",
+      timestampUtc: "2026-07-01T00:48:31.453Z",
+      path,
+      action: "deleted",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => event.displayAction), ["Excluído"]);
+  assert.equal(display[0]?.source, "usn-journal+security-log");
+});
+
 test("keeps initial creation before a normal rename", () => {
   const display = buildDisplayEvents([
     buildEvent({

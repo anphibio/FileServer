@@ -608,10 +608,9 @@ function deduplicateRawEvents(events: FileAuditEvent[]) {
     timestamp.setMilliseconds(0);
     const key = [
       event.user,
-      event.source,
       event.action,
-      event.path,
-      event.previousPath ?? "",
+      normalizePath(event.path),
+      normalizePath(event.previousPath),
       timestamp.toISOString()
     ].join("|");
 
@@ -653,7 +652,6 @@ function getSemanticEventKey(event: FileAuditEvent) {
 
   return [
     event.user,
-    event.source.includes("usn-journal") ? "usn" : event.source,
     effectiveAction,
     normalizePath(event.path),
     normalizePath(event.previousPath),
