@@ -137,6 +137,7 @@ function refineDisplayEvents(events: DisplayEvent[], rawEvents: FileAuditEvent[]
     && !isRedundantDisplayProvisionalCreate(event, allEvents)
     && !isRedundantDisplayRenameAfterCreate(event, allEvents)
     && !isRedundantDisplayCreateEcho(event, allEvents)
+    && !isRedundantDisplayCreatedDuplicate(event, allEvents)
     && !isRedundantDisplayAccessedEcho(event, allEvents)
     && !isRedundantDisplayChangedEcho(event, allEvents)
   );
@@ -187,6 +188,26 @@ function getSyntheticCreationCandidate(
       && !hasEarlierStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
       && !hasEarlierRawChange(path, rawEvent.timestampUtc, rawEvents)
       && hasLaterLifecycleSignal(path, rawEvent.timestampUtc, rawEvents)) {
+      return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
+    }
+  }
+
+  if ((rawEvent.action === "changed" || rawEvent.action === "modified")
+    && (rawEvent.objectType === "folder" || rawEvent.objectType === "directory" || isLikelyFolderPath(rawEvent.path))) {
+    const path = normalizePath(rawEvent.path);
+    if (!hasDisplayCreation(displayEvents, path)
+      && !hasEarlierNonDeletedStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
+      && hasNearbyChildCreationSignal(rawEvent, rawEvents)) {
+      return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
+    }
+  }
+
+  if (rawEvent.action === "modified" && rawEvent.source === "windows-security-log" && isFileLikePath(rawEvent.path)) {
+    const path = normalizePath(rawEvent.path);
+    if (!hasDisplayCreation(displayEvents, path)
+      && !hasEarlierStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
+      && !hasEarlierRawChange(path, rawEvent.timestampUtc, rawEvents)
+      && hasNearbySiblingCreationSignal(rawEvent, rawEvents)) {
       return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
     }
   }
@@ -265,6 +286,31 @@ function hasEarlierStrongRawHistory(path: string, timestampUtc: string, rawEvent
   });
 }
 
+function hasEarlierNonDeletedStrongRawHistory(path: string, timestampUtc: string, rawEvents: FileAuditEvent[]) {
+  const eventTime = new Date(timestampUtc).getTime();
+
+  return rawEvents.some((candidate) => {
+    if (new Date(candidate.timestampUtc).getTime() >= eventTime) {
+      return false;
+    }
+
+    const touchesPath = normalizePath(candidate.path) === path || normalizePath(candidate.previousPath) === path;
+    if (!touchesPath) {
+      return false;
+    }
+
+    if (candidate.action === "deleted") {
+      return false;
+    }
+
+    if (!isStrongLifecycleAction(candidate.action)) {
+      return false;
+    }
+
+    return !isIgnorableEarlierRawLifecycle(candidate, path);
+  });
+}
+
 function hasLaterLifecycleSignal(path: string, timestampUtc: string, rawEvents: FileAuditEvent[]) {
   const eventTime = new Date(timestampUtc).getTime();
 
@@ -282,6 +328,57 @@ function hasLaterLifecycleSignal(path: string, timestampUtc: string, rawEvents: 
     return candidate.action === "deleted"
       || candidate.action === "renamed"
       || candidate.action === "moved";
+  });
+}
+
+function hasNearbySiblingCreationSignal(event: FileAuditEvent, rawEvents: FileAuditEvent[]) {
+  const eventTime = new Date(event.timestampUtc).getTime();
+  const parentPath = normalizePath(getParentPath(event.path));
+  const path = normalizePath(event.path);
+
+  return rawEvents.some((candidate) => {
+    if (candidate.id === event.id) {
+      return false;
+    }
+
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    if (Math.abs(candidateTime - eventTime) > 5_000) {
+      return false;
+    }
+
+    if (normalizePath(candidate.path) === path) {
+      return false;
+    }
+
+    if (normalizePath(getParentPath(candidate.path)) !== parentPath) {
+      return false;
+    }
+
+    return candidate.action === "created"
+      || candidate.action === "created_or_appended";
+  });
+}
+
+function hasNearbyChildCreationSignal(event: FileAuditEvent, rawEvents: FileAuditEvent[]) {
+  const eventTime = new Date(event.timestampUtc).getTime();
+  const folderPath = normalizePath(event.path);
+
+  return rawEvents.some((candidate) => {
+    if (candidate.id === event.id) {
+      return false;
+    }
+
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    if (Math.abs(candidateTime - eventTime) > 5_000) {
+      return false;
+    }
+
+    if (normalizePath(getParentPath(candidate.path)) !== folderPath) {
+      return false;
+    }
+
+    return candidate.action === "created"
+      || candidate.action === "created_or_appended";
   });
 }
 
@@ -590,6 +687,39 @@ function isRedundantDisplayCreateEcho(event: DisplayEvent, allEvents: DisplayEve
     && (candidate.action === "renamed" || candidate.action === "moved")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
     && normalizePath(candidate.path) === normalizePath(event.path));
+}
+
+function isRedundantDisplayCreatedDuplicate(event: DisplayEvent, allEvents: DisplayEvent[]) {
+  if (event.action !== "created" && event.action !== "created_or_appended") {
+    return false;
+  }
+
+  const eventTime = new Date(event.timestampUtc).getTime();
+  return allEvents.some((candidate) => {
+    if (candidate.id === event.id) {
+      return false;
+    }
+
+    if (candidate.action !== "created" && candidate.action !== "created_or_appended") {
+      return false;
+    }
+
+    if (Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) > 5_000) {
+      return false;
+    }
+
+    if (!pathsReferToSameItem(candidate.path, event.path)) {
+      return false;
+    }
+
+    const candidateWeight = getEventWeight(candidate);
+    const eventWeight = getEventWeight(event);
+    if (candidateWeight !== eventWeight) {
+      return candidateWeight > eventWeight;
+    }
+
+    return new Date(candidate.timestampUtc).getTime() < eventTime;
+  });
 }
 
 function isRedundantDisplayChangedEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {

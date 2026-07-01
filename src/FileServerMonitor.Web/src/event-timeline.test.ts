@@ -192,6 +192,81 @@ test("suppresses access and mojibake security creation echoes near a usn creatio
   assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [[correctPath, "Criação"]]);
 });
 
+test("promotes a security modified event to creation when it is part of a creation batch", () => {
+  const targetPath = "C:\\Corporativo\\codex-client-check-02.md";
+  const siblingPath = "C:\\Corporativo\\codex-client-check-01.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "target-accessed-later",
+      timestampUtc: "2026-07-01T02:20:13.003Z",
+      path: targetPath,
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-accessed",
+      timestampUtc: "2026-07-01T02:20:11.997Z",
+      path: targetPath,
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-modified",
+      timestampUtc: "2026-07-01T02:20:11.993Z",
+      path: targetPath,
+      action: "modified",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "sibling-created",
+      timestampUtc: "2026-07-01T02:20:11.000Z",
+      path: siblingPath,
+      action: "created",
+      source: "usn-journal"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]).sort(), [
+    [siblingPath, "Criação"],
+    [targetPath, "Criação"]
+  ].sort());
+});
+
+test("promotes a modified folder to creation when its children are created in the same batch", () => {
+  const folderPath = "C:\\Corporativo\\teste";
+  const childPath = "C:\\Corporativo\\teste\\Example txt file.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-accessed",
+      timestampUtc: "2026-07-01T02:20:12.117Z",
+      path: folderPath,
+      objectType: "file",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "folder-modified-usn",
+      timestampUtc: "2026-07-01T02:20:12.000Z",
+      path: folderPath,
+      objectType: "folder",
+      action: "modified",
+      source: "usn-journal"
+    }),
+    buildEvent({
+      id: "child-created",
+      timestampUtc: "2026-07-01T02:20:11.940Z",
+      path: childPath,
+      action: "created_or_appended",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]).sort(), [
+    [childPath, "Criação"],
+    [folderPath, "Criação"]
+  ].sort());
+});
+
 test("keeps a folder deletion when recursive cleanup also deletes its children", () => {
   const display = buildDisplayEvents([
     buildEvent({
