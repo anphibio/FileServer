@@ -22,6 +22,15 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+try {
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [Console]::InputEncoding = $utf8NoBom
+    [Console]::OutputEncoding = $utf8NoBom
+    $OutputEncoding = $utf8NoBom
+} catch {
+    # Older hosts can reject console encoding changes; collection still works for ASCII paths.
+}
+
 $ptBrCulture = [System.Globalization.CultureInfo]::GetCultureInfo("pt-BR")
 $enUsCulture = [System.Globalization.CultureInfo]::GetCultureInfo("en-US")
 

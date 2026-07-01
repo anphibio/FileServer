@@ -248,6 +248,38 @@ test("keeps deletion of an empty Windows default-named folder", () => {
   assert.equal(display[0]?.path, path);
 });
 
+test("keeps folder creation when files are created inside it in the same batch", () => {
+  const folder = "C:\\Corporativo\\codex-create-action\\02-many-files";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-created",
+      timestampUtc: "2026-07-01T01:44:29.000Z",
+      path: folder,
+      objectType: "folder",
+      action: "created",
+      source: "usn-journal+security-log",
+      user: "FILESERVER\\Administrator"
+    }),
+    buildEvent({
+      id: "child-created",
+      timestampUtc: "2026-07-01T01:44:29.000Z",
+      path: `${folder}\\a.txt`,
+      objectType: "file",
+      action: "created",
+      source: "usn-journal+security-log",
+      user: "FILESERVER\\Administrator"
+    })
+  ]);
+
+  assert.deepEqual(
+    display.map((event) => [event.path, event.displayAction]).sort(),
+    [
+      [`${folder}\\a.txt`, "Criação"],
+      [folder, "Criação"]
+    ].sort()
+  );
+});
+
 test("keeps initial creation before a normal rename", () => {
   const display = buildDisplayEvents([
     buildEvent({

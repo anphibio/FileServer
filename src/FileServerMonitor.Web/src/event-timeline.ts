@@ -745,6 +745,10 @@ function isRootOnlyNoise(
     return false;
   }
 
+  if (event.action === "created" || event.action === "created_or_appended") {
+    return false;
+  }
+
   if (isShareRootPath(event)) {
     return true;
   }
