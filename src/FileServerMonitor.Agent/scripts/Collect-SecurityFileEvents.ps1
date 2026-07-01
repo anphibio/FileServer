@@ -268,5 +268,5 @@ $result = foreach ($event in $events) {
 if ($null -eq $result) {
     Write-Output "[]"
 } else {
-    @($result) | ConvertTo-Json -Depth 8
+    ConvertTo-Json -InputObject @($result) -Depth 8
 }

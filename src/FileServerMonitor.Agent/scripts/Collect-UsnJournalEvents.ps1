@@ -484,5 +484,5 @@ $result = @($hydratedRecords | Select-Object -First $MaxEvents)
 if ($result.Count -eq 0) {
     Write-Output "[]"
 } else {
-    $result | ConvertTo-Json -Depth 8
+    ConvertTo-Json -InputObject @($result) -Depth 8
 }
