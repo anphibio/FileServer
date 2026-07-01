@@ -196,6 +196,52 @@ test("suppresses access and mojibake security creation echoes near a usn creatio
   assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [[correctPath, "Criação"]]);
 });
 
+test("reconstructs a security-log-only folder rename with a default nested folder name", () => {
+  const parentPath = "C:\\Corporativo\\Nova pasta";
+  const previousPath = `${parentPath}\\Nova pasta`;
+  const nextPath = `${parentPath}\\Nova pasta - 10`;
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "target-accessed-1",
+      timestampUtc: "2026-07-01T23:01:16.153Z",
+      path: nextPath,
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-accessed-2",
+      timestampUtc: "2026-07-01T23:01:16.140Z",
+      path: nextPath,
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "parent-touch",
+      timestampUtc: "2026-07-01T23:01:16.140Z",
+      path: parentPath,
+      action: "created_or_appended",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "source-deleted",
+      timestampUtc: "2026-07-01T23:01:16.140Z",
+      path: previousPath,
+      action: "deleted",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => ({
+    action: event.displayAction,
+    path: event.path,
+    previousPath: event.previousPath
+  })), [{
+    action: "Renomeado",
+    path: nextPath,
+    previousPath
+  }]);
+});
+
 test("promotes a security modified event to creation when it is part of a creation batch", () => {
   const targetPath = "C:\\Corporativo\\codex-client-check-02.md";
   const siblingPath = "C:\\Corporativo\\codex-client-check-01.txt";

@@ -1623,7 +1623,10 @@ function isLikelySecurityTransitionTarget(previousPath: string, nextPath: string
       : getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();
   }
 
-  return getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();
+  const sameParent = normalizePath(getParentPath(nextPath)) === normalizePath(getParentPath(previousPath));
+  return sameParent
+    ? getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase() || isLikelyRenameLeafVariant(previousPath, nextPath)
+    : getLeafName(previousPath).toLowerCase() === getLeafName(nextPath).toLowerCase();
 }
 
 function shouldConsumeTransitionEvent(
