@@ -185,6 +185,33 @@ test("collapses duplicate security and usn delete events for the same path", () 
   assert.equal(display[0]?.source, "usn-journal+security-log");
 });
 
+test("collapses folder delete duplicates when security and usn timestamps differ within the same second", () => {
+  const path = "C:\\Corporativo\\Example folder";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "example-folder-security-delete",
+      timestampUtc: "2026-07-01T01:09:08.497Z",
+      path,
+      objectType: "file",
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    }),
+    buildEvent({
+      id: "example-folder-usn-delete",
+      timestampUtc: "2026-07-01T01:09:08.000Z",
+      path,
+      objectType: "folder",
+      action: "deleted",
+      source: "usn-journal",
+      user: "UNKNOWN"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => event.displayAction), ["Excluído"]);
+  assert.equal(display[0]?.user, "FILESERVER\\AnphibiO");
+});
+
 test("keeps initial creation before a normal rename", () => {
   const display = buildDisplayEvents([
     buildEvent({

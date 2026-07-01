@@ -606,8 +606,9 @@ function deduplicateRawEvents(events: FileAuditEvent[]) {
   for (const event of events) {
     const timestamp = new Date(event.timestampUtc);
     timestamp.setMilliseconds(0);
+    const effectiveUser = event.action === "deleted" ? "" : event.user;
     const key = [
-      event.user,
+      effectiveUser,
       event.action,
       normalizePath(event.path),
       normalizePath(event.previousPath),
@@ -616,12 +617,44 @@ function deduplicateRawEvents(events: FileAuditEvent[]) {
 
     const existing = grouped.get(key);
 
-    if (!existing || getEventWeight(event) > getEventWeight(existing)) {
+    if (existing) {
+      grouped.set(key, mergeDuplicateEvent(existing, event));
+    } else {
       grouped.set(key, event);
     }
   }
 
   return [...grouped.values()];
+}
+
+function mergeDuplicateEvent(left: FileAuditEvent, right: FileAuditEvent): FileAuditEvent {
+  const winner = getEventWeight(right) > getEventWeight(left) ? right : left;
+  const other = winner === right ? left : right;
+
+  return {
+    ...winner,
+    user: isUnknownUser(winner.user) && !isUnknownUser(other.user) ? other.user : winner.user,
+    sid: winner.sid ?? other.sid,
+    sourceHost: winner.sourceHost ?? other.sourceHost,
+    sourceIp: winner.sourceIp ?? other.sourceIp,
+    processName: winner.processName ?? other.processName,
+    source: mergeEventSources(winner.source, other.source)
+  };
+}
+
+function isUnknownUser(user?: string | null) {
+  return !user || user.trim().toUpperCase() === "UNKNOWN";
+}
+
+function mergeEventSources(left: string, right: string) {
+  const hasUsn = left.includes("usn-journal") || right.includes("usn-journal");
+  const hasSecurity = left.includes("security-log") || right.includes("security-log");
+
+  if (hasUsn && hasSecurity) {
+    return "usn-journal+security-log";
+  }
+
+  return left;
 }
 
 function getEventWeight(event: FileAuditEvent) {
@@ -649,9 +682,10 @@ function getSemanticEventKey(event: FileAuditEvent) {
     event.action === "changed" || event.action === "modified"
       ? "changed"
       : event.action;
+  const effectiveUser = event.action === "deleted" ? "" : event.user;
 
   return [
-    event.user,
+    effectiveUser,
     effectiveAction,
     normalizePath(event.path),
     normalizePath(event.previousPath),
