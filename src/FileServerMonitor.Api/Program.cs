@@ -6101,8 +6101,13 @@ internal sealed class LdapAuthenticator
                     return Task.FromResult(LdapAuthResult.Failed("Usuario autenticado, mas nao encontrado no diretorio."));
                 }
 
-                if (!TryResolveRole(settings, user.Groups, out var role))
+                if (!TryResolveRole(connection, settings, user, out var role))
                 {
+                    _logger.LogWarning(
+                        "Usuario LDAP/AD {Username} autenticado, mas sem grupos autorizados. DN={UserDn}. Grupos diretos={Groups}",
+                        user.Username,
+                        user.DistinguishedName,
+                        string.Join(";", user.Groups));
                     return Task.FromResult(LdapAuthResult.Failed("Usuario sem grupo autorizado."));
                 }
 
@@ -6233,21 +6238,21 @@ internal sealed class LdapAuthenticator
         return new AuthenticatedUser(accountName, displayName, distinguishedName, "reader", groups);
     }
 
-    private static bool TryResolveRole(LdapAuthSettings settings, IReadOnlyCollection<string> groups, out AuthRole role)
+    private static bool TryResolveRole(LdapConnection connection, LdapAuthSettings settings, AuthenticatedUser user, out AuthRole role)
     {
-        if (ContainsGroup(groups, settings.AdminGroupDn))
+        if (IsUserInGroup(connection, user, settings.AdminGroupDn))
         {
             role = AuthRole.Admin;
             return true;
         }
 
-        if (ContainsGroup(groups, settings.OperatorGroupDn))
+        if (IsUserInGroup(connection, user, settings.OperatorGroupDn))
         {
             role = AuthRole.Operator;
             return true;
         }
 
-        if (ContainsGroup(groups, settings.ReaderGroupDn))
+        if (IsUserInGroup(connection, user, settings.ReaderGroupDn))
         {
             role = AuthRole.Reader;
             return true;
@@ -6255,6 +6260,37 @@ internal sealed class LdapAuthenticator
 
         role = AuthRole.Reader;
         return false;
+    }
+
+    private static bool IsUserInGroup(LdapConnection connection, AuthenticatedUser user, string configuredGroup)
+    {
+        if (string.IsNullOrWhiteSpace(configuredGroup))
+        {
+            return false;
+        }
+
+        if (ContainsGroup(user.Groups, configuredGroup))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(user.DistinguishedName))
+        {
+            return false;
+        }
+
+        var filter = $"(&(objectClass=group)(distinguishedName={EscapeLdapFilter(configuredGroup)})(member:1.2.840.113556.1.4.1941:={EscapeLdapFilter(user.DistinguishedName)}))";
+        var request = new SearchRequest(configuredGroup, filter, SearchScope.Base, "distinguishedName");
+
+        try
+        {
+            var response = (SearchResponse)connection.SendRequest(request);
+            return response.Entries.Count > 0;
+        }
+        catch (DirectoryOperationException)
+        {
+            return false;
+        }
     }
 
     private static bool ContainsGroup(IEnumerable<string> groups, string configuredGroup)
