@@ -158,6 +158,12 @@ select {
   padding: 0;
 }
 
+.user-role {
+  color: #637083;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .icon-button:disabled {
   opacity: 0.55;
   cursor: wait;

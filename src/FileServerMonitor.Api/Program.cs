@@ -6477,7 +6477,7 @@ internal static class AuthHelpers
             return AuthRole.Admin;
         }
 
-        if (request.Path.StartsWithSegments("/api/auth/config") && !HttpMethods.IsGet(request.Method))
+        if (request.Path.StartsWithSegments("/api/auth/config"))
         {
             return AuthRole.Admin;
         }

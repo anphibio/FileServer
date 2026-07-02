@@ -314,6 +314,16 @@ type GeneratedReport = {
 };
 
 type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit" | "auth";
+type AccessRole = "admin" | "operator" | "reader";
+
+type AccessPolicy = {
+  role: AccessRole;
+  canManageAlerts: boolean;
+  canManagePaths: boolean;
+  canViewAgents: boolean;
+  canViewAdminAudit: boolean;
+  canManageAuth: boolean;
+};
 
 const authTokenStorageKey = "fileserver-monitor.auth.token";
 const authUserStorageKey = "fileserver-monitor.auth.user";
@@ -370,6 +380,8 @@ function App() {
   const [eventsTotalItems, setEventsTotalItems] = useState(0);
   const [eventsTotalPages, setEventsTotalPages] = useState(1);
   const [summaryFilters, setSummaryFilters] = useState<ActivitySummaryFilters>(defaultSummaryFilters);
+  const accessPolicy = useMemo(() => buildAccessPolicy(authStatus, authUser), [authStatus?.enabled, authUser?.role]);
+  const visibleTabs = useMemo(() => getVisibleTabs(accessPolicy), [accessPolicy]);
 
   async function loadAuthStatus() {
     try {
@@ -432,6 +444,12 @@ function App() {
     const timer = window.setInterval(loadData, 30000);
     return () => window.clearInterval(timer);
   }, [summaryFilters, eventsPage, eventFilter, authStatus?.enabled, authUser]);
+
+  useEffect(() => {
+    if (!visibleTabs.includes(activeTab)) {
+      setActiveTab("dashboard");
+    }
+  }, [activeTab, visibleTabs]);
 
   useEffect(() => {
     if (!notice) {
@@ -522,21 +540,31 @@ function App() {
           <TabButton icon={<BarChart3 size={18} />} active={activeTab === "reports"} onClick={() => setActiveTab("reports")} meta="guiados">
             Relatórios
           </TabButton>
-          <TabButton icon={<Bell size={18} />} active={activeTab === "alerts"} onClick={() => setActiveTab("alerts")} meta={openAlerts.length.toLocaleString("pt-BR")}>
-            Alertas
-          </TabButton>
-          <TabButton icon={<Server size={18} />} active={activeTab === "agents"} onClick={() => setActiveTab("agents")} meta={offlineAgents.length.toLocaleString("pt-BR")}>
-            Agentes
-          </TabButton>
-          <TabButton icon={<FolderTree size={18} />} active={activeTab === "paths"} onClick={() => setActiveTab("paths")} meta={monitoredPaths.length.toLocaleString("pt-BR")}>
-            Caminhos
-          </TabButton>
-          <TabButton icon={<ClipboardList size={18} />} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} meta={adminAudit.length.toLocaleString("pt-BR")}>
-            Auditoria
-          </TabButton>
-          <TabButton icon={<LockKeyhole size={18} />} active={activeTab === "auth"} onClick={() => setActiveTab("auth")} meta={authStatus?.enabled ? "AD" : "off"}>
-            Configuração
-          </TabButton>
+          {visibleTabs.includes("alerts") && (
+            <TabButton icon={<Bell size={18} />} active={activeTab === "alerts"} onClick={() => setActiveTab("alerts")} meta={openAlerts.length.toLocaleString("pt-BR")}>
+              Alertas
+            </TabButton>
+          )}
+          {visibleTabs.includes("agents") && (
+            <TabButton icon={<Server size={18} />} active={activeTab === "agents"} onClick={() => setActiveTab("agents")} meta={offlineAgents.length.toLocaleString("pt-BR")}>
+              Agentes
+            </TabButton>
+          )}
+          {visibleTabs.includes("paths") && (
+            <TabButton icon={<FolderTree size={18} />} active={activeTab === "paths"} onClick={() => setActiveTab("paths")} meta={monitoredPaths.length.toLocaleString("pt-BR")}>
+              Caminhos
+            </TabButton>
+          )}
+          {visibleTabs.includes("audit") && (
+            <TabButton icon={<ClipboardList size={18} />} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} meta={adminAudit.length.toLocaleString("pt-BR")}>
+              Auditoria
+            </TabButton>
+          )}
+          {visibleTabs.includes("auth") && (
+            <TabButton icon={<LockKeyhole size={18} />} active={activeTab === "auth"} onClick={() => setActiveTab("auth")} meta={authStatus?.enabled ? "AD" : "off"}>
+              Configuração
+            </TabButton>
+          )}
         </nav>
       </aside>
 
@@ -560,6 +588,7 @@ function App() {
               <button className="text-button" type="button" onClick={handleLogout} title="Sair">
                 <LogOut size={16} />
                 {authUser.displayName}
+                <span className="user-role">{labelForRole(accessPolicy.role)}</span>
               </button>
             )}
             <button className="icon-button" onClick={loadData} disabled={loading} title="Atualizar dados">
@@ -596,11 +625,20 @@ function App() {
 
         {activeTab === "reports" && <ReportsView onNotify={setNotice} />}
 
-        {activeTab === "alerts" && <AlertsView alerts={alerts} rules={alertRules} onChanged={loadData} onAcknowledge={loadData} onNotify={setNotice} />}
+        {activeTab === "alerts" && (
+          <AlertsView
+            alerts={alerts}
+            rules={alertRules}
+            canManageAlerts={accessPolicy.canManageAlerts}
+            onChanged={loadData}
+            onAcknowledge={loadData}
+            onNotify={setNotice}
+          />
+        )}
 
         {activeTab === "agents" && <AgentsView agents={agents} />}
 
-        {activeTab === "paths" && <MonitoredPathsView paths={monitoredPaths} onChanged={loadData} onNotify={setNotice} />}
+        {activeTab === "paths" && <MonitoredPathsView paths={monitoredPaths} canManagePaths={accessPolicy.canManagePaths} onChanged={loadData} onNotify={setNotice} />}
 
         {activeTab === "audit" && <AdminAuditView entries={adminAudit} />}
 
@@ -1577,12 +1615,14 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
 function AlertsView({
   alerts,
   rules,
+  canManageAlerts,
   onChanged,
   onAcknowledge,
   onNotify
 }: {
   alerts: FileServerAlert[];
   rules: AlertRuleConfig[];
+  canManageAlerts: boolean;
   onChanged: () => void;
   onAcknowledge: () => void;
   onNotify: (notice: Notice | null) => void;
@@ -1643,10 +1683,12 @@ function AlertsView({
         />
       </section>
 
-      <Panel title="Regras de Alerta" subtitle="Ajuste thresholds, escopo, exceções e janelas operacionais sem sair da tela.">
-        <p className="inline-note">Os tipos de alerta já vêm prontos. Aqui você ajusta as regras existentes e o comportamento de cada uma.</p>
-        <AlertRulesEditor rules={rules} onChanged={onChanged} onNotify={onNotify} />
-      </Panel>
+      {canManageAlerts && (
+        <Panel title="Regras de Alerta" subtitle="Ajuste thresholds, escopo, exceções e janelas operacionais sem sair da tela.">
+          <p className="inline-note">Os tipos de alerta já vêm prontos. Aqui você ajusta as regras existentes e o comportamento de cada uma.</p>
+          <AlertRulesEditor rules={rules} onChanged={onChanged} onNotify={onNotify} />
+        </Panel>
+      )}
       <Panel title="Alertas" subtitle="Fila operacional dos itens abertos e já reconhecidos mais recentes.">
         <div className="alert-table">
           {alerts.map((alert) => (
@@ -1673,7 +1715,7 @@ function AlertsView({
               </div>
               <div className="alert-actions">
                 <span className={`status ${alert.status}`}>{alert.status}</span>
-                {alert.status === "open" && (
+                {canManageAlerts && alert.status === "open" && (
                   <button className="text-button" onClick={() => acknowledgeAlert(alert.id, onAcknowledge, onNotify)}>
                     <CheckCircle2 size={16} />
                     Reconhecer
@@ -2067,10 +2109,12 @@ function AgentsView({ agents }: { agents: AgentHealth[] }) {
 
 function MonitoredPathsView({
   paths,
+  canManagePaths,
   onChanged,
   onNotify
 }: {
   paths: MonitoredPath[];
+  canManagePaths: boolean;
   onChanged: () => void;
   onNotify: (notice: Notice | null) => void;
 }) {
@@ -2133,52 +2177,54 @@ function MonitoredPathsView({
         />
       </section>
 
-      <Panel title="Novo Caminho Monitorado" subtitle="Cadastre shares e pastas críticas pensando em prioridade, dono e fase do rollout.">
-        <form className="path-form" onSubmit={submit}>
-          <label>
-            Servidor
-            <input value={form.server} onChange={(event) => setForm({ ...form, server: event.target.value })} />
-          </label>
-          <label>
-            Share
-            <input value={form.share} onChange={(event) => setForm({ ...form, share: event.target.value })} placeholder="Departamentos" />
-          </label>
-          <label className="wide-field">
-            Caminho raiz
-            <input value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="D:\\Shares\\Departamentos\\Financeiro" />
-          </label>
-          <label>
-            Status
-            <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>
-              <option value="planned">Planejado</option>
-              <option value="active">Ativo</option>
-              <option value="paused">Pausado</option>
-              <option value="retired">Retirado</option>
-            </select>
-          </label>
-          <label>
-            Prioridade
-            <select value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })}>
-              <option value="low">Baixa</option>
-              <option value="normal">Normal</option>
-              <option value="high">Alta</option>
-              <option value="critical">Crítica</option>
-            </select>
-          </label>
-          <label>
-            Responsável
-            <input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} placeholder="Infra / área dona" />
-          </label>
-          <label className="wide-field">
-            Observações
-            <input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Fase do piloto, exceções ou janela de implantação" />
-          </label>
-          <button className="text-button path-submit" type="submit" disabled={saving}>
-            <Plus size={16} />
-            {saving ? "Adicionando..." : "Adicionar"}
-          </button>
-        </form>
-      </Panel>
+      {canManagePaths && (
+        <Panel title="Novo Caminho Monitorado" subtitle="Cadastre shares e pastas críticas pensando em prioridade, dono e fase do rollout.">
+          <form className="path-form" onSubmit={submit}>
+            <label>
+              Servidor
+              <input value={form.server} onChange={(event) => setForm({ ...form, server: event.target.value })} />
+            </label>
+            <label>
+              Share
+              <input value={form.share} onChange={(event) => setForm({ ...form, share: event.target.value })} placeholder="Departamentos" />
+            </label>
+            <label className="wide-field">
+              Caminho raiz
+              <input value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="D:\\Shares\\Departamentos\\Financeiro" />
+            </label>
+            <label>
+              Status
+              <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>
+                <option value="planned">Planejado</option>
+                <option value="active">Ativo</option>
+                <option value="paused">Pausado</option>
+                <option value="retired">Retirado</option>
+              </select>
+            </label>
+            <label>
+              Prioridade
+              <select value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })}>
+                <option value="low">Baixa</option>
+                <option value="normal">Normal</option>
+                <option value="high">Alta</option>
+                <option value="critical">Crítica</option>
+              </select>
+            </label>
+            <label>
+              Responsável
+              <input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} placeholder="Infra / área dona" />
+            </label>
+            <label className="wide-field">
+              Observações
+              <input value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Fase do piloto, exceções ou janela de implantação" />
+            </label>
+            <button className="text-button path-submit" type="submit" disabled={saving}>
+              <Plus size={16} />
+              {saving ? "Adicionando..." : "Adicionar"}
+            </button>
+          </form>
+        </Panel>
+      )}
 
       <Panel title="Caminhos Cadastrados" subtitle="Inventário operacional do que já entrou ou ainda vai entrar no monitoramento.">
         <div className="table-wrap">
@@ -2200,6 +2246,7 @@ function MonitoredPathsView({
                   <td>{path.share}</td>
                   <td>
                     <select
+                      disabled={!canManagePaths}
                       value={(drafts[path.id] ?? path).status}
                       onChange={(event) => setDrafts({
                         ...drafts,
@@ -2214,6 +2261,7 @@ function MonitoredPathsView({
                   </td>
                   <td>
                     <select
+                      disabled={!canManagePaths}
                       value={(drafts[path.id] ?? path).priority}
                       onChange={(event) => setDrafts({
                         ...drafts,
@@ -2228,19 +2276,21 @@ function MonitoredPathsView({
                   </td>
                   <td className="path-cell" title={path.path}>{path.path}</td>
                   <td className="row-actions">
-                    <div className="row-button-stack">
-                      <button
-                        className="text-button"
-                        type="button"
-                        disabled={editingPathId === path.id}
-                        onClick={() => updateMonitoredPath(drafts[path.id] ?? path, setEditingPathId, onChanged, onNotify)}
-                      >
-                        {editingPathId === path.id ? "Salvando..." : "Salvar"}
-                      </button>
-                      <button className="icon-button subtle" onClick={() => deleteMonitoredPath(path.id, onChanged, onNotify)} title="Remover caminho">
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
+                    {canManagePaths && (
+                      <div className="row-button-stack">
+                        <button
+                          className="text-button"
+                          type="button"
+                          disabled={editingPathId === path.id}
+                          onClick={() => updateMonitoredPath(drafts[path.id] ?? path, setEditingPathId, onChanged, onNotify)}
+                        >
+                          {editingPathId === path.id ? "Salvando..." : "Salvar"}
+                        </button>
+                        <button className="icon-button subtle" onClick={() => deleteMonitoredPath(path.id, onChanged, onNotify)} title="Remover caminho">
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -3039,6 +3089,70 @@ function readStoredAuthUser() {
     localStorage.removeItem(authTokenStorageKey);
     return null;
   }
+}
+
+function buildAccessPolicy(authStatus: AuthStatusResponse | null, authUser: AuthenticatedUser | null): AccessPolicy {
+  const role = resolveAccessRole(authStatus, authUser);
+  const canOperate = role === "admin" || role === "operator";
+
+  return {
+    role,
+    canManageAlerts: canOperate,
+    canManagePaths: canOperate,
+    canViewAgents: canOperate,
+    canViewAdminAudit: role === "admin",
+    canManageAuth: role === "admin"
+  };
+}
+
+function resolveAccessRole(authStatus: AuthStatusResponse | null, authUser: AuthenticatedUser | null): AccessRole {
+  if (!authStatus?.enabled) {
+    return "admin";
+  }
+
+  const role = authUser?.role?.toLowerCase();
+
+  if (role === "admin" || role === "operator" || role === "reader") {
+    return role;
+  }
+
+  return "reader";
+}
+
+function getVisibleTabs(policy: AccessPolicy): Tab[] {
+  const tabs: Tab[] = ["dashboard", "events", "investigation", "reports"];
+
+  if (policy.canManageAlerts) {
+    tabs.push("alerts");
+  }
+
+  if (policy.canViewAgents) {
+    tabs.push("agents");
+  }
+
+  if (policy.canManagePaths) {
+    tabs.push("paths");
+  }
+
+  if (policy.canViewAdminAudit) {
+    tabs.push("audit");
+  }
+
+  if (policy.canManageAuth) {
+    tabs.push("auth");
+  }
+
+  return tabs;
+}
+
+function labelForRole(role: AccessRole) {
+  const labels: Record<AccessRole, string> = {
+    admin: "Admin",
+    operator: "Operador",
+    reader: "Leitor"
+  };
+
+  return labels[role];
 }
 
 function titleForTab(tab: Tab) {
