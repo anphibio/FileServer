@@ -783,6 +783,7 @@ app.MapGet("/api/reports/activity-summary", async (
     string? action,
     int? take,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     CancellationToken cancellationToken) =>
 {
     var now = DateTimeOffset.UtcNow;
@@ -794,6 +795,12 @@ app.MapGet("/api/reports/activity-summary", async (
         User: user,
         Action: action,
         Take: take is > 0 and <= 50 ? take.Value : 10);
+    var timelineSummary = await QueryPersistedTimelineActivitySummaryIfCoveredAsync(query, timelineRepository, cancellationToken);
+    if (timelineSummary is not null)
+    {
+        return Results.Ok(timelineSummary);
+    }
+
     var summary = await repository.GetActivitySummaryAsync(query, cancellationToken);
 
     return Results.Ok(summary);
@@ -808,6 +815,7 @@ app.MapGet("/api/reports/baseline-anomalies", async (
     string? action,
     int? take,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     ILoggerFactory loggerFactory,
     CancellationToken cancellationToken) =>
 {
@@ -824,6 +832,12 @@ app.MapGet("/api/reports/baseline-anomalies", async (
 
     try
     {
+        var timelineResult = await QueryPersistedTimelineBaselineAnomaliesIfCoveredAsync(query, timelineRepository, cancellationToken);
+        if (timelineResult is not null)
+        {
+            return Results.Ok(timelineResult);
+        }
+
         var result = await repository.GetBaselineAnomaliesAsync(query, cancellationToken);
 
         return Results.Ok(result);
@@ -853,6 +867,7 @@ app.MapGet("/api/reports/baseline-anomalies/export.csv", async (
     string? action,
     int? take,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     CancellationToken cancellationToken) =>
 {
     var now = DateTimeOffset.UtcNow;
@@ -865,7 +880,8 @@ app.MapGet("/api/reports/baseline-anomalies/export.csv", async (
         Action: action,
         BaselineWindows: 7,
         Take: take is > 0 and <= 50 ? take.Value : 20);
-    var result = await repository.GetBaselineAnomaliesAsync(query, cancellationToken);
+    var result = await QueryPersistedTimelineBaselineAnomaliesIfCoveredAsync(query, timelineRepository, cancellationToken)
+        ?? await repository.GetBaselineAnomaliesAsync(query, cancellationToken);
     var csv = BaselineAnomalyCsvExporter.Export(result);
 
     return Results.Text(csv, "text/csv; charset=utf-8");
@@ -1226,6 +1242,45 @@ static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTim
     return await timelineRepository.QueryAsync(query, cancellationToken);
 }
 
+static async Task<ActivitySummaryResponse?> QueryPersistedTimelineActivitySummaryIfCoveredAsync(
+    ActivitySummaryQuery query,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    return await IsTimelineCoveredAsync(query.FromUtc, query.ToUtc, timelineRepository, cancellationToken)
+        ? await timelineRepository.GetActivitySummaryAsync(query, cancellationToken)
+        : null;
+}
+
+static async Task<BaselineAnomalyResponse?> QueryPersistedTimelineBaselineAnomaliesIfCoveredAsync(
+    BaselineAnomalyQuery query,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    var windowSize = query.ToUtc - query.FromUtc;
+    var baselineFromUtc = query.FromUtc - TimeSpan.FromTicks(windowSize.Ticks * query.BaselineWindows);
+
+    return await IsTimelineCoveredAsync(baselineFromUtc, query.ToUtc, timelineRepository, cancellationToken)
+        ? await timelineRepository.GetBaselineAnomaliesAsync(query, cancellationToken)
+        : null;
+}
+
+static async Task<bool> IsTimelineCoveredAsync(
+    DateTimeOffset fromUtc,
+    DateTimeOffset toUtc,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    var coverage = await timelineRepository.GetCoverageAsync(cancellationToken);
+
+    return coverage.Count > 0
+        && coverage.FromUtc is not null
+        && coverage.ToUtc is not null
+        && coverage.FromUtc <= fromUtc
+        && coverage.ToUtc >= fromUtc
+        && toUtc >= fromUtc;
+}
+
 static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
     IReadOnlyCollection<FileAuditEvent> events,
     string? user,
@@ -1470,6 +1525,10 @@ internal interface ITimelineRepository
 
     Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryAsync(TimelineQuery query, CancellationToken cancellationToken);
 
+    Task<ActivitySummaryResponse> GetActivitySummaryAsync(ActivitySummaryQuery query, CancellationToken cancellationToken);
+
+    Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(BaselineAnomalyQuery query, CancellationToken cancellationToken);
+
     Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken);
 }
 
@@ -1593,6 +1652,47 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
         }
 
         return events;
+    }
+
+    public async Task<ActivitySummaryResponse> GetActivitySummaryAsync(
+        ActivitySummaryQuery query,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var total = await CountTimelineEventsAsync(connection, query, cancellationToken);
+        var byAction = await QueryTimelineDimensionAsync(connection, query, "DisplayAction", cancellationToken);
+        var byShare = await QueryTimelineDimensionAsync(connection, query, "ShareName", cancellationToken);
+        var byUser = await QueryTimelineDimensionAsync(connection, query, "UserName", cancellationToken);
+
+        return new ActivitySummaryResponse(
+            FromUtc: query.FromUtc,
+            ToUtc: query.ToUtc,
+            TotalEvents: total,
+            ByAction: byAction,
+            ByShare: byShare,
+            ByUser: byUser);
+    }
+
+    public async Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(
+        BaselineAnomalyQuery query,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var byAction = await BuildTimelineAnomaliesAsync(connection, query, "DisplayAction", cancellationToken);
+        var byShare = await BuildTimelineAnomaliesAsync(connection, query, "ShareName", cancellationToken);
+        var byUser = await BuildTimelineAnomaliesAsync(connection, query, "UserName", cancellationToken);
+
+        return new BaselineAnomalyResponse(
+            FromUtc: query.FromUtc,
+            ToUtc: query.ToUtc,
+            BaselineWindows: query.BaselineWindows,
+            ByAction: byAction,
+            ByShare: byShare,
+            ByUser: byUser);
     }
 
     public async Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken)
@@ -1761,6 +1861,186 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
             {{where}}
             ORDER BY TimestampUtc DESC;
             """;
+    }
+
+    private static async Task<long> CountTimelineEventsAsync(
+        SqlConnection connection,
+        ActivitySummaryQuery query,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        var where = BuildTimelineSummaryWhereSql(command, query);
+        command.CommandText = $$"""
+            SELECT COUNT_BIG(1)
+            FROM dbo.FileAuditTimelineEvents
+            {{where}};
+            """;
+
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private static async Task<IReadOnlyCollection<ActivitySummaryItem>> QueryTimelineDimensionAsync(
+        SqlConnection connection,
+        ActivitySummaryQuery query,
+        string columnName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        var where = BuildTimelineSummaryWhereSql(command, query);
+        command.CommandText = $$"""
+            SELECT TOP (@Take)
+                {{columnName}} AS Name,
+                COUNT_BIG(1) AS EventCount
+            FROM dbo.FileAuditTimelineEvents
+            {{where}}
+            GROUP BY {{columnName}}
+            ORDER BY EventCount DESC, Name ASC;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var items = new List<ActivitySummaryItem>();
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(new ActivitySummaryItem(
+                Name: reader.GetString(reader.GetOrdinal("Name")),
+                EventCount: Convert.ToInt64(reader["EventCount"])));
+        }
+
+        return items;
+    }
+
+    private static async Task<IReadOnlyCollection<BaselineAnomalyItem>> BuildTimelineAnomaliesAsync(
+        SqlConnection connection,
+        BaselineAnomalyQuery query,
+        string columnName,
+        CancellationToken cancellationToken)
+    {
+        var current = await QueryTimelineDimensionCountsAsync(
+            connection,
+            query.Server,
+            query.Share,
+            query.User,
+            query.Action,
+            query.FromUtc,
+            query.ToUtc,
+            columnName,
+            cancellationToken);
+
+        var baselineTotals = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        var windowSize = query.ToUtc - query.FromUtc;
+
+        for (var index = 1; index <= query.BaselineWindows; index++)
+        {
+            var windowTo = query.FromUtc - TimeSpan.FromTicks(windowSize.Ticks * (index - 1));
+            var windowFrom = windowTo - windowSize;
+            var items = await QueryTimelineDimensionCountsAsync(
+                connection,
+                query.Server,
+                query.Share,
+                query.User,
+                query.Action,
+                windowFrom,
+                windowTo,
+                columnName,
+                cancellationToken);
+
+            foreach (var item in items)
+            {
+                baselineTotals[item.Key] = baselineTotals.GetValueOrDefault(item.Key, 0) + item.Value;
+            }
+        }
+
+        return BaselineAnomalyCalculator.Build(current, baselineTotals, query.BaselineWindows, query.Take);
+    }
+
+    private static async Task<Dictionary<string, long>> QueryTimelineDimensionCountsAsync(
+        SqlConnection connection,
+        string? server,
+        string? share,
+        string? user,
+        string? action,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        string columnName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        var query = new ActivitySummaryQuery(fromUtc, toUtc, server, share, user, action, Take: 1);
+        var where = BuildTimelineSummaryWhereSql(command, query, includeTake: false);
+        command.CommandText = $$"""
+            SELECT
+                {{columnName}} AS Name,
+                COUNT_BIG(1) AS EventCount
+            FROM dbo.FileAuditTimelineEvents
+            {{where}}
+            GROUP BY {{columnName}};
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result[reader.GetString(reader.GetOrdinal("Name"))] = Convert.ToInt64(reader["EventCount"]);
+        }
+
+        return result;
+    }
+
+    private static string BuildTimelineSummaryWhereSql(SqlCommand command, ActivitySummaryQuery query, bool includeTake = true)
+    {
+        command.Parameters.AddWithValue("@FromUtc", query.FromUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@ToUtc", query.ToUtc.UtcDateTime);
+        if (includeTake)
+        {
+            command.Parameters.AddWithValue("@Take", query.Take);
+        }
+
+        var predicates = new List<string>
+        {
+            "TimestampUtc >= @FromUtc",
+            "TimestampUtc <= @ToUtc"
+        };
+
+        if (!string.IsNullOrWhiteSpace(query.Server))
+        {
+            predicates.Add("ServerName LIKE @SummaryServer");
+            command.Parameters.AddWithValue("@SummaryServer", $"%{query.Server}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Share))
+        {
+            predicates.Add("ShareName LIKE @SummaryShare");
+            command.Parameters.AddWithValue("@SummaryShare", $"%{query.Share}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.User))
+        {
+            predicates.Add("UserName LIKE @SummaryUser");
+            command.Parameters.AddWithValue("@SummaryUser", $"%{query.User}%");
+        }
+
+        var actions = BuildTimelineResultActionFilter(query.Action);
+        if (actions.Length == 1)
+        {
+            predicates.Add("ActionName = @SummaryAction");
+            command.Parameters.AddWithValue("@SummaryAction", actions[0]);
+        }
+        else if (actions.Length > 1)
+        {
+            var parameterNames = new List<string>();
+            for (var index = 0; index < actions.Length; index++)
+            {
+                var parameterName = $"@SummaryAction{index}";
+                parameterNames.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, actions[index]);
+            }
+
+            predicates.Add($"ActionName IN ({string.Join(", ", parameterNames)})");
+        }
+
+        return $"WHERE {string.Join(" AND ", predicates)}";
     }
 
     private static void AddTimelineParameters(SqlCommand command, FileAuditDisplayEvent item, string correlationVersion)
@@ -2629,6 +2909,57 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
         return Task.FromResult(result);
     }
 
+    public Task<ActivitySummaryResponse> GetActivitySummaryAsync(
+        ActivitySummaryQuery query,
+        CancellationToken cancellationToken)
+    {
+        var events = FilterForSummary(query.FromUtc, query.ToUtc, query.Server, query.Share, query.User, query.Action).ToArray();
+
+        return Task.FromResult(new ActivitySummaryResponse(
+            FromUtc: query.FromUtc,
+            ToUtc: query.ToUtc,
+            TotalEvents: events.Length,
+            ByAction: SummarizeTimeline(events, item => item.DisplayAction, query.Take),
+            ByShare: SummarizeTimeline(events, item => item.Share, query.Take),
+            ByUser: SummarizeTimeline(events, item => item.User, query.Take)));
+    }
+
+    public Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(
+        BaselineAnomalyQuery query,
+        CancellationToken cancellationToken)
+    {
+        var current = FilterForSummary(query.FromUtc, query.ToUtc, query.Server, query.Share, query.User, query.Action).ToArray();
+        var windowSize = query.ToUtc - query.FromUtc;
+        var baselineEvents = new List<FileAuditDisplayEvent>();
+
+        for (var index = 1; index <= query.BaselineWindows; index++)
+        {
+            var windowTo = query.FromUtc - TimeSpan.FromTicks(windowSize.Ticks * (index - 1));
+            var windowFrom = windowTo - windowSize;
+            baselineEvents.AddRange(FilterForSummary(windowFrom, windowTo, query.Server, query.Share, query.User, query.Action));
+        }
+
+        return Task.FromResult(new BaselineAnomalyResponse(
+            FromUtc: query.FromUtc,
+            ToUtc: query.ToUtc,
+            BaselineWindows: query.BaselineWindows,
+            ByAction: BaselineAnomalyCalculator.Build(
+                CountTimelineBy(current, item => item.DisplayAction),
+                CountTimelineBy(baselineEvents, item => item.DisplayAction),
+                query.BaselineWindows,
+                query.Take),
+            ByShare: BaselineAnomalyCalculator.Build(
+                CountTimelineBy(current, item => item.Share),
+                CountTimelineBy(baselineEvents, item => item.Share),
+                query.BaselineWindows,
+                query.Take),
+            ByUser: BaselineAnomalyCalculator.Build(
+                CountTimelineBy(current, item => item.User),
+                CountTimelineBy(baselineEvents, item => item.User),
+                query.BaselineWindows,
+                query.Take)));
+    }
+
     public Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken)
     {
         var values = _events.Values.ToArray();
@@ -2671,6 +3002,59 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
             "permission_changed" => new[] { "permission_changed" },
             _ => Array.Empty<string>()
         };
+    }
+
+    private IEnumerable<FileAuditDisplayEvent> FilterForSummary(
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        string? server,
+        string? share,
+        string? user,
+        string? action)
+    {
+        IEnumerable<FileAuditDisplayEvent> events = _events.Values
+            .Where(item => item.TimestampUtc >= fromUtc)
+            .Where(item => item.TimestampUtc <= toUtc)
+            .Where(item => MatchesText(item.Server, server))
+            .Where(item => MatchesText(item.Share, share))
+            .Where(item => MatchesText(item.User, user));
+
+        var actions = BuildTimelineResultActionFilter(action);
+        if (actions.Length > 0)
+        {
+            events = events.Where(item => actions.Contains(item.Action, StringComparer.OrdinalIgnoreCase));
+        }
+
+        return events;
+    }
+
+    private static IReadOnlyCollection<ActivitySummaryItem> SummarizeTimeline(
+        IEnumerable<FileAuditDisplayEvent> events,
+        Func<FileAuditDisplayEvent, string> selector,
+        int take)
+    {
+        return events
+            .GroupBy(selector, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new ActivitySummaryItem(group.Key, group.LongCount()))
+            .OrderByDescending(item => item.EventCount)
+            .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(take)
+            .ToArray();
+    }
+
+    private static Dictionary<string, long> CountTimelineBy(
+        IEnumerable<FileAuditDisplayEvent> events,
+        Func<FileAuditDisplayEvent, string> selector)
+    {
+        return events
+            .GroupBy(selector, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.LongCount(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesText(string value, string? filter)
+    {
+        return string.IsNullOrWhiteSpace(filter)
+            || value.Contains(filter, StringComparison.OrdinalIgnoreCase);
     }
 }
 
