@@ -72,13 +72,14 @@
             "filter": "FileServer Monitor: overall status"
           },
           "refId": "A",
-          "resultFormat": "time_series"
+          "resultFormat": "text",
+          "queryType": "text"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed"
           },
           "mappings": [
             {
@@ -106,17 +107,7 @@
                 }
               }
             }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
+          ]
         },
         "overrides": []
       },
@@ -132,7 +123,8 @@
           "fields": "",
           "values": false
         },
-        "textMode": "value"
+        "textMode": "value",
+        "noValue": "Sem dados"
       },
       "pluginVersion": "10.4.0"
     },
@@ -169,13 +161,14 @@
             "filter": "FileServer Monitor: database status"
           },
           "refId": "A",
-          "resultFormat": "time_series"
+          "resultFormat": "text",
+          "queryType": "text"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed"
           },
           "mappings": [
             {
@@ -203,17 +196,7 @@
                 }
               }
             }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
+          ]
         },
         "overrides": []
       },
@@ -229,7 +212,8 @@
           "fields": "",
           "values": false
         },
-        "textMode": "value"
+        "textMode": "value",
+        "noValue": "Sem dados"
       },
       "pluginVersion": "10.4.0"
     },
