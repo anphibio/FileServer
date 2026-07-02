@@ -1,5 +1,5 @@
 zabbix_export:
-  version: '6.4'
+  version: '7.4'
   template_groups:
     - uuid: 5e4cc0db0e534b2a9c2829f274741c41
       name: Templates/Applications
@@ -221,33 +221,32 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
-      triggers:
-        - uuid: ba8cc84ff4ab4902a416070eb257a817
-          expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
-          name: 'FileServer Monitor: ambiente nao esta healthy'
-          priority: WARNING
-        - uuid: 9a3dec8ac473451aae4b20b474211911
-          expression: 'last(/Template App FileServer Monitor/fileserver.db.status)<>"healthy"'
-          name: 'FileServer Monitor: banco indisponivel ou degradado'
-          priority: HIGH
-        - uuid: b80b97d6edbd4400801359435c3b7d93
-          expression: 'last(/Template App FileServer Monitor/fileserver.agents.total)=0'
-          name: 'FileServer Monitor: nenhum agente registrado'
-          priority: HIGH
-        - uuid: 32091dc2b90642f295ffabf6a24b3fe4
-          expression: 'last(/Template App FileServer Monitor/fileserver.agents.stale)>0'
-          name: 'FileServer Monitor: agente sem heartbeat'
-          priority: HIGH
-        - uuid: b342a34ee4da42a9b645d3ef139dc79c
-          expression: 'last(/Template App FileServer Monitor/fileserver.agents.unhealthy)>0'
-          name: 'FileServer Monitor: agente em estado nao saudavel'
-          priority: WARNING
-        - uuid: 9f1210c43ddb4fcc82e1be33040c2c16
-          expression: 'last(/Template App FileServer Monitor/fileserver.agents.max_pending_queue)>={$FILESERVER_MONITOR_QUEUE_WARN}'
-          name: 'FileServer Monitor: fila local do agente alta'
-          priority: WARNING
-        - uuid: c1092e359fc24965a7e506d313cfd546
-          expression: 'last(/Template App FileServer Monitor/fileserver.events.last_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
-          name: 'FileServer Monitor: sem eventos recentes'
-          priority: INFO
-
+  triggers:
+    - uuid: ba8cc84ff4ab4902a416070eb257a817
+      expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
+      name: 'FileServer Monitor: ambiente nao esta healthy'
+      priority: WARNING
+    - uuid: 9a3dec8ac473451aae4b20b474211911
+      expression: 'last(/Template App FileServer Monitor/fileserver.db.status)<>"healthy"'
+      name: 'FileServer Monitor: banco indisponivel ou degradado'
+      priority: HIGH
+    - uuid: b80b97d6edbd4400801359435c3b7d93
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.total)=0'
+      name: 'FileServer Monitor: nenhum agente registrado'
+      priority: HIGH
+    - uuid: 32091dc2b90642f295ffabf6a24b3fe4
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.stale)>0'
+      name: 'FileServer Monitor: agente sem heartbeat'
+      priority: HIGH
+    - uuid: b342a34ee4da42a9b645d3ef139dc79c
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.unhealthy)>0'
+      name: 'FileServer Monitor: agente em estado nao saudavel'
+      priority: WARNING
+    - uuid: 9f1210c43ddb4fcc82e1be33040c2c16
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.max_pending_queue)>={$FILESERVER_MONITOR_QUEUE_WARN}'
+      name: 'FileServer Monitor: fila local do agente alta'
+      priority: WARNING
+    - uuid: c1092e359fc24965a7e506d313cfd546
+      expression: 'last(/Template App FileServer Monitor/fileserver.events.last_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
+      name: 'FileServer Monitor: sem eventos recentes'
+      priority: INFO
