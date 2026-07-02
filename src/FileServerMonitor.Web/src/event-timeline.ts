@@ -702,6 +702,7 @@ function isRedundantDisplayDeleted(event: DisplayEvent, allEvents: DisplayEvent[
   return allEvents.some((candidate) =>
     candidate.id !== event.id
     && (candidate.action === "renamed" || candidate.action === "moved")
+    && !isTransientArtifactPath(candidate.path)
     && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
     && pathsReferToSameItem(candidate.previousPath, event.path));
 }
@@ -1254,7 +1255,7 @@ function isProvisionalDocumentNoise(
     }
 
     return normalizePath(event.previousPath) === currentPath
-      || normalizePath(event.path) === currentPath;
+      && !isTransientArtifactPath(event.path);
   });
 }
 
@@ -1661,6 +1662,12 @@ function shouldConsumeTransitionEvent(
   if (!isProvisionalOrigin
     && (event.action === "created" || event.action === "created_or_appended")
     && normalizedPath === normalizedTransitionPrevious) {
+    return false;
+  }
+
+  if (isProvisionalOrigin
+    && event.action === "deleted"
+    && normalizedPath === normalizedTransitionNext) {
     return false;
   }
 

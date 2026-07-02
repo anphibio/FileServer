@@ -297,6 +297,68 @@ test("keeps default Excel worksheet creation despite internal Office temp rename
   }]);
 });
 
+test("keeps explicit delete before recreating a default Excel worksheet", () => {
+  const finalPath = "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx";
+  const tempOriginPath = "C:\\Corporativo\\~ovo(a) Planilha do Microsoft Excel.tmp";
+  const tempBackupPath = "C:\\Corporativo\\Novo(a) Planilha do Microsoft Excel.xlsx~RF28cb7cc6.TMP";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "final-deleted",
+      timestampUtc: "2026-07-02T02:10:54.000Z",
+      path: finalPath,
+      action: "deleted",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "final-created",
+      timestampUtc: "2026-07-02T02:11:00.000Z",
+      path: finalPath,
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "temp-to-final",
+      timestampUtc: "2026-07-02T02:11:00.000Z",
+      path: finalPath,
+      previousPath: tempOriginPath,
+      action: "renamed",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "final-to-temp-backup",
+      timestampUtc: "2026-07-02T02:11:00.000Z",
+      path: tempBackupPath,
+      previousPath: finalPath,
+      action: "renamed",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "temp-backup-deleted",
+      timestampUtc: "2026-07-02T02:11:00.000Z",
+      path: tempBackupPath,
+      action: "deleted",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => ({
+    action: event.displayAction,
+    path: event.path,
+    previousPath: event.previousPath
+  })), [
+    {
+      action: "Criação",
+      path: finalPath,
+      previousPath: null
+    },
+    {
+      action: "Excluído",
+      path: finalPath,
+      previousPath: null
+    }
+  ]);
+});
+
 test("promotes a security modified event to creation when it is part of a creation batch", () => {
   const targetPath = "C:\\Corporativo\\codex-client-check-02.md";
   const siblingPath = "C:\\Corporativo\\codex-client-check-01.txt";
