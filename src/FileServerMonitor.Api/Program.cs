@@ -245,11 +245,13 @@ app.MapGet("/api/events/timeline", async (
     IEventRepository repository,
     CancellationToken cancellationToken) =>
 {
+    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
+    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
     var query = new EventQuery(
         Server: server,
         Share: share,
-        User: null,
-        Action: null,
+        User: prefilteredUser,
+        Action: prefilteredAction,
         Path: path,
         SourceHost: sourceHost,
         SourceIp: sourceIp,
@@ -259,7 +261,7 @@ app.MapGet("/api/events/timeline", async (
         Source: source,
         FromUtc: fromUtc,
         ToUtc: toUtc,
-        Take: take is > 0 and <= 5_000 ? take.Value : 100);
+        Take: take is > 0 and <= 20_000 ? take.Value : 100);
 
     var events = await repository.QueryAsync(query, cancellationToken);
     var timeline = ProjectTimeline(events, user, action);
@@ -285,11 +287,13 @@ app.MapGet("/api/events/timeline/export.csv", async (
     IEventRepository repository,
     CancellationToken cancellationToken) =>
 {
+    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
+    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
     var query = new EventQuery(
         Server: server,
         Share: share,
-        User: null,
-        Action: null,
+        User: prefilteredUser,
+        Action: prefilteredAction,
         Path: path,
         SourceHost: sourceHost,
         SourceIp: sourceIp,
@@ -332,12 +336,14 @@ app.MapGet("/api/events/timeline/page", async (
     var safePage = Math.Max(1, page ?? 1);
     var safePageSize = pageSize is > 0 and <= 100 ? pageSize.Value : 25;
     var minimumWindow = safePage * safePageSize * 4;
-    var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 10_000);
+    var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 20_000);
+    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
+    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
     var query = new EventQuery(
         Server: server,
         Share: share,
-        User: null,
-        Action: null,
+        User: prefilteredUser,
+        Action: prefilteredAction,
         Path: path,
         SourceHost: sourceHost,
         SourceIp: sourceIp,
@@ -889,6 +895,11 @@ static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditD
         auditEvent.Source,
         auditEvent.DisplayAction,
         auditEvent.DisplayTarget);
+}
+
+static bool ShouldPreFilterTimelineQuery(string? action)
+{
+    return action?.Equals("deleted", StringComparison.OrdinalIgnoreCase) == true;
 }
 
 static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
