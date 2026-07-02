@@ -948,6 +948,207 @@ dd {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.reports-view {
+  gap: 16px;
+}
+
+.report-mode-bar {
+  display: inline-flex;
+  gap: 4px;
+  margin: 0 16px 16px;
+  padding: 4px;
+  border: 1px solid #d7e0e8;
+  border-radius: 8px;
+  background: #f6f9fc;
+}
+
+.report-mode-bar button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #556579;
+  padding: 0 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.report-mode-bar button.active,
+.report-mode-bar button:hover {
+  background: #ffffff;
+  color: #1e2a37;
+  box-shadow: 0 4px 14px rgba(23, 33, 47, 0.08);
+}
+
+.report-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  padding: 0 16px 16px;
+}
+
+.report-card {
+  display: grid;
+  gap: 12px;
+  min-height: 118px;
+  border: 1px solid #d9e2eb;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1e2936;
+  padding: 18px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.report-card strong {
+  font-size: 15px;
+}
+
+.report-card span,
+.custom-report-note span {
+  color: #596b80;
+  line-height: 1.45;
+}
+
+.report-card.active,
+.report-card:hover {
+  border-color: #8fb3d1;
+  box-shadow: 0 12px 28px rgba(23, 33, 47, 0.08);
+}
+
+.custom-report-note {
+  display: grid;
+  gap: 8px;
+  margin: 0 16px 16px;
+  padding: 16px;
+  border: 1px solid #d9e2eb;
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+
+.report-form {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.report-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.report-results-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr);
+  gap: 16px;
+}
+
+.report-group-list {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.report-group-row {
+  display: grid;
+  gap: 8px;
+}
+
+.report-group-row div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.report-group-row strong {
+  color: #1e2936;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.report-group-row span {
+  color: #607287;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.report-group-bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8eef4;
+}
+
+.report-group-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #4f83ad;
+}
+
+.report-preview {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.report-preview-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.report-preview-head div {
+  display: grid;
+  gap: 4px;
+}
+
+.report-preview-head strong {
+  color: #162230;
+  font-size: 20px;
+}
+
+.report-preview-head span,
+.report-preview p,
+.report-preview small {
+  color: #607287;
+}
+
+.report-preview-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.report-preview-metrics span {
+  border: 1px solid #d9e2eb;
+  border-radius: 999px;
+  background: #f8fbfd;
+  color: #233344;
+  padding: 8px 12px;
+  font-weight: 750;
+}
+
+.report-preview-events {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding-left: 22px;
+}
+
+.report-preview-events li {
+  color: #1d2937;
+}
+
+.report-preview-events li span {
+  display: block;
+  margin-top: 2px;
+  color: #607287;
+  overflow-wrap: anywhere;
+}
+
 .row-actions {
   width: 1%;
   text-align: right;
@@ -992,7 +1193,7 @@ dd {
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(8, minmax(0, 1fr));
   }
 
   .nav-tabs button {
@@ -1012,7 +1213,9 @@ dd {
   .metrics-grid,
   .split-grid,
   .analytics-grid,
-  .report-filters {
+  .report-filters,
+  .report-card-grid,
+  .report-results-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1036,8 +1239,13 @@ dd {
   }
 
   .path-form,
-  .investigation-form {
+  .investigation-form,
+  .report-form {
     grid-template-columns: 1fr;
+  }
+
+  .report-preview-head {
+    flex-direction: column;
   }
 
   .wide-field {

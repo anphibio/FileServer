@@ -190,9 +190,16 @@ app.MapPost("/api/events/batch", async (
 
 app.MapGet("/api/events", async (
     string? server,
+    string? share,
     string? user,
     string? action,
     string? path,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
     int? take,
@@ -201,9 +208,16 @@ app.MapGet("/api/events", async (
 {
     var query = new EventQuery(
         Server: server,
-        User: null,
-        Action: null,
+        Share: share,
+        User: user,
+        Action: action,
         Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
         FromUtc: fromUtc,
         ToUtc: toUtc,
         Take: take is > 0 and <= 5_000 ? take.Value : 100);
@@ -215,9 +229,16 @@ app.MapGet("/api/events", async (
 
 app.MapGet("/api/events/timeline", async (
     string? server,
+    string? share,
     string? user,
     string? action,
     string? path,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
     int? take,
@@ -226,33 +247,80 @@ app.MapGet("/api/events/timeline", async (
 {
     var query = new EventQuery(
         Server: server,
-        User: user,
-        Action: action,
+        Share: share,
+        User: null,
+        Action: null,
         Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
         FromUtc: fromUtc,
         ToUtc: toUtc,
         Take: take is > 0 and <= 5_000 ? take.Value : 100);
 
     var events = await repository.QueryAsync(query, cancellationToken);
-    var timeline = new FileServerMonitor.Core.EventTimelineProjector()
-        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
-        .Select(ToApiDisplayEvent)
-        .Where(item => string.IsNullOrWhiteSpace(user)
-            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
-        .Where(item => string.IsNullOrWhiteSpace(action)
-            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
-            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
-        .ToArray();
+    var timeline = ProjectTimeline(events, user, action);
 
     return Results.Ok(timeline);
 });
 
+app.MapGet("/api/events/timeline/export.csv", async (
+    string? server,
+    string? share,
+    string? user,
+    string? action,
+    string? path,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    int? take,
+    IEventRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    var query = new EventQuery(
+        Server: server,
+        Share: share,
+        User: null,
+        Action: null,
+        Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: take is > 0 and <= 20_000 ? take.Value : 10_000);
+
+    var events = await repository.QueryAsync(query, cancellationToken);
+    var timeline = ProjectTimeline(events, user, action);
+    var csv = TimelineCsvExporter.Export(timeline);
+
+    return Results.Text(csv, "text/csv; charset=utf-8");
+});
+
 app.MapGet("/api/events/timeline/page", async (
     string? server,
+    string? share,
     string? user,
     string? action,
     string? path,
     string? search,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
     int? page,
@@ -267,22 +335,22 @@ app.MapGet("/api/events/timeline/page", async (
     var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 10_000);
     var query = new EventQuery(
         Server: server,
+        Share: share,
         User: null,
         Action: null,
         Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
         FromUtc: fromUtc,
         ToUtc: toUtc,
         Take: safeWindowTake);
 
     var events = await repository.QueryAsync(query, cancellationToken);
-    var filteredTimeline = new FileServerMonitor.Core.EventTimelineProjector()
-        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
-        .Select(ToApiDisplayEvent)
-        .Where(item => string.IsNullOrWhiteSpace(user)
-            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
-        .Where(item => string.IsNullOrWhiteSpace(action)
-            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
-            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
+    var filteredTimeline = ProjectTimeline(events, user, action)
         .Where(item => MatchesTimelineSearch(item, search))
         .ToArray();
     var totalItems = filteredTimeline.Length;
@@ -304,9 +372,16 @@ app.MapGet("/api/events/timeline/page", async (
 
 app.MapGet("/api/events/export.csv", async (
     string? server,
+    string? share,
     string? user,
     string? action,
     string? path,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
     int? take,
@@ -315,9 +390,16 @@ app.MapGet("/api/events/export.csv", async (
 {
     var query = new EventQuery(
         Server: server,
+        Share: share,
         User: user,
         Action: action,
         Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
         FromUtc: fromUtc,
         ToUtc: toUtc,
         Take: take is > 0 and <= 10_000 ? take.Value : 1_000);
@@ -469,9 +551,16 @@ app.MapPost("/api/alert-rules/{ruleName}/simulate", async (
     var take = request.Take is > 0 and <= 5_000 ? request.Take.Value : 5_000;
     var query = new EventQuery(
         Server: request.Server,
+        Share: null,
         User: request.User,
         Action: request.Action,
         Path: request.Path,
+        SourceHost: null,
+        SourceIp: null,
+        Extension: null,
+        Result: null,
+        Severity: null,
+        Source: null,
         FromUtc: fromUtc,
         ToUtc: toUtc,
         Take: take);
@@ -802,6 +891,22 @@ static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditD
         auditEvent.DisplayTarget);
 }
 
+static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
+    IReadOnlyCollection<FileAuditEvent> events,
+    string? user,
+    string? action)
+{
+    return new FileServerMonitor.Core.EventTimelineProjector()
+        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
+        .Select(ToApiDisplayEvent)
+        .Where(item => string.IsNullOrWhiteSpace(user)
+            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
+        .Where(item => string.IsNullOrWhiteSpace(action)
+            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
+            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+}
+
 static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? search)
 {
     if (string.IsNullOrWhiteSpace(search))
@@ -815,6 +920,8 @@ static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? sear
         || auditEvent.Path.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || (auditEvent.PreviousPath?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
         || auditEvent.User.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || (auditEvent.SourceHost?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
+        || (auditEvent.SourceIp?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
         || auditEvent.Action.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.DisplayAction.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.Source.Contains(needle, StringComparison.OrdinalIgnoreCase);
@@ -1285,6 +1392,12 @@ internal sealed class SqlServerEventRepository : IEventRepository
             command.Parameters.AddWithValue("@Server", $"%{query.Server}%");
         }
 
+        if (!string.IsNullOrWhiteSpace(query.Share))
+        {
+            predicates.Add("ShareName LIKE @Share");
+            command.Parameters.AddWithValue("@Share", $"%{query.Share}%");
+        }
+
         if (!string.IsNullOrWhiteSpace(query.User))
         {
             predicates.Add("UserName LIKE @User");
@@ -1301,6 +1414,53 @@ internal sealed class SqlServerEventRepository : IEventRepository
         {
             predicates.Add("FullPath LIKE @Path");
             command.Parameters.AddWithValue("@Path", $"%{query.Path}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceHost))
+        {
+            predicates.Add("SourceHost LIKE @SourceHost");
+            command.Parameters.AddWithValue("@SourceHost", $"%{query.SourceHost}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceIp))
+        {
+            predicates.Add("SourceIp LIKE @SourceIp");
+            command.Parameters.AddWithValue("@SourceIp", $"%{query.SourceIp}%");
+        }
+
+        var extensions = SplitFilterValues(query.Extension)
+            .Select(NormalizeExtensionFilter)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (extensions.Length > 0)
+        {
+            var parameterNames = new List<string>();
+            for (var index = 0; index < extensions.Length; index++)
+            {
+                var parameterName = $"@Extension{index}";
+                parameterNames.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, extensions[index]);
+            }
+
+            predicates.Add($"Extension IN ({string.Join(", ", parameterNames)})");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Result))
+        {
+            predicates.Add("ResultName LIKE @Result");
+            command.Parameters.AddWithValue("@Result", $"%{query.Result}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Severity))
+        {
+            predicates.Add("Severity = @Severity");
+            command.Parameters.AddWithValue("@Severity", query.Severity);
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Source))
+        {
+            predicates.Add("SourceName LIKE @Source");
+            command.Parameters.AddWithValue("@Source", $"%{query.Source}%");
         }
 
         if (query.FromUtc is not null)
@@ -1343,6 +1503,21 @@ internal sealed class SqlServerEventRepository : IEventRepository
             {{where}}
             ORDER BY TimestampUtc DESC;
             """;
+    }
+
+    private static IEnumerable<string> SplitFilterValues(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? Array.Empty<string>()
+            : value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static string NormalizeExtensionFilter(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.StartsWith(".", StringComparison.Ordinal)
+            ? trimmed.ToLowerInvariant()
+            : $".{trimmed.ToLowerInvariant()}";
     }
 
     private static async Task<long> CountEventsAsync(
@@ -1649,6 +1824,11 @@ internal sealed class InMemoryEventRepository : IEventRepository
             events = events.Where(item => item.Server.Contains(query.Server, StringComparison.OrdinalIgnoreCase));
         }
 
+        if (!string.IsNullOrWhiteSpace(query.Share))
+        {
+            events = events.Where(item => item.Share.Contains(query.Share, StringComparison.OrdinalIgnoreCase));
+        }
+
         if (!string.IsNullOrWhiteSpace(query.User))
         {
             events = events.Where(item => item.User.Contains(query.User, StringComparison.OrdinalIgnoreCase));
@@ -1662,6 +1842,40 @@ internal sealed class InMemoryEventRepository : IEventRepository
         if (!string.IsNullOrWhiteSpace(query.Path))
         {
             events = events.Where(item => item.Path.Contains(query.Path, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceHost))
+        {
+            events = events.Where(item => item.SourceHost?.Contains(query.SourceHost, StringComparison.OrdinalIgnoreCase) ?? false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceIp))
+        {
+            events = events.Where(item => item.SourceIp?.Contains(query.SourceIp, StringComparison.OrdinalIgnoreCase) ?? false);
+        }
+
+        var extensions = SplitFilterValues(query.Extension)
+            .Select(NormalizeExtensionFilter)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (extensions.Length > 0)
+        {
+            events = events.Where(item => item.Extension is not null && extensions.Contains(item.Extension, StringComparer.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Result))
+        {
+            events = events.Where(item => item.Result.Contains(query.Result, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Severity))
+        {
+            events = events.Where(item => item.Severity.Equals(query.Severity, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Source))
+        {
+            events = events.Where(item => item.Source.Contains(query.Source, StringComparison.OrdinalIgnoreCase));
         }
 
         if (query.FromUtc is not null)
@@ -1680,6 +1894,21 @@ internal sealed class InMemoryEventRepository : IEventRepository
             .ToArray();
 
         return Task.FromResult(result);
+    }
+
+    private static IEnumerable<string> SplitFilterValues(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? Array.Empty<string>()
+            : value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static string NormalizeExtensionFilter(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.StartsWith(".", StringComparison.Ordinal)
+            ? trimmed.ToLowerInvariant()
+            : $".{trimmed.ToLowerInvariant()}";
     }
 
     public Task<EventStoreStats> GetStatsAsync(CancellationToken cancellationToken)
@@ -4755,9 +4984,16 @@ internal sealed record FileAuditEventRequest(
 
 internal sealed record EventQuery(
     string? Server,
+    string? Share,
     string? User,
     string? Action,
     string? Path,
+    string? SourceHost,
+    string? SourceIp,
+    string? Extension,
+    string? Result,
+    string? Severity,
+    string? Source,
     DateTimeOffset? FromUtc,
     DateTimeOffset? ToUtc,
     int Take);
@@ -4805,6 +5041,67 @@ internal static class EventCsvExporter
                 auditEvent.PreviousPath,
                 auditEvent.ObjectType,
                 auditEvent.Action,
+                auditEvent.User,
+                auditEvent.Sid,
+                auditEvent.SourceHost,
+                auditEvent.SourceIp,
+                auditEvent.ProcessName,
+                auditEvent.FileSizeBytes,
+                auditEvent.Extension,
+                auditEvent.Result,
+                auditEvent.Severity,
+                auditEvent.Source);
+        }
+
+        return builder.ToString();
+    }
+}
+
+internal static class TimelineCsvExporter
+{
+    private static readonly string[] Header =
+    {
+        "id",
+        "timestampUtc",
+        "server",
+        "share",
+        "path",
+        "previousPath",
+        "objectType",
+        "action",
+        "displayAction",
+        "displayTarget",
+        "user",
+        "sid",
+        "sourceHost",
+        "sourceIp",
+        "processName",
+        "fileSizeBytes",
+        "extension",
+        "result",
+        "severity",
+        "source"
+    };
+
+    public static string Export(IReadOnlyCollection<FileAuditDisplayEvent> events)
+    {
+        var builder = new StringBuilder();
+        CsvWriter.AppendRow(builder, Header);
+
+        foreach (var auditEvent in events)
+        {
+            CsvWriter.AppendRow(
+                builder,
+                auditEvent.Id,
+                auditEvent.TimestampUtc,
+                auditEvent.Server,
+                auditEvent.Share,
+                auditEvent.Path,
+                auditEvent.PreviousPath,
+                auditEvent.ObjectType,
+                auditEvent.Action,
+                auditEvent.DisplayAction,
+                auditEvent.DisplayTarget,
                 auditEvent.User,
                 auditEvent.Sid,
                 auditEvent.SourceHost,

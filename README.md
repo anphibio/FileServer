@@ -194,6 +194,12 @@ Exportar anomalias de baseline:
 curl "http://localhost:8080/api/reports/baseline-anomalies/export.csv?server=FS01&take=20" -o anomalias.csv
 ```
 
+Exportar a timeline correlacionada usada pelos relatorios:
+
+```bash
+curl "http://localhost:8080/api/events/timeline/export.csv?action=deleted&path=C:%5CCorporativo%5CRH&take=10000" -o relatorio.csv
+```
+
 Listar alertas abertos:
 
 ```bash
@@ -276,6 +282,13 @@ Quando houver um proxy ou autenticacao corporativa, envie `X-Actor` para registr
 O painel web tambem possui a aba `Auditoria`, com busca por acao, entidade, operador ou IP.
 
 ## Relatorios Operacionais
+
+O painel web possui a aba `Relatorios` com dois fluxos:
+
+- `Guiados`: atalhos para atividade por pasta, usuario, servidor, leitura sem alteracao, exclusao em massa, acesso negado, permissao, renomeacao, criacao de executaveis, host de origem e acesso remoto suspeito.
+- `Personalizado`: filtros livres para montar o recorte manualmente.
+
+O fluxo recomendado e investigar primeiro na tela, validar se o recorte esta correto e depois usar `Exportar CSV` ou `Gerar relatorio`. A exportacao usa a timeline ja projetada pelo Core, evitando divergencia entre a tela e o arquivo.
 
 O endpoint de resumo operacional agrega atividade recente sem retornar a lista completa de eventos.
 

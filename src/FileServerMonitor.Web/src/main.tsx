@@ -19,6 +19,17 @@ import {
   Trash2
 } from "lucide-react";
 import "./styles.css";
+import {
+  buildReportQueryParams,
+  createDefaultReportFilters,
+  createFiltersForScenario,
+  getReportScenario,
+  reportScenarios,
+  summarizeReportFilters,
+  type ReportFilters,
+  type ReportGrouping,
+  type ReportScenarioId
+} from "./report-definitions";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 const apiKey = import.meta.env.VITE_API_KEY ?? "";
@@ -251,7 +262,14 @@ type Notice = {
   message: string;
 };
 
-type Tab = "dashboard" | "events" | "investigation" | "alerts" | "agents" | "paths" | "audit";
+type GeneratedReport = {
+  title: string;
+  generatedAt: string;
+  filtersSummary: string;
+  events: DisplayEvent[];
+};
+
+type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit";
 
 const emptyMonitoredPathForm: MonitoredPathForm = {
   server: "FS01",
@@ -414,6 +432,9 @@ function App() {
           <TabButton icon={<Search size={18} />} active={activeTab === "investigation"} onClick={() => setActiveTab("investigation")} meta="até 500">
             Investigação
           </TabButton>
+          <TabButton icon={<BarChart3 size={18} />} active={activeTab === "reports"} onClick={() => setActiveTab("reports")} meta="guiados">
+            Relatórios
+          </TabButton>
           <TabButton icon={<Bell size={18} />} active={activeTab === "alerts"} onClick={() => setActiveTab("alerts")} meta={openAlerts.length.toLocaleString("pt-BR")}>
             Alertas
           </TabButton>
@@ -476,6 +497,8 @@ function App() {
         )}
 
         {activeTab === "investigation" && <InvestigationView onNotify={setNotice} />}
+
+        {activeTab === "reports" && <ReportsView onNotify={setNotice} />}
 
         {activeTab === "alerts" && <AlertsView alerts={alerts} rules={alertRules} onChanged={loadData} onAcknowledge={loadData} onNotify={setNotice} />}
 
@@ -886,6 +909,322 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
           <EmptyState text="Preencha os filtros e consulte para iniciar a investigação." />
         )}
       </Panel>
+    </div>
+  );
+}
+
+function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [mode, setMode] = useState<"guided" | "custom">("guided");
+  const [selectedScenario, setSelectedScenario] = useState<ReportScenarioId>("folder-activity");
+  const [filters, setFilters] = useState<ReportFilters>(createFiltersForScenario("folder-activity"));
+  const [events, setEvents] = useState<DisplayEvent[]>([]);
+  const [searched, setSearched] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [generatedReport, setGeneratedReport] = useState<GeneratedReport | null>(null);
+  const [page, setPage] = useState(1);
+  const scenario = getReportScenario(selectedScenario);
+  const reportTitle = mode === "guided" ? scenario.title : "Relatorio personalizado";
+  const totalPages = Math.max(1, Math.ceil(events.length / EVENTS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const visibleEvents = useMemo(
+    () => events.slice((safePage - 1) * EVENTS_PAGE_SIZE, safePage * EVENTS_PAGE_SIZE),
+    [events, safePage]
+  );
+  const groupedRows = useMemo(() => buildReportGroups(events, filters.groupBy), [events, filters.groupBy]);
+  const uniqueUsers = useMemo(() => new Set(events.map((event) => event.user).filter(Boolean)).size, [events]);
+  const affectedPaths = useMemo(() => new Set(events.map((event) => event.path).filter(Boolean)).size, [events]);
+  const dominantAction = useMemo(() => getTopEventAction(events), [events]);
+
+  useEffect(() => {
+    setPage((current) => Math.min(current, totalPages));
+  }, [totalPages]);
+
+  function selectScenario(id: ReportScenarioId) {
+    setSelectedScenario(id);
+    setMode("guided");
+    setFilters(createFiltersForScenario(id));
+    setGeneratedReport(null);
+    setError(null);
+  }
+
+  function startCustomReport() {
+    setMode("custom");
+    setFilters(createDefaultReportFilters());
+    setGeneratedReport(null);
+    setError(null);
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!validateReportFilters(filters, setError, onNotify)) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setGeneratedReport(null);
+
+    try {
+      const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, 1000));
+      setEvents(result);
+      setPage(1);
+      setSearched(true);
+      onNotify({
+        tone: result.length > 0 ? "success" : "warning",
+        message: result.length > 0
+          ? `Relatorio atualizado com ${result.length.toLocaleString("pt-BR")} evento(s).`
+          : "Nenhum evento encontrado para este recorte."
+      });
+    } catch (searchError) {
+      setError(searchError instanceof Error ? searchError.message : "Falha ao consultar relatorio.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function generateReport() {
+    if (!searched) {
+      onNotify({ tone: "warning", message: "Consulte o recorte antes de gerar o relatorio." });
+      return;
+    }
+
+    setGeneratedReport({
+      title: reportTitle,
+      generatedAt: new Date().toISOString(),
+      filtersSummary: summarizeReportFilters(filters),
+      events
+    });
+    onNotify({ tone: "success", message: "Previa do relatorio gerada com o mesmo recorte da investigacao." });
+  }
+
+  return (
+    <div className="view-stack reports-view">
+      <section className="executive-grid">
+        <ExecutiveCard
+          title="Eventos no recorte"
+          value={searched ? events.length.toLocaleString("pt-BR") : "-"}
+          detail={searched ? summarizeReportFilters(filters) || "Sem filtros adicionais." : "Escolha um relatorio e investigue o recorte."}
+          tone={events.length > 500 ? "warning" : "neutral"}
+        />
+        <ExecutiveCard
+          title="Usuarios envolvidos"
+          value={searched ? uniqueUsers.toLocaleString("pt-BR") : "-"}
+          detail={dominantAction ? `Acao dominante: ${dominantAction}.` : "Aguardando consulta."}
+          tone={uniqueUsers > 20 ? "warning" : "neutral"}
+        />
+        <ExecutiveCard
+          title="Caminhos afetados"
+          value={searched ? affectedPaths.toLocaleString("pt-BR") : "-"}
+          detail={`Agrupamento: ${labelForReportGroup(filters.groupBy)}.`}
+          tone={affectedPaths > 100 ? "danger" : "neutral"}
+        />
+      </section>
+
+      <Panel title="Relatorios guiados" subtitle="Use cenarios prontos para montar rapidamente um recorte comum de investigacao.">
+        <div className="report-mode-bar">
+          <button className={mode === "guided" ? "active" : ""} type="button" onClick={() => setMode("guided")}>
+            Guiados
+          </button>
+          <button className={mode === "custom" ? "active" : ""} type="button" onClick={startCustomReport}>
+            Personalizado
+          </button>
+        </div>
+
+        {mode === "guided" ? (
+          <div className="report-card-grid">
+            {reportScenarios.map((item) => (
+              <button
+                key={item.id}
+                className={`report-card ${selectedScenario === item.id ? "active" : ""}`}
+                type="button"
+                onClick={() => selectScenario(item.id)}
+              >
+                <strong>{item.title}</strong>
+                <span>{item.description}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="custom-report-note">
+            <strong>Relatorio personalizado</strong>
+            <span>Monte livremente o periodo, escopo, acao, origem e agrupamento antes de investigar.</span>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title={reportTitle} subtitle={mode === "guided" ? scenario.focus : "Use filtros livres e gere um recorte reutilizavel."}>
+        <form className="path-form report-form" onSubmit={submit}>
+          <label>
+            Periodo
+            <select value={filters.periodMode} onChange={(event) => setFilters({ ...filters, periodMode: event.target.value as "preset" | "custom" })}>
+              <option value="preset">Faixa rapida</option>
+              <option value="custom">Dia ou intervalo</option>
+            </select>
+          </label>
+          {filters.periodMode === "preset" ? (
+            <label>
+              Faixa rapida
+              <select value={filters.periodHours} onChange={(event) => setFilters({ ...filters, periodHours: event.target.value })}>
+                <option value="1">Ultima hora</option>
+                <option value="6">Ultimas 6 horas</option>
+                <option value="24">Ultimas 24 horas</option>
+                <option value="168">Ultimos 7 dias</option>
+                <option value="720">Ultimos 30 dias</option>
+              </select>
+            </label>
+          ) : (
+            <>
+              <label>
+                De
+                <input type="date" value={filters.fromDate} onChange={(event) => setFilters({ ...filters, fromDate: event.target.value })} />
+              </label>
+              <label>
+                Ate
+                <input type="date" value={filters.toDate} onChange={(event) => setFilters({ ...filters, toDate: event.target.value })} />
+              </label>
+            </>
+          )}
+          <label>
+            Servidor
+            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FS01" />
+          </label>
+          <label>
+            Compartilhamento
+            <input value={filters.share} onChange={(event) => setFilters({ ...filters, share: event.target.value })} placeholder="Corporativo" />
+          </label>
+          <label>
+            Usuario
+            <input value={filters.user} onChange={(event) => setFilters({ ...filters, user: event.target.value })} placeholder="DOMINIO\\usuario" />
+          </label>
+          <label className="wide-field">
+            Caminho
+            <input value={filters.path} onChange={(event) => setFilters({ ...filters, path: event.target.value })} placeholder="C:\\Corporativo\\RH ou parte do caminho" />
+          </label>
+          <label>
+            Acao
+            <select value={filters.action} onChange={(event) => setFilters({ ...filters, action: event.target.value })}>
+              <option value="">Todas</option>
+              <option value="created">Criado</option>
+              <option value="modified">Alterado</option>
+              <option value="accessed">Acessado</option>
+              <option value="deleted">Excluido</option>
+              <option value="renamed">Renomeado</option>
+              <option value="moved">Movido</option>
+              <option value="permission_changed">Permissao</option>
+            </select>
+          </label>
+          <label>
+            Host origem
+            <input value={filters.sourceHost} onChange={(event) => setFilters({ ...filters, sourceHost: event.target.value })} placeholder="NOTE-01" />
+          </label>
+          <label>
+            IP origem
+            <input value={filters.sourceIp} onChange={(event) => setFilters({ ...filters, sourceIp: event.target.value })} placeholder="192.168.2.10" />
+          </label>
+          <label>
+            Extensoes
+            <input value={filters.extension} onChange={(event) => setFilters({ ...filters, extension: event.target.value })} placeholder=".exe,.ps1,.bat" />
+          </label>
+          <label>
+            Resultado
+            <input value={filters.result} onChange={(event) => setFilters({ ...filters, result: event.target.value })} placeholder="success, denied..." />
+          </label>
+          <label>
+            Severidade
+            <select value={filters.severity} onChange={(event) => setFilters({ ...filters, severity: event.target.value })}>
+              <option value="">Todas</option>
+              <option value="info">Info</option>
+              <option value="warning">Warning</option>
+              <option value="critical">Critical</option>
+            </select>
+          </label>
+          <label>
+            Agrupar por
+            <select value={filters.groupBy} onChange={(event) => setFilters({ ...filters, groupBy: event.target.value as ReportGrouping })}>
+              <option value="action">Acao</option>
+              <option value="user">Usuario</option>
+              <option value="server">Servidor</option>
+              <option value="share">Compartilhamento</option>
+              <option value="sourceHost">Host origem</option>
+              <option value="path">Caminho</option>
+              <option value="extension">Extensao</option>
+              <option value="severity">Severidade</option>
+            </select>
+          </label>
+          <div className="report-actions">
+            <button className="text-button" type="submit" disabled={loading}>
+              <Search size={16} />
+              Investigar
+            </button>
+            <button className="text-button" type="button" onClick={() => downloadReportCsv(filters, onNotify)}>
+              <Download size={16} />
+              Exportar CSV
+            </button>
+            <button className="text-button" type="button" onClick={generateReport}>
+              <ClipboardList size={16} />
+              Gerar relatorio
+            </button>
+          </div>
+        </form>
+      </Panel>
+
+      {error && <div className="error-banner">{error}</div>}
+
+      <section className="report-results-grid">
+        <Panel title="Resumo por agrupamento" subtitle={`Top ${labelForReportGroup(filters.groupBy).toLowerCase()} no recorte investigado.`}>
+          {groupedRows.length > 0 ? <ReportGroupList rows={groupedRows} total={events.length} /> : <EmptyState text="Consulte um recorte para gerar o resumo." />}
+        </Panel>
+        <Panel title="Linha do Tempo do Relatorio" subtitle="Eventos correlacionados pelo Core, prontos para validar antes da geracao.">
+          {searched ? (
+            <InvestigationTable
+              events={visibleEvents}
+              pagination={{
+                page: safePage,
+                totalPages,
+                pageItems: visibleEvents.length,
+                totalItems: events.length,
+                onPrevious: () => setPage((current) => Math.max(1, current - 1)),
+                onNext: () => setPage((current) => Math.min(totalPages, current + 1))
+              }}
+            />
+          ) : (
+            <EmptyState text="Escolha um relatorio, ajuste os filtros e clique em Investigar." />
+          )}
+        </Panel>
+      </section>
+
+      {generatedReport && (
+        <Panel title="Previa do relatorio" subtitle="Texto pronto para revisao, impressao ou salvamento em PDF pelo navegador.">
+          <div className="report-preview">
+            <div className="report-preview-head">
+              <div>
+                <strong>{generatedReport.title}</strong>
+                <span>Gerado em {formatDate(generatedReport.generatedAt)}</span>
+              </div>
+              <button className="text-button" type="button" onClick={() => window.print()}>
+                <Download size={16} />
+                Imprimir / salvar PDF
+              </button>
+            </div>
+            <p>{generatedReport.filtersSummary || "Sem filtros adicionais."}</p>
+            <div className="report-preview-metrics">
+              <span>{generatedReport.events.length.toLocaleString("pt-BR")} evento(s)</span>
+              <span>{uniqueUsers.toLocaleString("pt-BR")} usuario(s)</span>
+              <span>{affectedPaths.toLocaleString("pt-BR")} caminho(s)</span>
+            </div>
+            <ol className="report-preview-events">
+              {generatedReport.events.slice(0, 20).map((item) => (
+                <li key={item.id}>
+                  <strong>{item.displayAction ?? item.action}</strong>
+                  <span>{formatDate(item.timestampUtc)} · {item.user} · {item.path}</span>
+                </li>
+              ))}
+            </ol>
+            {generatedReport.events.length > 20 && <small>Mostrando os 20 eventos mais recentes na previa. Use o CSV para a lista completa.</small>}
+          </div>
+        </Panel>
+      )}
     </div>
   );
 }
@@ -1881,6 +2220,29 @@ function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
 }
 
+function ReportGroupList({ rows, total }: { rows: Array<{ label: string; count: number }>; total: number }) {
+  const safeTotal = Math.max(1, total);
+
+  return (
+    <div className="report-group-list">
+      {rows.slice(0, 10).map((row) => {
+        const percent = Math.round((row.count / safeTotal) * 100);
+        return (
+          <div key={row.label} className="report-group-row">
+            <div>
+              <strong>{row.label}</strong>
+              <span>{row.count.toLocaleString("pt-BR")} evento(s)</span>
+            </div>
+            <div className="report-group-bar" aria-label={`${row.label}: ${percent}%`}>
+              <span style={{ width: `${Math.max(4, percent)}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function FeedbackBanner({
   tone,
   message,
@@ -2042,6 +2404,16 @@ function buildInvestigationUrl(filters: InvestigationFilters) {
   }
 
   return `/api/events/timeline?${params.toString()}`;
+}
+
+function buildReportEventsUrl(filters: ReportFilters, take = 1000) {
+  const params = buildReportQueryParams(filters, take);
+  return `/api/events/timeline?${params.toString()}`;
+}
+
+function buildReportExportUrl(filters: ReportFilters, take = 10000) {
+  const params = buildReportQueryParams(filters, take);
+  return `/api/events/timeline/export.csv?${params.toString()}`;
 }
 
 function buildTimelinePageUrl(page: number, search: string) {
@@ -2248,6 +2620,19 @@ async function downloadEventsCsv(onNotify: (notice: Notice | null) => void) {
   }
 }
 
+async function downloadReportCsv(filters: ReportFilters, onNotify: (notice: Notice | null) => void) {
+  try {
+    await downloadCsv(
+      `${apiBaseUrl}${buildReportExportUrl(filters, 10000)}`,
+      `fileserver-report-${new Date().toISOString().slice(0, 10)}.csv`
+    );
+    onNotify({ tone: "success", message: "Exportação do relatório iniciada." });
+  } catch (error) {
+    console.error(error);
+    onNotify({ tone: "danger", message: "Nao foi possivel exportar o relatorio agora." });
+  }
+}
+
 async function downloadCsv(url: string, fileName: string) {
   const response = await fetch(url, {
     headers: buildHeaders()
@@ -2295,6 +2680,7 @@ function titleForTab(tab: Tab) {
     dashboard: "Dashboard",
     events: "Eventos",
     investigation: "Investigação",
+    reports: "Relatórios",
     alerts: "Alertas",
     agents: "Agentes",
     paths: "Caminhos Monitorados",
@@ -2444,6 +2830,82 @@ function getTopEventAction(events: FileAuditEvent[]) {
   }
 
   return [...counts.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? null;
+}
+
+function validateReportFilters(
+  filters: ReportFilters,
+  setError: (error: string | null) => void,
+  onNotify: (notice: Notice | null) => void
+) {
+  if (filters.periodMode === "custom" && !filters.fromDate) {
+    setError("Selecione pelo menos a data inicial para consultar um dia ou intervalo.");
+    onNotify({ tone: "warning", message: "Escolha a data inicial para abrir o relatorio." });
+    return false;
+  }
+
+  if (filters.periodMode === "custom" && filters.toDate && filters.toDate < filters.fromDate) {
+    setError("A data final não pode ser anterior à data inicial.");
+    onNotify({ tone: "warning", message: "Revise o intervalo informado antes de consultar." });
+    return false;
+  }
+
+  return true;
+}
+
+function buildReportGroups(events: DisplayEvent[], groupBy: ReportGrouping) {
+  const counts = new Map<string, number>();
+
+  for (const event of events) {
+    const label = getReportGroupValue(event, groupBy);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .map(([label, count]) => ({ label, count }))
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, "pt-BR"));
+}
+
+function getReportGroupValue(event: DisplayEvent, groupBy: ReportGrouping) {
+  switch (groupBy) {
+    case "action":
+      return event.displayAction ?? event.action;
+    case "user":
+      return event.user || "UNKNOWN";
+    case "server":
+      return event.server || "Sem servidor";
+    case "share":
+      return event.share || "Sem compartilhamento";
+    case "sourceHost":
+      return event.sourceHost || "Sem host";
+    case "path":
+      return getDirectoryName(event.path) || event.path || "Sem caminho";
+    case "extension":
+      return event.extension || "Sem extensao";
+    case "severity":
+      return event.severity || "Sem severidade";
+    default:
+      return "Outros";
+  }
+}
+
+function labelForReportGroup(groupBy: ReportGrouping) {
+  const labels: Record<ReportGrouping, string> = {
+    action: "Ação",
+    user: "Usuário",
+    server: "Servidor",
+    share: "Compartilhamento",
+    sourceHost: "Host de origem",
+    path: "Caminho",
+    extension: "Extensão",
+    severity: "Severidade"
+  };
+
+  return labels[groupBy];
+}
+
+function getDirectoryName(path: string) {
+  const index = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return index > 0 ? path.slice(0, index) : path;
 }
 
 function formatDetails(value?: string | null) {
