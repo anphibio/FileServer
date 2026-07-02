@@ -6141,11 +6141,6 @@ internal sealed class LdapAuthenticator
 
         if (settings.Security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase))
         {
-            if (!settings.ValidateTlsCertificate)
-            {
-                connection.SessionOptions.VerifyServerCertificate = (_, _) => true;
-            }
-
             connection.SessionOptions.SecureSocketLayer = true;
         }
 
