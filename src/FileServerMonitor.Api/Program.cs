@@ -25,6 +25,7 @@ builder.Services.AddSingleton<AlertStore>();
 builder.Services.AddSingleton<MonitoredPathStore>();
 builder.Services.AddSingleton<AdminAuditStore>();
 builder.Services.AddSingleton<LdapAuthSettingsStore>();
+builder.Services.AddSingleton<RetentionSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
 builder.Services.AddHostedService<RetentionWorker>();
 builder.Services.AddCors(options =>
@@ -137,6 +138,7 @@ app.MapGet("/health", async (IEventRepository repository, CancellationToken canc
 app.MapGet("/metrics", async (
     IEventRepository repository,
     AgentHealthStore agents,
+    RetentionSettingsStore retentionStore,
     IConfiguration configuration,
     CancellationToken cancellationToken) =>
 {
@@ -147,14 +149,7 @@ app.MapGet("/metrics", async (
         AgentStaleMinutes: configuration.GetValue("Agents:StaleMinutes", 10),
         AgentBacklogWarningThreshold: configuration.GetValue("Agents:BacklogWarningThreshold", 1000),
         LastEventWarningSeconds: configuration.GetValue("Metrics:LastEventWarningSeconds", 1800));
-    var retention = new RetentionMetrics(
-        Enabled: configuration.GetValue("Retention:Enabled", false),
-        EventsDays: configuration.GetValue("Retention:EventsDays", 180),
-        TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays")
-            ?? configuration.GetValue("Retention:EventsDays", 180),
-        AlertsDays: configuration.GetValue("Retention:AlertsDays", 365),
-        IntervalHours: configuration.GetValue("Retention:IntervalHours", 24),
-        PurgeBatchSize: configuration.GetValue("Retention:PurgeBatchSize", 10_000));
+    var retention = RetentionMetrics.FromSettings(await retentionStore.GetAsync(cancellationToken));
     var api = new ApiMetrics(
         Status: "healthy",
         StorageProvider: repository.ProviderName,
@@ -977,6 +972,34 @@ app.MapPut("/api/auth/config", async (
         Details: AuthConfigResponse.FromSettings(settings)), cancellationToken);
 
     return Results.Ok(AuthConfigResponse.FromSettings(settings));
+});
+
+app.MapGet("/api/retention/config", async (
+    RetentionSettingsStore store,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+    return Results.Ok(RetentionSettingsResponse.FromSettings(settings));
+});
+
+app.MapPut("/api/retention/config", async (
+    RetentionSettingsRequest request,
+    RetentionSettingsStore store,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.SaveAsync(request, cancellationToken);
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "retention.update",
+        EntityType: "retention_settings",
+        EntityId: "default",
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: RetentionSettingsResponse.FromSettings(settings)), cancellationToken);
+
+    return Results.Ok(RetentionSettingsResponse.FromSettings(settings));
 });
 
 app.MapPost("/api/monitored-paths", async (
@@ -6010,58 +6033,258 @@ internal sealed class AlertNotificationService
     }
 }
 
+internal sealed class RetentionSettingsStore
+{
+    private RetentionOptions _settings;
+#if SQLSERVER
+    private readonly bool _persistSettings;
+    private readonly string? _connectionString;
+#endif
+
+    public RetentionSettingsStore(IConfiguration configuration)
+    {
+#if SQLSERVER
+        _persistSettings = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+
+        _settings = Normalize(new RetentionSettingsRequest(
+            Enabled: configuration.GetValue("Retention:Enabled", false),
+            EventsDays: configuration.GetValue<int?>("Retention:EventsDays"),
+            TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays"),
+            AlertsDays: configuration.GetValue<int?>("Retention:AlertsDays"),
+            IntervalHours: configuration.GetValue<int?>("Retention:IntervalHours"),
+            PurgeBatchSize: configuration.GetValue<int?>("Retention:PurgeBatchSize")));
+    }
+
+    public async Task<RetentionOptions> GetAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            var persisted = await ReadSqlAsync(cancellationToken);
+            if (persisted is not null)
+            {
+                _settings = persisted;
+            }
+        }
+#endif
+
+        return _settings;
+    }
+
+    public async Task<RetentionOptions> SaveAsync(RetentionSettingsRequest request, CancellationToken cancellationToken)
+    {
+        var settings = Normalize(request);
+        _settings = settings;
+
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            await UpsertSqlAsync(settings, cancellationToken);
+        }
+#endif
+
+        return settings;
+    }
+
+    private static RetentionOptions Normalize(RetentionSettingsRequest request)
+    {
+        var eventsDays = Math.Clamp(request.EventsDays ?? 180, 7, 3650);
+        var timelineDays = Math.Clamp(request.TimelineDays ?? eventsDays, 7, 3650);
+        var alertsDays = Math.Clamp(request.AlertsDays ?? 365, 7, 3650);
+
+        return new RetentionOptions(
+            Enabled: request.Enabled,
+            EventsDays: eventsDays,
+            TimelineDays: timelineDays,
+            AlertsDays: alertsDays,
+            IntervalHours: Math.Clamp(request.IntervalHours ?? 24, 1, 168),
+            PurgeBatchSize: Math.Clamp(request.PurgeBatchSize ?? 10_000, 100, 100_000),
+            UpdatedUtc: DateTimeOffset.UtcNow);
+    }
+
+#if SQLSERVER
+    private async Task<RetentionOptions?> ReadSqlAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1)
+                Enabled,
+                EventsDays,
+                TimelineDays,
+                AlertsDays,
+                IntervalHours,
+                PurgeBatchSize,
+                UpdatedUtc
+            FROM dbo.RetentionSettings
+            WHERE Id = 1;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSettings(reader) : null;
+    }
+
+    private async Task UpsertSqlAsync(RetentionOptions settings, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            MERGE dbo.RetentionSettings AS target
+            USING (SELECT 1 AS Id) AS source
+                ON target.Id = source.Id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    Enabled = @Enabled,
+                    EventsDays = @EventsDays,
+                    TimelineDays = @TimelineDays,
+                    AlertsDays = @AlertsDays,
+                    IntervalHours = @IntervalHours,
+                    PurgeBatchSize = @PurgeBatchSize,
+                    UpdatedUtc = @UpdatedUtc
+            WHEN NOT MATCHED THEN
+                INSERT
+                (
+                    Id,
+                    Enabled,
+                    EventsDays,
+                    TimelineDays,
+                    AlertsDays,
+                    IntervalHours,
+                    PurgeBatchSize,
+                    UpdatedUtc
+                )
+                VALUES
+                (
+                    1,
+                    @Enabled,
+                    @EventsDays,
+                    @TimelineDays,
+                    @AlertsDays,
+                    @IntervalHours,
+                    @PurgeBatchSize,
+                    @UpdatedUtc
+                );
+            """;
+        AddParameters(command, settings);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureSqlSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.RetentionSettings', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.RetentionSettings
+                (
+                    Id INT NOT NULL CONSTRAINT PK_RetentionSettings PRIMARY KEY,
+                    Enabled BIT NOT NULL,
+                    EventsDays INT NOT NULL,
+                    TimelineDays INT NOT NULL,
+                    AlertsDays INT NOT NULL,
+                    IntervalHours INT NOT NULL,
+                    PurgeBatchSize INT NOT NULL,
+                    UpdatedUtc DATETIME2(3) NOT NULL
+                );
+            END;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private SqlConnection CreateSqlConnection()
+    {
+        if (string.IsNullOrWhiteSpace(_connectionString))
+        {
+            throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+        }
+
+        return new SqlConnection(_connectionString);
+    }
+
+    private static void AddParameters(SqlCommand command, RetentionOptions settings)
+    {
+        command.Parameters.AddWithValue("@Enabled", settings.Enabled);
+        command.Parameters.AddWithValue("@EventsDays", settings.EventsDays);
+        command.Parameters.AddWithValue("@TimelineDays", settings.TimelineDays);
+        command.Parameters.AddWithValue("@AlertsDays", settings.AlertsDays);
+        command.Parameters.AddWithValue("@IntervalHours", settings.IntervalHours);
+        command.Parameters.AddWithValue("@PurgeBatchSize", settings.PurgeBatchSize);
+        command.Parameters.AddWithValue("@UpdatedUtc", settings.UpdatedUtc.UtcDateTime);
+    }
+
+    private static RetentionOptions ReadSettings(SqlDataReader reader)
+    {
+        return new RetentionOptions(
+            Enabled: reader.GetBoolean(reader.GetOrdinal("Enabled")),
+            EventsDays: reader.GetInt32(reader.GetOrdinal("EventsDays")),
+            TimelineDays: reader.GetInt32(reader.GetOrdinal("TimelineDays")),
+            AlertsDays: reader.GetInt32(reader.GetOrdinal("AlertsDays")),
+            IntervalHours: reader.GetInt32(reader.GetOrdinal("IntervalHours")),
+            PurgeBatchSize: reader.GetInt32(reader.GetOrdinal("PurgeBatchSize")),
+            UpdatedUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("UpdatedUtc")), DateTimeKind.Utc)));
+    }
+#endif
+}
+
 internal sealed class RetentionWorker : BackgroundService
 {
     private readonly IEventRepository _events;
     private readonly ITimelineRepository _timeline;
     private readonly AlertStore _alerts;
-    private readonly RetentionOptions _options;
+    private readonly RetentionSettingsStore _settings;
     private readonly ILogger<RetentionWorker> _logger;
 
     public RetentionWorker(
         IEventRepository events,
         ITimelineRepository timeline,
         AlertStore alerts,
-        IConfiguration configuration,
+        RetentionSettingsStore settings,
         ILogger<RetentionWorker> logger)
     {
         _events = events;
         _timeline = timeline;
         _alerts = alerts;
+        _settings = settings;
         _logger = logger;
-        _options = new RetentionOptions(
-            Enabled: configuration.GetValue("Retention:Enabled", false),
-            EventsDays: configuration.GetValue("Retention:EventsDays", 180),
-            TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays")
-                ?? configuration.GetValue("Retention:EventsDays", 180),
-            AlertsDays: configuration.GetValue("Retention:AlertsDays", 365),
-            IntervalHours: configuration.GetValue("Retention:IntervalHours", 24),
-            PurgeBatchSize: configuration.GetValue("Retention:PurgeBatchSize", 10_000));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!_options.Enabled)
-        {
-            _logger.LogInformation("Retencao automatica desativada.");
-            return;
-        }
-
-        var interval = TimeSpan.FromHours(Math.Max(1, _options.IntervalHours));
-
         while (!stoppingToken.IsCancellationRequested)
         {
-            await RunOnceAsync(stoppingToken);
+            var options = await _settings.GetAsync(stoppingToken);
+
+            if (options.Enabled)
+            {
+                await RunOnceAsync(options, stoppingToken);
+            }
+            else
+            {
+                _logger.LogDebug("Retencao automatica desativada.");
+            }
+
+            var interval = options.Enabled
+                ? TimeSpan.FromHours(Math.Max(1, options.IntervalHours))
+                : TimeSpan.FromMinutes(5);
             await Task.Delay(interval, stoppingToken);
         }
     }
 
-    private async Task RunOnceAsync(CancellationToken cancellationToken)
+    private async Task RunOnceAsync(RetentionOptions options, CancellationToken cancellationToken)
     {
-        var eventCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.EventsDays));
-        var timelineCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.TimelineDays));
-        var alertCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.AlertsDays));
-        var batchSize = Math.Clamp(_options.PurgeBatchSize, 100, 100_000);
+        var eventCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.EventsDays));
+        var timelineCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.TimelineDays));
+        var alertCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.AlertsDays));
+        var batchSize = Math.Clamp(options.PurgeBatchSize, 100, 100_000);
 
         try
         {
@@ -6937,6 +7160,11 @@ internal static class AuthHelpers
             return AuthRole.Admin;
         }
 
+        if (request.Path.StartsWithSegments("/api/retention/config"))
+        {
+            return AuthRole.Admin;
+        }
+
         if (request.Path.StartsWithSegments("/api/alerts") && HttpMethods.IsPost(request.Method))
         {
             return AuthRole.Operator;
@@ -7023,7 +7251,38 @@ internal sealed record RetentionOptions(
     int TimelineDays,
     int AlertsDays,
     int IntervalHours,
-    int PurgeBatchSize);
+    int PurgeBatchSize,
+    DateTimeOffset UpdatedUtc);
+
+internal sealed record RetentionSettingsRequest(
+    bool Enabled,
+    int? EventsDays,
+    int? TimelineDays,
+    int? AlertsDays,
+    int? IntervalHours,
+    int? PurgeBatchSize);
+
+internal sealed record RetentionSettingsResponse(
+    bool Enabled,
+    int EventsDays,
+    int TimelineDays,
+    int AlertsDays,
+    int IntervalHours,
+    int PurgeBatchSize,
+    DateTimeOffset UpdatedUtc)
+{
+    public static RetentionSettingsResponse FromSettings(RetentionOptions settings)
+    {
+        return new RetentionSettingsResponse(
+            settings.Enabled,
+            settings.EventsDays,
+            settings.TimelineDays,
+            settings.AlertsDays,
+            settings.IntervalHours,
+            settings.PurgeBatchSize,
+            settings.UpdatedUtc);
+    }
+}
 
 internal sealed record FileAuditEvent(
     Guid Id,
@@ -7669,7 +7928,21 @@ internal sealed record RetentionMetrics(
     int TimelineDays,
     int AlertsDays,
     int IntervalHours,
-    int PurgeBatchSize);
+    int PurgeBatchSize,
+    DateTimeOffset UpdatedUtc)
+{
+    public static RetentionMetrics FromSettings(RetentionOptions settings)
+    {
+        return new RetentionMetrics(
+            settings.Enabled,
+            settings.EventsDays,
+            settings.TimelineDays,
+            settings.AlertsDays,
+            settings.IntervalHours,
+            settings.PurgeBatchSize,
+            settings.UpdatedUtc);
+    }
+}
 
 internal sealed record MetricsThresholds(
     int AgentStaleMinutes,

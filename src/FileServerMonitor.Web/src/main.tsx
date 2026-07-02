@@ -74,6 +74,16 @@ type AuthConfig = {
   updatedUtc: string;
 };
 
+type RetentionConfig = {
+  enabled: boolean;
+  eventsDays: number;
+  timelineDays: number;
+  alertsDays: number;
+  intervalHours: number;
+  purgeBatchSize: number;
+  updatedUtc: string;
+};
+
 type AuthenticatedUser = {
   username: string;
   displayName: string;
@@ -881,7 +891,107 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
           </button>
         </form>
       </Panel>
+
+      <RetentionConfigPanel onNotify={onNotify} />
     </div>
+  );
+}
+
+function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [config, setConfig] = useState<RetentionConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    fetchJson<RetentionConfig>("/api/retention/config")
+      .then(setConfig)
+      .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar retencao." }));
+  }, [onNotify]);
+
+  function update<K extends keyof RetentionConfig>(key: K, value: RetentionConfig[K]) {
+    setConfig((current) => current ? { ...current, [key]: value } : current);
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+
+    if (!config) {
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/retention/config`, {
+        method: "PUT",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify(config)
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel salvar retencao."));
+      }
+
+      setConfig((await response.json()) as RetentionConfig);
+      onNotify({ tone: "success", message: "Retencao de dados salva." });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel salvar retencao." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!config) {
+    return <Panel title="Retencao de dados" subtitle="Carregando politica de limpeza..." />;
+  }
+
+  return (
+    <Panel title="Retencao de dados" subtitle="Controle quanto tempo eventos brutos, linha do tempo correlacionada e alertas ficam no banco.">
+      <form className="auth-form retention-form" onSubmit={submit}>
+        <div className="retention-summary">
+          <StatusCard label="Estado" value={config.enabled ? "Ativa" : "Inativa"} detail={config.enabled ? "Limpeza automatica em execucao" : "Banco mantem os dados sem purga automatica"} />
+          <StatusCard label="Linha do tempo" value={`${config.timelineDays} dias`} detail="Eventos correlacionados usados por telas e relatorios" />
+          <StatusCard label="Execucao" value={`${config.intervalHours} h`} detail={`Lotes de ate ${config.purgeBatchSize.toLocaleString("pt-BR")} registros`} />
+        </div>
+
+        <label className="check-row">
+          <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
+          Habilitar limpeza automatica
+        </label>
+
+        <div className="form-grid five">
+          <label>
+            Eventos brutos (dias)
+            <input value={config.eventsDays} onChange={(event) => update("eventsDays", Number(event.target.value))} inputMode="numeric" min={7} max={3650} type="number" />
+          </label>
+          <label>
+            Linha do tempo (dias)
+            <input value={config.timelineDays} onChange={(event) => update("timelineDays", Number(event.target.value))} inputMode="numeric" min={7} max={3650} type="number" />
+          </label>
+          <label>
+            Alertas (dias)
+            <input value={config.alertsDays} onChange={(event) => update("alertsDays", Number(event.target.value))} inputMode="numeric" min={7} max={3650} type="number" />
+          </label>
+          <label>
+            Intervalo (horas)
+            <input value={config.intervalHours} onChange={(event) => update("intervalHours", Number(event.target.value))} inputMode="numeric" min={1} max={168} type="number" />
+          </label>
+          <label>
+            Lote maximo
+            <input value={config.purgeBatchSize} onChange={(event) => update("purgeBatchSize", Number(event.target.value))} inputMode="numeric" min={100} max={100000} step={100} type="number" />
+          </label>
+        </div>
+
+        <div className="auth-badges">
+          <span className="badge info">Relatorios usam timeline persistida</span>
+          <span className="badge neutral">Limpeza em lotes para reduzir impacto</span>
+          <span className="badge low">Atualizado em {formatDate(config.updatedUtc)}</span>
+        </div>
+
+        <button className="primary-button" type="submit" disabled={saving}>
+          <Database size={18} />
+          {saving ? "Salvando..." : "Salvar retencao"}
+        </button>
+      </form>
+    </Panel>
   );
 }
 

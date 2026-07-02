@@ -1611,6 +1611,21 @@ dd {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.form-grid.five {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.retention-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.retention-form .auth-status-card {
+  border: 1px solid #dce5ef;
+  background: #f8fbfe;
+}
+
 .auth-badges {
   display: flex;
   flex-wrap: wrap;
@@ -1642,8 +1657,10 @@ dd {
   }
 
   .auth-status-grid,
+  .retention-summary,
   .form-grid.three,
-  .form-grid.four {
+  .form-grid.four,
+  .form-grid.five {
     grid-template-columns: 1fr;
   }
 }
