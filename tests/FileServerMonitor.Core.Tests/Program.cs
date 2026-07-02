@@ -26,7 +26,8 @@ var tests = new (string Name, Action Test)[]
     ("timeline colapsa acessos repetidos ao mesmo arquivo", TimelineCollapsesRepeatedFileAccess),
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
-    ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename)
+    ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
+    ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution)
 };
 
 var failures = new List<string>();
@@ -520,6 +521,24 @@ static void TimelineSuppressesDeleteEchoAroundRename()
     Assert(display.Length == 1, "Delete usado como eco de rename nao deveria aparecer na timeline final.");
     Assert(display[0].Action == "renamed", "O rename deveria ser preservado.");
     Assert(display[0].PreviousPath == @"C:\Corporativo\codex-client-check-02.md", "Caminho anterior do rename deveria ser preservado.");
+}
+
+static void TimelineCollapsesRenameDuplicateAfterUserResolution()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "renamed", @"C:\Corporativo\Nova pasta - 10", previousPath: @"C:\Corporativo\Nova pasta", objectType: "folder", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp, "renamed", @"C:\Corporativo\Nova pasta - 10", previousPath: @"C:\Corporativo\Nova pasta", objectType: "folder", source: "usn-journal", user: "UNKNOWN")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+
+    Assert(display.Length == 1, "Rename duplicado entre Security Log e USN deveria aparecer uma unica vez depois de resolver usuario.");
+    Assert(display[0].Action == "renamed", "Evento preservado deveria continuar sendo rename.");
+    Assert(display[0].Source == "usn-journal", "Quando ambos descrevem a mesma transicao, a entrada USN deve ser preferida.");
+    Assert(display[0].User == @"FILESERVER\AnphibiO", "Rename USN preservado deveria herdar usuario do Security Log.");
 }
 
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)

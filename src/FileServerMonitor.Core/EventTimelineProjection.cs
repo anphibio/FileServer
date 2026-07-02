@@ -477,16 +477,36 @@ public sealed class EventTimelineProjector
             && !HasNearbyTransitionDestination(relevant, previousPath, current.TimestampUtc);
         var action = IsMove(previousPath, current.Path) ? "moved" : "renamed";
         var displayAction = isProvisionalOrigin ? "Criação" : action == "moved" ? "Movido" : "Renomeado";
-        var consumed = relevant
+        var consumedEvents = relevant
             .Where(item => ShouldConsumeTransitionEvent(item.Event, previousPath, current.Path, isProvisionalOrigin))
+            .ToArray();
+        var consumed = consumedEvents
             .Select(item => item.Index)
             .ToArray();
+        var baseEvent = consumedEvents
+            .Where(item => item.Event.Action is "renamed" or "moved")
+            .Select(item => item.Event)
+            .OrderByDescending(GetEventWeight)
+            .ThenByDescending(item => item.TimestampUtc)
+            .FirstOrDefault() ?? current;
+        var userEvent = consumedEvents
+            .Select(item => item.Event)
+            .Where(item => !IsUnknownUser(item.User))
+            .OrderByDescending(GetEventWeight)
+            .FirstOrDefault();
 
-        var display = ToDisplayEvent(current with
+        var display = ToDisplayEvent(baseEvent with
         {
-            Id = StableSyntheticGuid(current.Id, $"{action}:explicit"),
+            Id = StableSyntheticGuid(baseEvent.Id, $"{action}:explicit"),
+            TimestampUtc = current.TimestampUtc,
             Action = isProvisionalOrigin ? "created" : action,
-            PreviousPath = isProvisionalOrigin ? null : previousPath
+            PreviousPath = isProvisionalOrigin ? null : previousPath,
+            Path = current.Path,
+            User = IsUnknownUser(baseEvent.User) && userEvent is not null ? userEvent.User : baseEvent.User,
+            Sid = baseEvent.Sid ?? userEvent?.Sid,
+            SourceHost = baseEvent.SourceHost ?? userEvent?.SourceHost,
+            SourceIp = baseEvent.SourceIp ?? userEvent?.SourceIp,
+            ProcessName = baseEvent.ProcessName ?? userEvent?.ProcessName
         }) with
         {
             DisplayAction = displayAction,
