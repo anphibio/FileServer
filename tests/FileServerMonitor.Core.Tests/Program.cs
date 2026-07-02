@@ -27,7 +27,8 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
-    ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution)
+    ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
+    ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
 };
 
 var failures = new List<string>();
@@ -87,6 +88,94 @@ static void NormalizesRequiredFieldsAndDefaults()
     Assert(normalized.Result == "success", "Resultado default deveria ser success.");
     Assert(normalized.Severity == "info", "Severidade default deveria ser info.");
     Assert(normalized.Source == "manual-ingest", "Origem default deveria ser manual-ingest.");
+}
+
+static void AgentClassifiesOperationalHealth()
+{
+    var now = DateTimeOffset.Parse("2026-07-02T12:00:00Z");
+
+    var ok = AgentOperationalHealth.Evaluate(new AgentOperationalHealthInput(
+        Status: "running",
+        LastHeartbeatUtc: now.AddMinutes(-1),
+        LastSuccessfulSendUtc: now.AddMinutes(-2),
+        PendingQueueEvents: 0,
+        LastCycle: new AgentCycleMetrics(
+            StartedUtc: now.AddMinutes(-1),
+            FinishedUtc: now,
+            DurationMs: 900,
+            SecurityEventsRead: 2,
+            UsnEventsRead: 3,
+            CorrelatedEvents: 4,
+            SentEvents: 4,
+            QueuedEvents: 0,
+            Error: null),
+        NowUtc: now,
+        StaleAfterMinutes: 10,
+        BacklogWarningThreshold: 1000,
+        SendLagWarningMinutes: 15));
+
+    Assert(ok.Level == "ok", "Agente recente e sem fila deveria ser ok.");
+    Assert(ok.HasError == false, "Agente ok nao deveria ter erro.");
+
+    var idleOk = AgentOperationalHealth.Evaluate(new AgentOperationalHealthInput(
+        Status: "running",
+        LastHeartbeatUtc: now.AddMinutes(-1),
+        LastSuccessfulSendUtc: now.AddHours(-2),
+        PendingQueueEvents: 0,
+        LastCycle: new AgentCycleMetrics(
+            StartedUtc: now.AddSeconds(-20),
+            FinishedUtc: now.AddSeconds(-1),
+            DurationMs: 19000,
+            SecurityEventsRead: 0,
+            UsnEventsRead: 0,
+            CorrelatedEvents: 0,
+            SentEvents: 0,
+            QueuedEvents: 0,
+            Error: null),
+        NowUtc: now,
+        StaleAfterMinutes: 10,
+        BacklogWarningThreshold: 1000,
+        SendLagWarningMinutes: 15));
+
+    Assert(idleOk.Level == "ok", "Ciclo recente sem eventos novos nao deveria virar atraso de envio.");
+
+    var attention = AgentOperationalHealth.Evaluate(new AgentOperationalHealthInput(
+        Status: "running",
+        LastHeartbeatUtc: now.AddMinutes(-1),
+        LastSuccessfulSendUtc: now.AddMinutes(-20),
+        PendingQueueEvents: 5,
+        LastCycle: new AgentCycleMetrics(
+            StartedUtc: now.AddMinutes(-1),
+            FinishedUtc: now,
+            DurationMs: 1200,
+            SecurityEventsRead: 5,
+            UsnEventsRead: 5,
+            CorrelatedEvents: 7,
+            SentEvents: 0,
+            QueuedEvents: 7,
+            Error: "API indisponivel"),
+        NowUtc: now,
+        StaleAfterMinutes: 10,
+        BacklogWarningThreshold: 1000,
+        SendLagWarningMinutes: 15));
+
+    Assert(attention.Level == "attention", "Fila pequena ou erro recente deveria exigir atencao.");
+    Assert(attention.HasError, "Erro do ciclo deveria ser sinalizado.");
+    Assert(attention.LastSuccessfulSendAgeSeconds == 1200, "Atraso do ultimo envio deveria ser calculado.");
+
+    var critical = AgentOperationalHealth.Evaluate(new AgentOperationalHealthInput(
+        Status: "running",
+        LastHeartbeatUtc: now.AddMinutes(-30),
+        LastSuccessfulSendUtc: now.AddMinutes(-30),
+        PendingQueueEvents: 0,
+        LastCycle: null,
+        NowUtc: now,
+        StaleAfterMinutes: 10,
+        BacklogWarningThreshold: 1000,
+        SendLagWarningMinutes: 15));
+
+    Assert(critical.Level == "critical", "Heartbeat atrasado deveria ser critico.");
+    Assert(critical.LastHeartbeatAgeSeconds == 1800, "Atraso do heartbeat deveria ser calculado.");
 }
 
 static void RaisesMassDeleteAlert()

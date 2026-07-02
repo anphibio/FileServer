@@ -35,7 +35,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "### FILESERVER MONITOR\n# Painel operacional e gerencial\nAcompanhe disponibilidade da API, saude do banco, batimento dos agentes, fila local de envio e fluxo de eventos a partir do endpoint `/metrics` coletado pelo Zabbix."
+        "content": "### FILESERVER MONITOR\n# Painel operacional e gerencial\nAcompanhe disponibilidade da API, saúde do banco, coleta dos agentes, fila local, cursores e contadores do último ciclo a partir do endpoint `/metrics` coletado pelo Zabbix."
       },
       "transparent": false
     },
@@ -92,27 +92,17 @@
                 "degraded": {
                   "color": "orange",
                   "index": 1,
-                  "text": "Degraded"
+                  "text": "Atenção"
                 },
                 "critical": {
                   "color": "red",
                   "index": 2,
-                  "text": "Critical"
+                  "text": "Crítico"
                 },
-                "running": {
+                "ok": {
                   "color": "green",
                   "index": 3,
-                  "text": "Running"
-                },
-                "stale": {
-                  "color": "red",
-                  "index": 4,
-                  "text": "Stale"
-                },
-                "backlog": {
-                  "color": "orange",
-                  "index": 5,
-                  "text": "Backlog"
+                  "text": "OK"
                 }
               }
             }
@@ -199,27 +189,17 @@
                 "degraded": {
                   "color": "orange",
                   "index": 1,
-                  "text": "Degraded"
+                  "text": "Atenção"
                 },
                 "critical": {
                   "color": "red",
                   "index": 2,
-                  "text": "Critical"
+                  "text": "Crítico"
                 },
-                "running": {
+                "ok": {
                   "color": "green",
                   "index": 3,
-                  "text": "Running"
-                },
-                "stale": {
-                  "color": "red",
-                  "index": 4,
-                  "text": "Stale"
-                },
-                "backlog": {
-                  "color": "orange",
-                  "index": 5,
-                  "text": "Backlog"
+                  "text": "OK"
                 }
               }
             }
@@ -330,7 +310,7 @@
     },
     {
       "id": 5,
-      "title": "Agentes stale",
+      "title": "Agentes críticos",
       "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
@@ -358,7 +338,7 @@
             "filter": "$zabbix_host"
           },
           "item": {
-            "filter": "FileServer Monitor: stale agents"
+            "filter": "FileServer Monitor: critical agents"
           },
           "refId": "A",
           "resultFormat": "time_series"
@@ -405,7 +385,7 @@
     },
     {
       "id": 6,
-      "title": "Maior fila",
+      "title": "Erros de ciclo",
       "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
@@ -413,6 +393,81 @@
       },
       "gridPos": {
         "x": 16,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: agent cycle errors"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 7,
+      "title": "Maior fila",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 20,
         "y": 5,
         "w": 4,
         "h": 4
@@ -483,79 +538,8 @@
       "pluginVersion": "10.4.0"
     },
     {
-      "id": 7,
-      "title": "Eventos armazenados",
-      "type": "stat",
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
-      "gridPos": {
-        "x": 20,
-        "y": 5,
-        "w": 4,
-        "h": 4
-      },
-      "targets": [
-        {
-          "application": {
-            "filter": "FileServer Monitor"
-          },
-          "datasource": {
-            "type": "alexanderzobnin-zabbix-datasource",
-            "uid": "${DS_ZABBIX}"
-          },
-          "group": {
-            "filter": "$zabbix_group"
-          },
-          "host": {
-            "filter": "$zabbix_host"
-          },
-          "item": {
-            "filter": "FileServer Monitor: stored events"
-          },
-          "refId": "A",
-          "resultFormat": "time_series"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.4.0"
-    },
-    {
       "id": 8,
-      "title": "Latencia e frescor da coleta",
+      "title": "Latência da aplicação e do banco",
       "type": "timeseries",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
@@ -586,6 +570,26 @@
             "filter": "FileServer Monitor: database query time"
           },
           "refId": "A",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max cycle duration"
+          },
+          "refId": "B",
           "resultFormat": "time_series"
         }
       ],
@@ -657,7 +661,7 @@
     },
     {
       "id": 9,
-      "title": "Idade do ultimo evento e heartbeat",
+      "title": "Atrasos operacionais",
       "type": "timeseries",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
@@ -705,9 +709,29 @@
             "filter": "$zabbix_host"
           },
           "item": {
-            "filter": "FileServer Monitor: max heartbeat age"
+            "filter": "FileServer Monitor: max collected event age"
           },
           "refId": "B",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max heartbeat age"
+          },
+          "refId": "C",
           "resultFormat": "time_series"
         }
       ],
@@ -779,7 +803,7 @@
     },
     {
       "id": 10,
-      "title": "Saude dos agentes",
+      "title": "Último ciclo de coleta",
       "type": "bargauge",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
@@ -787,6 +811,250 @@
       },
       "gridPos": {
         "x": 0,
+        "y": 17,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: last cycle security events"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: last cycle USN events"
+          },
+          "refId": "B",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: last cycle correlated events"
+          },
+          "refId": "C",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "bottom",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 11,
+      "title": "Entrega do último ciclo",
+      "type": "bargauge",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 17,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: last cycle sent events"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: last cycle queued events"
+          },
+          "refId": "B",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max agent queue"
+          },
+          "refId": "C",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "bottom",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 12,
+      "title": "Saúde dos agentes",
+      "type": "bargauge",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 16,
         "y": 17,
         "w": 8,
         "h": 6
@@ -827,9 +1095,29 @@
             "filter": "$zabbix_host"
           },
           "item": {
-            "filter": "FileServer Monitor: stale agents"
+            "filter": "FileServer Monitor: attention agents"
           },
           "refId": "B",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: critical agents"
+          },
+          "refId": "C",
           "resultFormat": "time_series"
         },
         {
@@ -849,7 +1137,7 @@
           "item": {
             "filter": "FileServer Monitor: unhealthy agents"
           },
-          "refId": "C",
+          "refId": "D",
           "resultFormat": "time_series"
         }
       ],
@@ -871,7 +1159,7 @@
               },
               {
                 "color": "red",
-                "value": 10
+                "value": 1000
               }
             ]
           },
@@ -900,40 +1188,20 @@
       "pluginVersion": "10.4.0"
     },
     {
-      "id": 11,
-      "title": "Fila e eventos",
-      "type": "bargauge",
+      "id": 13,
+      "title": "Eventos armazenados",
+      "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
         "uid": "${DS_ZABBIX}"
       },
       "gridPos": {
-        "x": 8,
-        "y": 17,
-        "w": 8,
-        "h": 6
+        "x": 0,
+        "y": 23,
+        "w": 6,
+        "h": 4
       },
       "targets": [
-        {
-          "application": {
-            "filter": "FileServer Monitor"
-          },
-          "datasource": {
-            "type": "alexanderzobnin-zabbix-datasource",
-            "uid": "${DS_ZABBIX}"
-          },
-          "group": {
-            "filter": "$zabbix_group"
-          },
-          "host": {
-            "filter": "$zabbix_host"
-          },
-          "item": {
-            "filter": "FileServer Monitor: max agent queue"
-          },
-          "refId": "A",
-          "resultFormat": "time_series"
-        },
         {
           "application": {
             "filter": "FileServer Monitor"
@@ -951,29 +1219,22 @@
           "item": {
             "filter": "FileServer Monitor: stored events"
           },
-          "refId": "B",
+          "refId": "A",
           "resultFormat": "time_series"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 10
               }
             ]
           },
@@ -982,11 +1243,9 @@
         "overrides": []
       },
       "options": {
-        "displayMode": "gradient",
-        "maxVizHeight": 300,
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "namePlacement": "bottom",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
         "orientation": "horizontal",
         "reduceOptions": {
           "calcs": [
@@ -995,25 +1254,23 @@
           "fields": "",
           "values": false
         },
-        "showUnfilled": true,
-        "sizing": "auto",
-        "valueMode": "color"
+        "textMode": "auto"
       },
       "pluginVersion": "10.4.0"
     },
     {
-      "id": 12,
-      "title": "Fila local do agente",
-      "type": "timeseries",
+      "id": 14,
+      "title": "Agentes em atenção",
+      "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
         "uid": "${DS_ZABBIX}"
       },
       "gridPos": {
-        "x": 16,
-        "y": 17,
-        "w": 8,
-        "h": 6
+        "x": 6,
+        "y": 23,
+        "w": 6,
+        "h": 4
       },
       "targets": [
         {
@@ -1031,7 +1288,7 @@
             "filter": "$zabbix_host"
           },
           "item": {
-            "filter": "FileServer Monitor: max agent queue"
+            "filter": "FileServer Monitor: attention agents"
           },
           "refId": "A",
           "resultFormat": "time_series"
@@ -1040,40 +1297,163 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
           },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 12,
-            "gradientMode": "opacity",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
           },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 15,
+      "title": "Sem eventos recentes",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max collected event age"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 900
+              },
+              {
+                "color": "red",
+                "value": 1800
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 16,
+      "title": "Uptime API",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: API uptime"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -1083,25 +1463,25 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
       "options": {
-        "legend": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
           "calcs": [
-            "lastNotNull",
-            "max"
+            "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      }
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
     }
   ],
   "refresh": "30s",
@@ -1179,6 +1559,6 @@
   "timezone": "browser",
   "title": "FileServer Monitor",
   "uid": "fileserver-monitor",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }

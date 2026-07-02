@@ -103,6 +103,16 @@ BEGIN
         LastUsnByVolumeJson NVARCHAR(MAX) NULL,
         PendingQueueEvents INT NOT NULL CONSTRAINT DF_AgentHeartbeats_PendingQueueEvents DEFAULT 0,
         LastSuccessfulSendUtc DATETIME2(3) NULL,
+        LastCollectedEventUtc DATETIME2(3) NULL,
+        LastCycleStartedUtc DATETIME2(3) NULL,
+        LastCycleFinishedUtc DATETIME2(3) NULL,
+        LastCycleDurationMs BIGINT NULL,
+        LastCycleSecurityEventsRead INT NULL,
+        LastCycleUsnEventsRead INT NULL,
+        LastCycleCorrelatedEvents INT NULL,
+        LastCycleSentEvents INT NULL,
+        LastCycleQueuedEvents INT NULL,
+        LastCycleError NVARCHAR(1024) NULL,
         Message NVARCHAR(1024) NULL
     );
 END;
@@ -133,6 +143,76 @@ IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastSuccessfulSendUtc') IS NULL
 BEGIN
     ALTER TABLE dbo.AgentHeartbeats
     ADD LastSuccessfulSendUtc DATETIME2(3) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCollectedEventUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCollectedEventUtc DATETIME2(3) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleStartedUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleStartedUtc DATETIME2(3) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleFinishedUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleFinishedUtc DATETIME2(3) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleDurationMs') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleDurationMs BIGINT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleSecurityEventsRead') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleSecurityEventsRead INT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleUsnEventsRead') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleUsnEventsRead INT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleCorrelatedEvents') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleCorrelatedEvents INT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleSentEvents') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleSentEvents INT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleQueuedEvents') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleQueuedEvents INT NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.AgentHeartbeats', N'LastCycleError') IS NULL
+BEGIN
+    ALTER TABLE dbo.AgentHeartbeats
+    ADD LastCycleError NVARCHAR(1024) NULL;
 END;
 GO
 

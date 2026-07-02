@@ -185,6 +185,151 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: a74bc54639a84d3996aee11b5b81671e
+          name: 'FileServer Monitor: attention agents'
+          type: DEPENDENT
+          key: fileserver.agents.attention
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.attention
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: d24ed2e7882f4e7d9909084d96622c3b
+          name: 'FileServer Monitor: critical agents'
+          type: DEPENDENT
+          key: fileserver.agents.critical
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.critical
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: a95ecb1542574ca9a9f52e88431d224c
+          name: 'FileServer Monitor: agent cycle errors'
+          type: DEPENDENT
+          key: fileserver.agents.cycle_errors
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.cycleErrors
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: b90c05868a964a7f82af7dacbd043304
+          name: 'FileServer Monitor: last cycle security events'
+          type: DEPENDENT
+          key: fileserver.agents.last_cycle_security_events
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.lastCycleSecurityEventsRead
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: e93ccd2610dd4ecc850a5b8b3685360f
+          name: 'FileServer Monitor: last cycle USN events'
+          type: DEPENDENT
+          key: fileserver.agents.last_cycle_usn_events
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.lastCycleUsnEventsRead
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 97fb0b0cf14a4a899eb554c6704e2937
+          name: 'FileServer Monitor: last cycle correlated events'
+          type: DEPENDENT
+          key: fileserver.agents.last_cycle_correlated_events
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.lastCycleCorrelatedEvents
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 629847d3b49d47cbb0d1cd4ba5eed925
+          name: 'FileServer Monitor: last cycle sent events'
+          type: DEPENDENT
+          key: fileserver.agents.last_cycle_sent_events
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.lastCycleSentEvents
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 62b28ebef1154dd39f4b20acf39b13e1
+          name: 'FileServer Monitor: last cycle queued events'
+          type: DEPENDENT
+          key: fileserver.agents.last_cycle_queued_events
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.lastCycleQueuedEvents
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: f65a237c7f5b47acba76eacebb1cb450
+          name: 'FileServer Monitor: max cycle duration'
+          type: DEPENDENT
+          key: fileserver.agents.max_cycle_duration_ms
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: ms
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.maxCycleDurationMs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
         - uuid: 2555a9bbf576489b830f4bcd08c7ad86
           name: 'FileServer Monitor: max agent queue'
           type: DEPENDENT
@@ -221,6 +366,26 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: b773ccbeae1a4343b9ab7446e0480557
+          name: 'FileServer Monitor: max collected event age'
+          type: DEPENDENT
+          key: fileserver.agents.max_collected_event_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.maxCollectedEventAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
   triggers:
     - uuid: ba8cc84ff4ab4902a416070eb257a817
       expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
@@ -242,10 +407,22 @@ zabbix_export:
       expression: 'last(/Template App FileServer Monitor/fileserver.agents.unhealthy)>0'
       name: 'FileServer Monitor: agente em estado nao saudavel'
       priority: WARNING
+    - uuid: b4f270728ec64ffbbae0ff428c56816e
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.critical)>0'
+      name: 'FileServer Monitor: agente em estado critico'
+      priority: HIGH
+    - uuid: 93d0bdc4efe940eba95c3f51219d46e3
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.cycle_errors)>0'
+      name: 'FileServer Monitor: erro no ultimo ciclo do agente'
+      priority: WARNING
     - uuid: 9f1210c43ddb4fcc82e1be33040c2c16
       expression: 'last(/Template App FileServer Monitor/fileserver.agents.max_pending_queue)>={$FILESERVER_MONITOR_QUEUE_WARN}'
       name: 'FileServer Monitor: fila local do agente alta'
       priority: WARNING
+    - uuid: a6cde95de7944237ae663cf91e2dfef6
+      expression: 'last(/Template App FileServer Monitor/fileserver.agents.max_collected_event_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
+      name: 'FileServer Monitor: agente sem coletar eventos recentes'
+      priority: INFO
     - uuid: c1092e359fc24965a7e506d313cfd546
       expression: 'last(/Template App FileServer Monitor/fileserver.events.last_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
       name: 'FileServer Monitor: sem eventos recentes'

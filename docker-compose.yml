@@ -33,6 +33,7 @@ services:
       Cors__AllowedOrigins__5: http://127.0.0.1:4173
       Agents__StaleMinutes: ${AGENTS_STALE_MINUTES:-10}
       Agents__BacklogWarningThreshold: ${AGENTS_BACKLOG_WARNING_THRESHOLD:-1000}
+      Agents__SendLagWarningMinutes: ${AGENTS_SEND_LAG_WARNING_MINUTES:-15}
       Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
       Notifications__WebhookUrl: ${NOTIFICATIONS_WEBHOOK_URL:-}
       Notifications__Format: ${NOTIFICATIONS_FORMAT:-generic}

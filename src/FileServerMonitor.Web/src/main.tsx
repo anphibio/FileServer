@@ -138,9 +138,29 @@ type AgentHealth = {
   message?: string | null;
   pendingQueueEvents: number;
   lastSuccessfulSendUtc?: string | null;
+  lastCollectedEventUtc?: string | null;
+  lastCycle?: AgentCycleMetrics | null;
   backlogWarningThreshold: number;
   isStale: boolean;
   staleAfterMinutes: number;
+  operationalStatus: string;
+  operationalMessage?: string | null;
+  lastHeartbeatAgeSeconds?: number | null;
+  lastSuccessfulSendAgeSeconds?: number | null;
+  lastCollectedEventAgeSeconds?: number | null;
+  hasCycleError: boolean;
+};
+
+type AgentCycleMetrics = {
+  startedUtc?: string | null;
+  finishedUtc?: string | null;
+  durationMs: number;
+  securityEventsRead: number;
+  usnEventsRead: number;
+  correlatedEvents: number;
+  sentEvents: number;
+  queuedEvents: number;
+  error?: string | null;
 };
 
 type MonitoredPath = {
@@ -337,7 +357,11 @@ function App() {
 
   const openAlerts = alerts.filter((alert) => alert.status === "open");
   const criticalAlerts = openAlerts.filter((alert) => alert.severity === "critical");
-  const offlineAgents = agents.filter((agent) => agent.isStale || agent.status !== "running" || agent.pendingQueueEvents >= agent.backlogWarningThreshold);
+  const offlineAgents = agents.filter((agent) =>
+    agent.isStale
+    || agent.operationalStatus !== "ok"
+    || agent.status !== "running"
+    || agent.pendingQueueEvents >= agent.backlogWarningThreshold);
 
   const displayedEvents = events;
   const totalDisplayedEventCount = eventsTotalItems;
@@ -1227,8 +1251,11 @@ function AlertRulesEditor({
 }
 
 function AgentsView({ agents }: { agents: AgentHealth[] }) {
-  const staleAgents = agents.filter((agent) => agent.isStale || ["stale", "backlog", "degraded"].includes(agent.status)).length;
+  const attentionAgents = agents.filter((agent) => agent.operationalStatus === "attention").length;
+  const criticalAgents = agents.filter((agent) => agent.operationalStatus === "critical" || agent.isStale).length;
+  const staleAgents = attentionAgents + criticalAgents;
   const queuedAgents = agents.filter((agent) => agent.pendingQueueEvents > 0).length;
+  const cycleErrors = agents.filter((agent) => agent.hasCycleError || agent.lastCycle?.error).length;
   const lastHeartbeat = agents
     .map((agent) => agent.lastHeartbeatUtc)
     .filter(Boolean)
@@ -1246,8 +1273,14 @@ function AgentsView({ agents }: { agents: AgentHealth[] }) {
         <ExecutiveCard
           title="Agentes em Atenção"
           value={staleAgents.toLocaleString("pt-BR")}
-          detail={`${queuedAgents} com fila pendente ou pressão de envio.`}
-          tone={staleAgents > 0 ? "danger" : queuedAgents > 0 ? "warning" : "neutral"}
+          detail={`${attentionAgents} atenção · ${criticalAgents} críticos · ${queuedAgents} com fila.`}
+          tone={criticalAgents > 0 ? "danger" : attentionAgents > 0 || queuedAgents > 0 ? "warning" : "neutral"}
+        />
+        <ExecutiveCard
+          title="Erros de Ciclo"
+          value={cycleErrors.toLocaleString("pt-BR")}
+          detail="Última varredura com erro de coleta, correlação ou envio."
+          tone={cycleErrors > 0 ? "danger" : "neutral"}
         />
         <ExecutiveCard
           title="Último Heartbeat"
@@ -1270,20 +1303,20 @@ function AgentsView({ agents }: { agents: AgentHealth[] }) {
               </div>
               <dl>
                 <div>
-                  <dt>Status</dt>
-                  <dd className={`status ${agent.status}`}>{agent.isStale ? "heartbeat atrasado" : agent.status}</dd>
+                  <dt>Status operacional</dt>
+                  <dd className={`status ${agent.operationalStatus}`}>{formatAgentOperationalStatus(agent.operationalStatus)}</dd>
                 </div>
                 <div>
                   <dt>Heartbeat</dt>
-                  <dd>{agent.lastHeartbeatUtc ? formatDate(agent.lastHeartbeatUtc) : "Sem registro"}</dd>
+                  <dd>{formatDateWithAge(agent.lastHeartbeatUtc, agent.lastHeartbeatAgeSeconds)}</dd>
                 </div>
                 <div>
-                  <dt>Limite</dt>
-                  <dd>{agent.staleAfterMinutes} min</dd>
+                  <dt>Serviço</dt>
+                  <dd className={`status ${agent.status}`}>{agent.isStale ? "heartbeat atrasado" : agent.status}</dd>
                 </div>
                 <div>
-                  <dt>RecordId</dt>
-                  <dd>{agent.lastRecordId}</dd>
+                  <dt>Último evento</dt>
+                  <dd>{formatDateWithAge(agent.lastCollectedEventUtc, agent.lastCollectedEventAgeSeconds)}</dd>
                 </div>
                 <div>
                   <dt>Fila</dt>
@@ -1292,19 +1325,50 @@ function AgentsView({ agents }: { agents: AgentHealth[] }) {
                   </dd>
                 </div>
                 <div>
-                  <dt>Limite fila</dt>
-                  <dd>{agent.backlogWarningThreshold}</dd>
+                  <dt>Último envio</dt>
+                  <dd>{formatDateWithAge(agent.lastSuccessfulSendUtc, agent.lastSuccessfulSendAgeSeconds) || "Sem envio"}</dd>
                 </div>
                 <div>
-                  <dt>Último envio</dt>
-                  <dd>{agent.lastSuccessfulSendUtc ? formatDate(agent.lastSuccessfulSendUtc) : "Sem envio"}</dd>
+                  <dt>Security cursor</dt>
+                  <dd>{agent.lastRecordId}</dd>
                 </div>
                 <div>
                   <dt>USN</dt>
                   <dd>{formatUsn(agent.lastUsnByVolume)}</dd>
                 </div>
               </dl>
-              {agent.message && <p className="agent-message">{agent.message}</p>}
+              {agent.lastCycle && (
+                <div className="agent-cycle">
+                  <strong>Última varredura</strong>
+                  <div>
+                    <span>Security</span>
+                    <b>{agent.lastCycle.securityEventsRead.toLocaleString("pt-BR")}</b>
+                  </div>
+                  <div>
+                    <span>USN</span>
+                    <b>{agent.lastCycle.usnEventsRead.toLocaleString("pt-BR")}</b>
+                  </div>
+                  <div>
+                    <span>Correlacionados</span>
+                    <b>{agent.lastCycle.correlatedEvents.toLocaleString("pt-BR")}</b>
+                  </div>
+                  <div>
+                    <span>Enviados</span>
+                    <b>{agent.lastCycle.sentEvents.toLocaleString("pt-BR")}</b>
+                  </div>
+                  <div>
+                    <span>Fila gerada</span>
+                    <b>{agent.lastCycle.queuedEvents.toLocaleString("pt-BR")}</b>
+                  </div>
+                  <div>
+                    <span>Duração</span>
+                    <b>{formatDurationMs(agent.lastCycle.durationMs)}</b>
+                  </div>
+                </div>
+              )}
+              {(agent.operationalMessage || agent.message || agent.lastCycle?.error) && (
+                <p className="agent-message">{agent.lastCycle?.error ?? agent.operationalMessage ?? agent.message}</p>
+              )}
             </article>
           ))}
           {agents.length === 0 && <EmptyState text="Nenhum agente reportou heartbeat ainda." />}
@@ -2402,6 +2466,49 @@ function formatDate(value: string) {
     dateStyle: "short",
     timeStyle: "medium"
   }).format(new Date(value));
+}
+
+function formatDateWithAge(value?: string | null, ageSeconds?: number | null) {
+  if (!value) {
+    return "Sem registro";
+  }
+
+  return `${formatDate(value)} · ${formatAge(ageSeconds)}`;
+}
+
+function formatAge(ageSeconds?: number | null) {
+  if (ageSeconds === undefined || ageSeconds === null) {
+    return "idade indisponível";
+  }
+
+  if (ageSeconds < 60) {
+    return `${Math.round(ageSeconds)}s atrás`;
+  }
+
+  if (ageSeconds < 3600) {
+    return `${Math.round(ageSeconds / 60)}min atrás`;
+  }
+
+  return `${Math.round(ageSeconds / 3600)}h atrás`;
+}
+
+function formatDurationMs(value: number) {
+  if (value < 1000) {
+    return `${Math.round(value)} ms`;
+  }
+
+  return `${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s`;
+}
+
+function formatAgentOperationalStatus(value: string) {
+  const labels: Record<string, string> = {
+    ok: "ok",
+    attention: "atenção",
+    critical: "crítico",
+    unknown: "indefinido"
+  };
+
+  return labels[value] ?? value;
 }
 
 function formatUsn(value: Record<string, number>) {

@@ -606,6 +606,22 @@ tbody tr:hover {
   color: #38566f;
 }
 
+.status.ok,
+.status.running {
+  background: #e8f5ec;
+  color: #27633a;
+}
+
+.status.attention {
+  background: #fff2df;
+  color: #99541d;
+}
+
+.status.critical {
+  background: #fdeaea;
+  color: #9f2727;
+}
+
 .alert-list {
   display: grid;
 }
@@ -862,6 +878,29 @@ dd {
 
 .agent-message {
   margin: 12px 0 0;
+  color: #637083;
+}
+
+.agent-cycle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #e6ebf0;
+}
+
+.agent-cycle strong {
+  grid-column: 1 / -1;
+}
+
+.agent-cycle div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-cycle span {
   color: #637083;
 }
 

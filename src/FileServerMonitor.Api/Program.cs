@@ -498,7 +498,9 @@ app.MapPost("/api/agents/heartbeat", async (
         LastUsnByVolume: request.LastUsnByVolume ?? new Dictionary<string, long>(),
         Message: request.Message,
         PendingQueueEvents: request.PendingQueueEvents,
-        LastSuccessfulSendUtc: request.LastSuccessfulSendUtc);
+        LastSuccessfulSendUtc: request.LastSuccessfulSendUtc,
+        LastCollectedEventUtc: request.LastCollectedEventUtc,
+        LastCycle: request.LastCycle);
 
     await store.UpsertAsync(heartbeat, cancellationToken);
 
@@ -856,6 +858,12 @@ static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
                 PendingQueueEvents: agent.PendingQueueEvents,
                 LastSuccessfulSendUtc: agent.LastSuccessfulSendUtc,
                 LastSuccessfulSendAgeSeconds: GetAgeSeconds(now, agent.LastSuccessfulSendUtc),
+                LastCollectedEventUtc: agent.LastCollectedEventUtc,
+                LastCollectedEventAgeSeconds: GetAgeSeconds(now, agent.LastCollectedEventUtc),
+                LastCycle: agent.LastCycle,
+                OperationalStatus: agent.OperationalStatus,
+                OperationalMessage: agent.OperationalMessage,
+                HasCycleError: agent.HasCycleError,
                 Message: agent.Message,
                 IsStale: agent.IsStale))
             .OrderBy(item => item.Server)
@@ -864,14 +872,25 @@ static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
         var stale = items.Count(item => item.IsStale);
         var backlog = items.Count(item => item.Status.Equals("backlog", StringComparison.OrdinalIgnoreCase)
             || item.PendingQueueEvents > 0);
-        var unhealthy = items.Count(item => !item.Status.Equals("running", StringComparison.OrdinalIgnoreCase));
+        var attention = items.Count(item => item.OperationalStatus.Equals("attention", StringComparison.OrdinalIgnoreCase));
+        var critical = items.Count(item => item.OperationalStatus.Equals("critical", StringComparison.OrdinalIgnoreCase));
+        var cycleErrors = items.Count(item => item.HasCycleError);
+        var lastCycles = items
+            .Select(item => item.LastCycle)
+            .Where(item => item is not null)
+            .Cast<FileServerMonitor.Core.AgentCycleMetrics>()
+            .ToArray();
+        var unhealthy = items.Count(item => !item.OperationalStatus.Equals("ok", StringComparison.OrdinalIgnoreCase));
 
         return new AgentMetricsSummary(
-            Status: ResolveAgentStatus(items.Length, stale, unhealthy, backlog),
+            Status: ResolveAgentStatus(items.Length, stale, unhealthy, backlog, critical),
             Total: items.Length,
             Running: items.Count(item => item.Status.Equals("running", StringComparison.OrdinalIgnoreCase)),
             Stale: stale,
             Backlog: backlog,
+            Attention: attention,
+            Critical: critical,
+            CycleErrors: cycleErrors,
             Unhealthy: unhealthy,
             MaxPendingQueueEvents: items.Length == 0 ? 0 : items.Max(item => item.PendingQueueEvents),
             MaxHeartbeatAgeSeconds: items
@@ -879,6 +898,17 @@ static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
                 .Where(item => item.HasValue)
                 .DefaultIfEmpty(0)
                 .Max(),
+            MaxCollectedEventAgeSeconds: items
+                .Select(item => item.LastCollectedEventAgeSeconds)
+                .Where(item => item.HasValue)
+                .DefaultIfEmpty(0)
+                .Max(),
+            LastCycleSecurityEventsRead: lastCycles.Sum(item => item.SecurityEventsRead),
+            LastCycleUsnEventsRead: lastCycles.Sum(item => item.UsnEventsRead),
+            LastCycleCorrelatedEvents: lastCycles.Sum(item => item.CorrelatedEvents),
+            LastCycleSentEvents: lastCycles.Sum(item => item.SentEvents),
+            LastCycleQueuedEvents: lastCycles.Sum(item => item.QueuedEvents),
+            MaxCycleDurationMs: lastCycles.Length == 0 ? 0 : lastCycles.Max(item => item.DurationMs),
             Items: items,
             Error: null);
     }
@@ -890,9 +920,19 @@ static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
             Running: 0,
             Stale: 0,
             Backlog: 0,
+            Attention: 0,
+            Critical: 0,
+            CycleErrors: 0,
             Unhealthy: 0,
             MaxPendingQueueEvents: 0,
             MaxHeartbeatAgeSeconds: null,
+            MaxCollectedEventAgeSeconds: null,
+            LastCycleSecurityEventsRead: 0,
+            LastCycleUsnEventsRead: 0,
+            LastCycleCorrelatedEvents: 0,
+            LastCycleSentEvents: 0,
+            LastCycleQueuedEvents: 0,
+            MaxCycleDurationMs: 0,
             Items: Array.Empty<AgentMetricsItem>(),
             Error: ex.Message);
     }
@@ -905,9 +945,9 @@ static long? GetAgeSeconds(DateTimeOffset now, DateTimeOffset? value)
         : Math.Max(0, (long)now.Subtract(value.Value).TotalSeconds);
 }
 
-static string ResolveAgentStatus(int total, int stale, int unhealthy, int backlog)
+static string ResolveAgentStatus(int total, int stale, int unhealthy, int backlog, int critical)
 {
-    if (total == 0 || stale > 0)
+    if (total == 0 || stale > 0 || critical > 0)
     {
         return "critical";
     }
@@ -1773,6 +1813,7 @@ internal sealed class AgentHealthStore
     private readonly ConcurrentDictionary<string, AgentHealthResponse> _agents = new(StringComparer.OrdinalIgnoreCase);
     private readonly int _staleMinutes;
     private readonly int _backlogWarningThreshold;
+    private readonly int _sendLagWarningMinutes;
 #if SQLSERVER
     private readonly bool _persistHeartbeats;
     private readonly string? _connectionString;
@@ -1782,6 +1823,7 @@ internal sealed class AgentHealthStore
     {
         _staleMinutes = configuration.GetValue("Agents:StaleMinutes", 10);
         _backlogWarningThreshold = configuration.GetValue("Agents:BacklogWarningThreshold", 1000);
+        _sendLagWarningMinutes = configuration.GetValue("Agents:SendLagWarningMinutes", 15);
 #if SQLSERVER
         _persistHeartbeats = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
             .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
@@ -1836,50 +1878,74 @@ internal sealed class AgentHealthStore
 
     private AgentHealthResponse NormalizeAgentHealth(AgentHealthResponse agent)
     {
+        var now = DateTimeOffset.UtcNow;
+        var operationalHealth = FileServerMonitor.Core.AgentOperationalHealth.Evaluate(
+            new FileServerMonitor.Core.AgentOperationalHealthInput(
+                Status: agent.Status,
+                LastHeartbeatUtc: agent.LastHeartbeatUtc,
+                LastSuccessfulSendUtc: agent.LastSuccessfulSendUtc,
+                PendingQueueEvents: agent.PendingQueueEvents,
+                LastCycle: agent.LastCycle,
+                NowUtc: now,
+                StaleAfterMinutes: _staleMinutes,
+                BacklogWarningThreshold: _backlogWarningThreshold,
+                SendLagWarningMinutes: _sendLagWarningMinutes));
+        var lastCollectedEventAgeSeconds = GetAgeSecondsForAgent(now, agent.LastCollectedEventUtc);
+        var normalized = agent with
+        {
+            OperationalStatus = operationalHealth.Level,
+            OperationalMessage = operationalHealth.Reason,
+            LastHeartbeatAgeSeconds = operationalHealth.LastHeartbeatAgeSeconds,
+            LastSuccessfulSendAgeSeconds = operationalHealth.LastSuccessfulSendAgeSeconds,
+            LastCollectedEventAgeSeconds = lastCollectedEventAgeSeconds,
+            HasCycleError = operationalHealth.HasError,
+            StaleAfterMinutes = _staleMinutes,
+            BacklogWarningThreshold = _backlogWarningThreshold
+        };
+
         if (agent.LastHeartbeatUtc is null)
         {
-            return agent with
+            return normalized with
             {
                 Status = "stale",
                 IsStale = true,
-                StaleAfterMinutes = _staleMinutes,
-                BacklogWarningThreshold = _backlogWarningThreshold,
                 Message = agent.Message ?? "Agente sem heartbeat registrado."
             };
         }
 
-        var minutesSinceHeartbeat = DateTimeOffset.UtcNow.Subtract(agent.LastHeartbeatUtc.Value).TotalMinutes;
+        var minutesSinceHeartbeat = now.Subtract(agent.LastHeartbeatUtc.Value).TotalMinutes;
 
         if (minutesSinceHeartbeat > Math.Max(1, _staleMinutes))
         {
-            return agent with
+            return normalized with
             {
                 Status = "stale",
                 IsStale = true,
-                StaleAfterMinutes = _staleMinutes,
-                BacklogWarningThreshold = _backlogWarningThreshold,
                 Message = agent.Message ?? $"Sem heartbeat ha {Math.Floor(minutesSinceHeartbeat)} minuto(s)."
             };
         }
 
         if (agent.PendingQueueEvents >= Math.Max(1, _backlogWarningThreshold))
         {
-            return agent with
+            return normalized with
             {
                 Status = "backlog",
                 IsStale = false,
-                StaleAfterMinutes = _staleMinutes,
-                BacklogWarningThreshold = _backlogWarningThreshold,
                 Message = agent.Message ?? $"Fila local com {agent.PendingQueueEvents} evento(s) pendente(s)."
             };
         }
 
-        return agent with
+        return normalized with
         {
-            IsStale = false,
-            StaleAfterMinutes = _staleMinutes,
-            BacklogWarningThreshold = _backlogWarningThreshold
+            IsStale = false
         };
+    }
+
+    private static long? GetAgeSecondsForAgent(DateTimeOffset now, DateTimeOffset? value)
+    {
+        return value is null
+            ? null
+            : Math.Max(0, (long)now.Subtract(value.Value).TotalSeconds);
     }
 
 #if SQLSERVER
@@ -1903,6 +1969,16 @@ internal sealed class AgentHealthStore
                     LastUsnByVolumeJson = @LastUsnByVolumeJson,
                     PendingQueueEvents = @PendingQueueEvents,
                     LastSuccessfulSendUtc = @LastSuccessfulSendUtc,
+                    LastCollectedEventUtc = @LastCollectedEventUtc,
+                    LastCycleStartedUtc = @LastCycleStartedUtc,
+                    LastCycleFinishedUtc = @LastCycleFinishedUtc,
+                    LastCycleDurationMs = @LastCycleDurationMs,
+                    LastCycleSecurityEventsRead = @LastCycleSecurityEventsRead,
+                    LastCycleUsnEventsRead = @LastCycleUsnEventsRead,
+                    LastCycleCorrelatedEvents = @LastCycleCorrelatedEvents,
+                    LastCycleSentEvents = @LastCycleSentEvents,
+                    LastCycleQueuedEvents = @LastCycleQueuedEvents,
+                    LastCycleError = @LastCycleError,
                     Message = @Message
             WHEN NOT MATCHED THEN
                 INSERT
@@ -1916,6 +1992,16 @@ internal sealed class AgentHealthStore
                     LastUsnByVolumeJson,
                     PendingQueueEvents,
                     LastSuccessfulSendUtc,
+                    LastCollectedEventUtc,
+                    LastCycleStartedUtc,
+                    LastCycleFinishedUtc,
+                    LastCycleDurationMs,
+                    LastCycleSecurityEventsRead,
+                    LastCycleUsnEventsRead,
+                    LastCycleCorrelatedEvents,
+                    LastCycleSentEvents,
+                    LastCycleQueuedEvents,
+                    LastCycleError,
                     Message
                 )
                 VALUES
@@ -1929,6 +2015,16 @@ internal sealed class AgentHealthStore
                     @LastUsnByVolumeJson,
                     @PendingQueueEvents,
                     @LastSuccessfulSendUtc,
+                    @LastCollectedEventUtc,
+                    @LastCycleStartedUtc,
+                    @LastCycleFinishedUtc,
+                    @LastCycleDurationMs,
+                    @LastCycleSecurityEventsRead,
+                    @LastCycleUsnEventsRead,
+                    @LastCycleCorrelatedEvents,
+                    @LastCycleSentEvents,
+                    @LastCycleQueuedEvents,
+                    @LastCycleError,
                     @Message
                 );
             """;
@@ -1954,6 +2050,16 @@ internal sealed class AgentHealthStore
                 LastUsnByVolumeJson,
                 PendingQueueEvents,
                 LastSuccessfulSendUtc,
+                LastCollectedEventUtc,
+                LastCycleStartedUtc,
+                LastCycleFinishedUtc,
+                LastCycleDurationMs,
+                LastCycleSecurityEventsRead,
+                LastCycleUsnEventsRead,
+                LastCycleCorrelatedEvents,
+                LastCycleSentEvents,
+                LastCycleQueuedEvents,
+                LastCycleError,
                 Message
             FROM dbo.AgentHeartbeats
             ORDER BY ServerName, AgentId;
@@ -1991,6 +2097,16 @@ internal sealed class AgentHealthStore
         command.Parameters.AddWithValue("@LastUsnByVolumeJson", JsonSerializer.Serialize(heartbeat.LastUsnByVolume));
         command.Parameters.AddWithValue("@PendingQueueEvents", heartbeat.PendingQueueEvents);
         command.Parameters.AddWithValue("@LastSuccessfulSendUtc", DbValue(heartbeat.LastSuccessfulSendUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@LastCollectedEventUtc", DbValue(heartbeat.LastCollectedEventUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@LastCycleStartedUtc", DbValue(heartbeat.LastCycle?.StartedUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@LastCycleFinishedUtc", DbValue(heartbeat.LastCycle?.FinishedUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@LastCycleDurationMs", DbValue(heartbeat.LastCycle?.DurationMs));
+        command.Parameters.AddWithValue("@LastCycleSecurityEventsRead", DbValue(heartbeat.LastCycle?.SecurityEventsRead));
+        command.Parameters.AddWithValue("@LastCycleUsnEventsRead", DbValue(heartbeat.LastCycle?.UsnEventsRead));
+        command.Parameters.AddWithValue("@LastCycleCorrelatedEvents", DbValue(heartbeat.LastCycle?.CorrelatedEvents));
+        command.Parameters.AddWithValue("@LastCycleSentEvents", DbValue(heartbeat.LastCycle?.SentEvents));
+        command.Parameters.AddWithValue("@LastCycleQueuedEvents", DbValue(heartbeat.LastCycle?.QueuedEvents));
+        command.Parameters.AddWithValue("@LastCycleError", DbValue(heartbeat.LastCycle?.Error));
         command.Parameters.AddWithValue("@Message", DbValue(heartbeat.Message));
     }
 
@@ -2000,6 +2116,7 @@ internal sealed class AgentHealthStore
         var lastUsnByVolume = string.IsNullOrWhiteSpace(lastUsnJson)
             ? new Dictionary<string, long>()
             : JsonSerializer.Deserialize<Dictionary<string, long>>(lastUsnJson) ?? new Dictionary<string, long>();
+        var lastCycle = ReadLastCycle(reader);
 
         return new AgentHealthResponse(
             AgentId: reader.GetString(reader.GetOrdinal("AgentId")),
@@ -2011,7 +2128,30 @@ internal sealed class AgentHealthStore
             LastUsnByVolume: lastUsnByVolume,
             Message: ReadNullableString(reader, "Message"),
             PendingQueueEvents: reader.GetInt32(reader.GetOrdinal("PendingQueueEvents")),
-            LastSuccessfulSendUtc: ReadNullableUtcDateTimeOffset(reader, "LastSuccessfulSendUtc"));
+            LastSuccessfulSendUtc: ReadNullableUtcDateTimeOffset(reader, "LastSuccessfulSendUtc"),
+            LastCollectedEventUtc: ReadNullableUtcDateTimeOffset(reader, "LastCollectedEventUtc"),
+            LastCycle: lastCycle);
+    }
+
+    private static FileServerMonitor.Core.AgentCycleMetrics? ReadLastCycle(SqlDataReader reader)
+    {
+        var duration = ReadNullableLong(reader, "LastCycleDurationMs");
+
+        if (duration is null)
+        {
+            return null;
+        }
+
+        return new FileServerMonitor.Core.AgentCycleMetrics(
+            StartedUtc: ReadNullableUtcDateTimeOffset(reader, "LastCycleStartedUtc"),
+            FinishedUtc: ReadNullableUtcDateTimeOffset(reader, "LastCycleFinishedUtc"),
+            DurationMs: duration.Value,
+            SecurityEventsRead: ReadNullableInt(reader, "LastCycleSecurityEventsRead") ?? 0,
+            UsnEventsRead: ReadNullableInt(reader, "LastCycleUsnEventsRead") ?? 0,
+            CorrelatedEvents: ReadNullableInt(reader, "LastCycleCorrelatedEvents") ?? 0,
+            SentEvents: ReadNullableInt(reader, "LastCycleSentEvents") ?? 0,
+            QueuedEvents: ReadNullableInt(reader, "LastCycleQueuedEvents") ?? 0,
+            Error: ReadNullableString(reader, "LastCycleError"));
     }
 
     private static DateTimeOffset ReadUtcDateTimeOffset(SqlDataReader reader, string name)
@@ -2036,6 +2176,18 @@ internal sealed class AgentHealthStore
     {
         var ordinal = reader.GetOrdinal(name);
         return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static int? ReadNullableInt(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+    }
+
+    private static long? ReadNullableLong(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
     }
 
     private static object DbValue<T>(T? value)
@@ -4965,9 +5117,19 @@ internal sealed record AgentMetricsSummary(
     int Running,
     int Stale,
     int Backlog,
+    int Attention,
+    int Critical,
+    int CycleErrors,
     int Unhealthy,
     int MaxPendingQueueEvents,
     long? MaxHeartbeatAgeSeconds,
+    long? MaxCollectedEventAgeSeconds,
+    int LastCycleSecurityEventsRead,
+    int LastCycleUsnEventsRead,
+    int LastCycleCorrelatedEvents,
+    int LastCycleSentEvents,
+    int LastCycleQueuedEvents,
+    long MaxCycleDurationMs,
     IReadOnlyCollection<AgentMetricsItem> Items,
     string? Error);
 
@@ -4983,6 +5145,12 @@ internal sealed record AgentMetricsItem(
     int PendingQueueEvents,
     DateTimeOffset? LastSuccessfulSendUtc,
     long? LastSuccessfulSendAgeSeconds,
+    DateTimeOffset? LastCollectedEventUtc,
+    long? LastCollectedEventAgeSeconds,
+    FileServerMonitor.Core.AgentCycleMetrics? LastCycle,
+    string OperationalStatus,
+    string? OperationalMessage,
+    bool HasCycleError,
     string? Message,
     bool IsStale);
 
@@ -5013,7 +5181,9 @@ internal sealed record AgentHeartbeatRequest(
     IReadOnlyDictionary<string, long>? LastUsnByVolume,
     string? Message,
     int PendingQueueEvents = 0,
-    DateTimeOffset? LastSuccessfulSendUtc = null);
+    DateTimeOffset? LastSuccessfulSendUtc = null,
+    DateTimeOffset? LastCollectedEventUtc = null,
+    FileServerMonitor.Core.AgentCycleMetrics? LastCycle = null);
 
 internal sealed record AgentHealthResponse(
     string AgentId,
@@ -5026,9 +5196,17 @@ internal sealed record AgentHealthResponse(
     string? Message,
     int PendingQueueEvents = 0,
     DateTimeOffset? LastSuccessfulSendUtc = null,
+    DateTimeOffset? LastCollectedEventUtc = null,
+    FileServerMonitor.Core.AgentCycleMetrics? LastCycle = null,
     int BacklogWarningThreshold = 1000,
     bool IsStale = false,
-    int StaleAfterMinutes = 10);
+    int StaleAfterMinutes = 10,
+    string OperationalStatus = "unknown",
+    string? OperationalMessage = null,
+    long? LastHeartbeatAgeSeconds = null,
+    long? LastSuccessfulSendAgeSeconds = null,
+    long? LastCollectedEventAgeSeconds = null,
+    bool HasCycleError = false);
 
 internal sealed record AgentConfigResponse(
     string Server,

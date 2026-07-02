@@ -9,7 +9,18 @@ A API expõe:
 - `GET /health`: checagem simples de disponibilidade.
 - `GET /metrics`: retrato completo do ambiente em JSON para Zabbix/Grafana.
 
-O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, resumo dos agentes, fila local dos agentes, batimentos e configuração de retenção.
+O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado e contadores do último ciclo de coleta.
+
+Principais sinais de agente:
+
+- `operationalStatus`: `ok`, `attention` ou `critical`.
+- `lastCycleSecurityEventsRead`: eventos lidos no Security Log no último ciclo.
+- `lastCycleUsnEventsRead`: eventos lidos no USN Journal no último ciclo.
+- `lastCycleCorrelatedEvents`: eventos após correlação no último ciclo.
+- `lastCycleSentEvents`: eventos enviados para a API no último ciclo.
+- `lastCycleQueuedEvents`: eventos que precisaram ficar na fila local.
+- `maxCollectedEventAgeSeconds`: maior atraso desde o último evento coletado por um agente.
+- `cycleErrors`: quantidade de agentes cujo último ciclo reportou erro.
 
 ## Zabbix
 

@@ -34,6 +34,7 @@ internal sealed class FileServerAgent
     private readonly HttpClient _httpClient;
     private AgentConfigResponse? _remoteConfig;
     private DateTimeOffset? _lastRemoteConfigFetchUtc;
+    private FileServerMonitor.Core.AgentCycleMetrics? _lastCycle;
 
     public FileServerAgent(AgentOptions options, AgentState state)
     {
@@ -76,12 +77,13 @@ internal sealed class FileServerAgent
         {
             while (!cts.IsCancellationRequested)
             {
+                var cycleStartedUtc = DateTimeOffset.UtcNow;
                 try
                 {
                     await RefreshRemoteConfigAsync(cts.Token);
-                    await SendHeartbeatAsync("running", null, cts.Token);
                     await FlushQueueAsync(cts.Token);
                     await CollectAndSendAsync(cts.Token);
+                    await SendHeartbeatAsync("running", null, cts.Token);
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested)
                 {
@@ -90,6 +92,11 @@ internal sealed class FileServerAgent
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"Falha no ciclo de coleta: {ex.Message}");
+                    if (_lastCycle?.StartedUtc is null || _lastCycle.StartedUtc < cycleStartedUtc)
+                    {
+                        _lastCycle = BuildErrorCycle(cycleStartedUtc, ex);
+                    }
+
                     await SendHeartbeatAsync("degraded", ex.Message, CancellationToken.None);
                 }
 
@@ -109,53 +116,83 @@ internal sealed class FileServerAgent
 
     private async Task CollectAndSendAsync(CancellationToken cancellationToken)
     {
-        var collected = (await CollectEventsAsync(cancellationToken))
+        var cycleStartedUtc = DateTimeOffset.UtcNow;
+        var stopwatch = Stopwatch.StartNew();
+        var sentEvents = 0;
+        var queuedEvents = 0;
+        string? cycleError = null;
+        CollectionResult? result = null;
+
+        try
+        {
+            result = await CollectEventsAsync(cancellationToken);
+            var collected = result.Events
             .Where(item => !string.IsNullOrWhiteSpace(item.Path))
             .Pipe(DeduplicateCollectedEvents)
             .ToArray();
 
-        if (collected.Length == 0)
-        {
-            return;
-        }
+            if (collected.Length == 0)
+            {
+                return;
+            }
 
-        var eventsToSend = _options.SendSecurityLogEvents
-            ? collected
-            : collected
-                .Where(item => !item.CursorType.Equals("security", StringComparison.OrdinalIgnoreCase))
-                .ToArray();
+            _state.LastCollectedEventUtc = MaxTimestamp(collected, _state.LastCollectedEventUtc);
 
-        if (eventsToSend.Length == 0)
-        {
+            var eventsToSend = _options.SendSecurityLogEvents
+                ? collected
+                : collected
+                    .Where(item => !item.CursorType.Equals("security", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+
+            if (eventsToSend.Length == 0)
+            {
+                AdvanceState(collected);
+                _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
+                _state.Save(_options.StateFile);
+                return;
+            }
+
+            var events = eventsToSend.Select(item => item.ToApiRequest()).ToArray();
+            var sent = await TrySendBatchAsync(events, cancellationToken);
+
+            if (!sent)
+            {
+                await AppendQueueAsync(eventsToSend, cancellationToken);
+                queuedEvents = eventsToSend.Length;
+                return;
+            }
+
+            sentEvents = eventsToSend.Length;
             AdvanceState(collected);
             _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
             _state.Save(_options.StateFile);
-            return;
         }
-
-        var events = eventsToSend.Select(item => item.ToApiRequest()).ToArray();
-        var sent = await TrySendBatchAsync(events, cancellationToken);
-
-        if (!sent)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            await AppendQueueAsync(eventsToSend, cancellationToken);
-            return;
+            cycleError = ex.Message;
+            throw;
         }
-
-        AdvanceState(collected);
-        _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
-        _state.Save(_options.StateFile);
+        finally
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _lastCycle = BuildCycleMetrics(cycleStartedUtc, stopwatch.ElapsedMilliseconds, result, sentEvents, queuedEvents, cycleError);
+            }
+        }
     }
 
-    private async Task<IReadOnlyCollection<CollectedFileEvent>> CollectEventsAsync(CancellationToken cancellationToken)
+    private async Task<CollectionResult> CollectEventsAsync(CancellationToken cancellationToken)
     {
         var collected = new List<CollectedFileEvent>();
+        var securityEventsRead = 0;
+        var usnEventsRead = 0;
 
         if (_options.EnableSecurityLogCollector)
         {
             var scriptPath = Path.GetFullPath(_options.SecurityLogScriptPath);
             var arguments = BuildSecurityLogArguments(scriptPath);
             var securityEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+            securityEventsRead = securityEvents.Count;
             Console.WriteLine($"Coleta Security: lastRecordId={_state.LastRecordId}; recebidos={securityEvents.Count}");
             collected.AddRange(securityEvents);
         }
@@ -171,6 +208,7 @@ internal sealed class FileServerAgent
                 var basePath = GetEffectiveUsnBasePath(volume);
                 var arguments = BuildUsnJournalArguments(scriptPath, volume, startUsn, basePath);
                 var usnEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+                usnEventsRead += usnEvents.Count;
                 Console.WriteLine($"Coleta USN: volume={volume}; startUsn={startUsn}; basePath={basePath}; recebidos={usnEvents.Count}");
                 collected.AddRange(usnEvents);
             }
@@ -187,7 +225,12 @@ internal sealed class FileServerAgent
             .ToArray();
 
         Console.WriteLine($"Coleta final: brutos={collected.Count}; pos-correlacao={output.Count}; pos-filtro={filtered.Length}");
-        return filtered;
+        return new CollectionResult(
+            Events: filtered,
+            RawEvents: collected.Count,
+            SecurityEventsRead: securityEventsRead,
+            UsnEventsRead: usnEventsRead,
+            CorrelatedEvents: output.Count);
     }
 
     private async Task<IReadOnlyCollection<CollectedFileEvent>> RunCollectorScriptAsync(
@@ -430,7 +473,9 @@ internal sealed class FileServerAgent
             LastUsnByVolume: _state.LastUsnByVolume,
             Message: message ?? BuildHeartbeatMessage(),
             PendingQueueEvents: CountPendingQueueEvents(),
-            LastSuccessfulSendUtc: _state.LastSuccessfulSendUtc);
+            LastSuccessfulSendUtc: _state.LastSuccessfulSendUtc,
+            LastCollectedEventUtc: _state.LastCollectedEventUtc,
+            LastCycle: _lastCycle);
 
         try
         {
@@ -546,6 +591,47 @@ internal sealed class FileServerAgent
         return string.IsNullOrWhiteSpace(path)
             ? string.Empty
             : path.Trim().TrimEnd('\\', '/');
+    }
+
+    private static DateTimeOffset? MaxTimestamp(
+        IReadOnlyCollection<CollectedFileEvent> events,
+        DateTimeOffset? current)
+    {
+        if (events.Count == 0)
+        {
+            return current;
+        }
+
+        var max = events.Max(item => item.TimestampUtc);
+
+        return current is null || max > current
+            ? max
+            : current;
+    }
+
+    private static FileServerMonitor.Core.AgentCycleMetrics BuildErrorCycle(DateTimeOffset startedUtc, Exception ex)
+    {
+        return BuildCycleMetrics(startedUtc, (long)DateTimeOffset.UtcNow.Subtract(startedUtc).TotalMilliseconds, null, 0, 0, ex.Message);
+    }
+
+    private static FileServerMonitor.Core.AgentCycleMetrics BuildCycleMetrics(
+        DateTimeOffset startedUtc,
+        long durationMs,
+        CollectionResult? result,
+        int sentEvents,
+        int queuedEvents,
+        string? error)
+    {
+        return new FileServerMonitor.Core.AgentCycleMetrics(
+            StartedUtc: startedUtc,
+            FinishedUtc: DateTimeOffset.UtcNow,
+            DurationMs: Math.Max(0, durationMs),
+            SecurityEventsRead: result?.SecurityEventsRead ?? 0,
+            UsnEventsRead: result?.UsnEventsRead ?? 0,
+            CorrelatedEvents: result?.CorrelatedEvents ?? 0,
+            SentEvents: sentEvents,
+            QueuedEvents: queuedEvents,
+            Error: error);
     }
 
     private int CountPendingQueueEvents()
@@ -849,6 +935,13 @@ internal sealed record MonitoredPath(
     DateTimeOffset CreatedUtc,
     DateTimeOffset UpdatedUtc);
 
+internal sealed record CollectionResult(
+    IReadOnlyCollection<CollectedFileEvent> Events,
+    int RawEvents,
+    int SecurityEventsRead,
+    int UsnEventsRead,
+    int CorrelatedEvents);
+
 internal sealed record AgentState
 {
     public long LastRecordId { get; set; }
@@ -858,6 +951,8 @@ internal sealed record AgentState
     public Dictionary<string, Dictionary<string, string>> KnownPathByFileIdByVolume { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     public DateTimeOffset? LastSuccessfulSendUtc { get; set; }
+
+    public DateTimeOffset? LastCollectedEventUtc { get; set; }
 
     public static AgentState Load(string path)
     {
@@ -975,7 +1070,9 @@ internal sealed record AgentHeartbeatRequest(
     IReadOnlyDictionary<string, long> LastUsnByVolume,
     string? Message,
     int PendingQueueEvents,
-    DateTimeOffset? LastSuccessfulSendUtc);
+    DateTimeOffset? LastSuccessfulSendUtc,
+    DateTimeOffset? LastCollectedEventUtc,
+    FileServerMonitor.Core.AgentCycleMetrics? LastCycle);
 
 internal sealed class WindowsServiceRuntime
 {
