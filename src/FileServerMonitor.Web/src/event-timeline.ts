@@ -974,12 +974,24 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
   const eventTime = new Date(event.timestampUtc).getTime();
   const eventPath = normalizePath(event.path);
   return allEvents.some((candidate) => {
-    if (candidate.id === event.id
-      || (candidate.action !== "created"
-        && candidate.action !== "created_or_appended"
-        && candidate.action !== "renamed"
-        && candidate.action !== "moved"
-        && candidate.action !== "deleted")) {
+    if (candidate.id === event.id) {
+      return false;
+    }
+
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    if (candidate.action === "accessed") {
+      return isFileLikePath(event.path)
+        && pathsReferToSameItem(candidate.path, event.path)
+        && normalizeUser(candidate.user) === normalizeUser(event.user)
+        && candidateTime > eventTime
+        && candidateTime - eventTime <= 5_000;
+    }
+
+    if (candidate.action !== "created"
+      && candidate.action !== "created_or_appended"
+      && candidate.action !== "renamed"
+      && candidate.action !== "moved"
+      && candidate.action !== "deleted") {
       return false;
     }
 
@@ -987,7 +999,7 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
       ? 5_000
       : 10_000;
 
-    return Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= candidateWindowMs
+    return Math.abs(candidateTime - eventTime) <= candidateWindowMs
       && (
         pathsReferToSameItem(candidate.path, event.path)
         || pathsReferToSameItem(candidate.previousPath, event.path)

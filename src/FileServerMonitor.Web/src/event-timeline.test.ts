@@ -144,6 +144,40 @@ test("keeps accessed events with the file name visible", () => {
   assert.equal(display[0]?.displayTarget, "Novo Documento.txt");
 });
 
+test("collapses repeated access noise for the same file within a few seconds", () => {
+  const path = "C:\\Corporativo\\Novo(a) Documento de Texto - Copia (4).txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "accessed-1",
+      timestampUtc: "2026-07-02T06:44:05.000Z",
+      path,
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    }),
+    buildEvent({
+      id: "accessed-2",
+      timestampUtc: "2026-07-02T06:44:06.000Z",
+      path,
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    }),
+    buildEvent({
+      id: "accessed-3",
+      timestampUtc: "2026-07-02T06:44:07.000Z",
+      path,
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\AnphibiO"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.path, event.timestampUtc]), [
+    ["Acessado", path, "2026-07-02T06:44:07.000Z"]
+  ]);
+});
+
 test("does not let a near creation access echo replace the creation", () => {
   const path = "C:\\Corporativo\\codex-create-action\\01-single-file.txt";
   const display = buildDisplayEvents([
