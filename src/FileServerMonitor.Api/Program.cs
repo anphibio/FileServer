@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
@@ -7,6 +8,7 @@ using Microsoft.Data.SqlClient;
 #endif
 
 var builder = WebApplication.CreateBuilder(args);
+var apiStartedUtc = DateTimeOffset.UtcNow;
 
 builder.Services.Configure<MonitorOptions>(
     builder.Configuration.GetSection(MonitorOptions.SectionName));
@@ -107,6 +109,44 @@ app.MapGet("/health", async (IEventRepository repository, CancellationToken canc
         StorageProvider: repository.ProviderName,
         StoredEvents: stats.StoredEvents,
         LastEventUtc: stats.LastEventUtc));
+});
+
+app.MapGet("/metrics", async (
+    IEventRepository repository,
+    AgentHealthStore agents,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    var now = DateTimeOffset.UtcNow;
+    var database = await BuildDatabaseMetricsAsync(repository, now, cancellationToken);
+    var agentSummary = await BuildAgentMetricsAsync(agents, now, cancellationToken);
+    var thresholds = new MetricsThresholds(
+        AgentStaleMinutes: configuration.GetValue("Agents:StaleMinutes", 10),
+        AgentBacklogWarningThreshold: configuration.GetValue("Agents:BacklogWarningThreshold", 1000),
+        LastEventWarningSeconds: configuration.GetValue("Metrics:LastEventWarningSeconds", 1800));
+    var retention = new RetentionMetrics(
+        Enabled: configuration.GetValue("Retention:Enabled", false),
+        EventsDays: configuration.GetValue("Retention:EventsDays", 180),
+        AlertsDays: configuration.GetValue("Retention:AlertsDays", 365),
+        IntervalHours: configuration.GetValue("Retention:IntervalHours", 24));
+    var api = new ApiMetrics(
+        Status: "healthy",
+        StorageProvider: repository.ProviderName,
+        UptimeSeconds: Math.Max(0, (long)now.Subtract(apiStartedUtc).TotalSeconds),
+        StartedUtc: apiStartedUtc,
+        MachineName: Environment.MachineName,
+        ProcessId: Environment.ProcessId);
+    var status = ResolveMetricsStatus(database, agentSummary);
+
+    return Results.Ok(new MetricsResponse(
+        Service: "FileServerMonitor.Api",
+        Status: status,
+        TimestampUtc: now,
+        Api: api,
+        Database: database,
+        Agents: agentSummary,
+        Retention: retention,
+        Thresholds: thresholds));
 });
 
 app.MapPost("/api/events", async (
@@ -757,6 +797,144 @@ static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? sear
         || auditEvent.Action.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.DisplayAction.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.Source.Contains(needle, StringComparison.OrdinalIgnoreCase);
+}
+
+static async Task<DatabaseMetrics> BuildDatabaseMetricsAsync(
+    IEventRepository repository,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    var stopwatch = Stopwatch.StartNew();
+
+    try
+    {
+        var stats = await repository.GetStatsAsync(cancellationToken);
+        stopwatch.Stop();
+
+        return new DatabaseMetrics(
+            Status: "healthy",
+            Provider: repository.ProviderName,
+            StoredEvents: stats.StoredEvents,
+            LastEventUtc: stats.LastEventUtc,
+            LastEventAgeSeconds: GetAgeSeconds(now, stats.LastEventUtc),
+            QueryDurationMs: stopwatch.ElapsedMilliseconds,
+            Error: null);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        stopwatch.Stop();
+
+        return new DatabaseMetrics(
+            Status: "critical",
+            Provider: repository.ProviderName,
+            StoredEvents: null,
+            LastEventUtc: null,
+            LastEventAgeSeconds: null,
+            QueryDurationMs: stopwatch.ElapsedMilliseconds,
+            Error: ex.Message);
+    }
+}
+
+static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
+    AgentHealthStore store,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var agents = await store.ListAsync(cancellationToken);
+        var items = agents
+            .Select(agent => new AgentMetricsItem(
+                AgentId: agent.AgentId,
+                Server: agent.Server,
+                Status: agent.Status,
+                LastHeartbeatUtc: agent.LastHeartbeatUtc,
+                LastHeartbeatAgeSeconds: GetAgeSeconds(now, agent.LastHeartbeatUtc),
+                Version: agent.Version,
+                LastRecordId: agent.LastRecordId,
+                LastUsnByVolume: agent.LastUsnByVolume,
+                PendingQueueEvents: agent.PendingQueueEvents,
+                LastSuccessfulSendUtc: agent.LastSuccessfulSendUtc,
+                LastSuccessfulSendAgeSeconds: GetAgeSeconds(now, agent.LastSuccessfulSendUtc),
+                Message: agent.Message,
+                IsStale: agent.IsStale))
+            .OrderBy(item => item.Server)
+            .ThenBy(item => item.AgentId)
+            .ToArray();
+        var stale = items.Count(item => item.IsStale);
+        var backlog = items.Count(item => item.Status.Equals("backlog", StringComparison.OrdinalIgnoreCase)
+            || item.PendingQueueEvents > 0);
+        var unhealthy = items.Count(item => !item.Status.Equals("running", StringComparison.OrdinalIgnoreCase));
+
+        return new AgentMetricsSummary(
+            Status: ResolveAgentStatus(items.Length, stale, unhealthy, backlog),
+            Total: items.Length,
+            Running: items.Count(item => item.Status.Equals("running", StringComparison.OrdinalIgnoreCase)),
+            Stale: stale,
+            Backlog: backlog,
+            Unhealthy: unhealthy,
+            MaxPendingQueueEvents: items.Length == 0 ? 0 : items.Max(item => item.PendingQueueEvents),
+            MaxHeartbeatAgeSeconds: items
+                .Select(item => item.LastHeartbeatAgeSeconds)
+                .Where(item => item.HasValue)
+                .DefaultIfEmpty(0)
+                .Max(),
+            Items: items,
+            Error: null);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        return new AgentMetricsSummary(
+            Status: "critical",
+            Total: 0,
+            Running: 0,
+            Stale: 0,
+            Backlog: 0,
+            Unhealthy: 0,
+            MaxPendingQueueEvents: 0,
+            MaxHeartbeatAgeSeconds: null,
+            Items: Array.Empty<AgentMetricsItem>(),
+            Error: ex.Message);
+    }
+}
+
+static long? GetAgeSeconds(DateTimeOffset now, DateTimeOffset? value)
+{
+    return value is null
+        ? null
+        : Math.Max(0, (long)now.Subtract(value.Value).TotalSeconds);
+}
+
+static string ResolveAgentStatus(int total, int stale, int unhealthy, int backlog)
+{
+    if (total == 0 || stale > 0)
+    {
+        return "critical";
+    }
+
+    if (unhealthy > 0 || backlog > 0)
+    {
+        return "degraded";
+    }
+
+    return "healthy";
+}
+
+static string ResolveMetricsStatus(DatabaseMetrics database, AgentMetricsSummary agents)
+{
+    if (database.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
+        || agents.Status.Equals("critical", StringComparison.OrdinalIgnoreCase))
+    {
+        return "critical";
+    }
+
+    if (!database.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase)
+        || !agents.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase))
+    {
+        return "degraded";
+    }
+
+    return "healthy";
 }
 
 internal interface IEventRepository
@@ -4207,7 +4385,8 @@ internal static class AuthHelpers
     public static bool IsAnonymousPath(PathString path)
     {
         return path == "/"
-            || path.StartsWithSegments("/health");
+            || path.StartsWithSegments("/health")
+            || path.StartsWithSegments("/metrics");
     }
 
     public static bool RequiresAdminKey(HttpRequest request)
@@ -4752,6 +4931,71 @@ internal sealed record HealthResponse(
     string StorageProvider,
     long StoredEvents,
     DateTimeOffset? LastEventUtc);
+
+internal sealed record MetricsResponse(
+    string Service,
+    string Status,
+    DateTimeOffset TimestampUtc,
+    ApiMetrics Api,
+    DatabaseMetrics Database,
+    AgentMetricsSummary Agents,
+    RetentionMetrics Retention,
+    MetricsThresholds Thresholds);
+
+internal sealed record ApiMetrics(
+    string Status,
+    string StorageProvider,
+    long UptimeSeconds,
+    DateTimeOffset StartedUtc,
+    string MachineName,
+    int ProcessId);
+
+internal sealed record DatabaseMetrics(
+    string Status,
+    string Provider,
+    long? StoredEvents,
+    DateTimeOffset? LastEventUtc,
+    long? LastEventAgeSeconds,
+    long QueryDurationMs,
+    string? Error);
+
+internal sealed record AgentMetricsSummary(
+    string Status,
+    int Total,
+    int Running,
+    int Stale,
+    int Backlog,
+    int Unhealthy,
+    int MaxPendingQueueEvents,
+    long? MaxHeartbeatAgeSeconds,
+    IReadOnlyCollection<AgentMetricsItem> Items,
+    string? Error);
+
+internal sealed record AgentMetricsItem(
+    string AgentId,
+    string Server,
+    string Status,
+    DateTimeOffset? LastHeartbeatUtc,
+    long? LastHeartbeatAgeSeconds,
+    string? Version,
+    long LastRecordId,
+    IReadOnlyDictionary<string, long> LastUsnByVolume,
+    int PendingQueueEvents,
+    DateTimeOffset? LastSuccessfulSendUtc,
+    long? LastSuccessfulSendAgeSeconds,
+    string? Message,
+    bool IsStale);
+
+internal sealed record RetentionMetrics(
+    bool Enabled,
+    int EventsDays,
+    int AlertsDays,
+    int IntervalHours);
+
+internal sealed record MetricsThresholds(
+    int AgentStaleMinutes,
+    int AgentBacklogWarningThreshold,
+    int LastEventWarningSeconds);
 
 internal sealed record EventIngestResponse(FileAuditEvent Event, IReadOnlyCollection<FileServerAlert> Alerts);
 

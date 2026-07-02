@@ -1,0 +1,253 @@
+zabbix_export:
+  version: '6.4'
+  template_groups:
+    - uuid: 5e4cc0db0e534b2a9c2829f274741c41
+      name: Templates/Applications
+  templates:
+    - uuid: 44bb727c3a8046bbb3513add9f9eec42
+      template: 'Template App FileServer Monitor'
+      name: 'Template App FileServer Monitor'
+      groups:
+        - name: Templates/Applications
+      macros:
+        - macro: '{$FILESERVER_MONITOR_URL}'
+          value: 'http://localhost:8180'
+          description: 'URL base da API FileServer Monitor.'
+        - macro: '{$FILESERVER_MONITOR_QUEUE_WARN}'
+          value: '1000'
+          description: 'Fila local maxima aceitavel por agente.'
+        - macro: '{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
+          value: '1800'
+          description: 'Tempo maximo sem eventos novos, em segundos.'
+      items:
+        - uuid: 0d0fdcc35bd047e592adcb65fd1c39e8
+          name: 'FileServer Monitor: metrics raw'
+          type: HTTP_AGENT
+          key: fileserver.metrics.raw
+          delay: 30s
+          history: 7d
+          trends: '0'
+          value_type: TEXT
+          url: '{$FILESERVER_MONITOR_URL}/metrics'
+          timeout: 10s
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 61b550c33bc34d20a01f961032d83615
+          name: 'FileServer Monitor: overall status'
+          type: DEPENDENT
+          key: fileserver.api.status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.status
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: c5acbf597c99472ea67f3f2e6a64753e
+          name: 'FileServer Monitor: API uptime'
+          type: DEPENDENT
+          key: fileserver.api.uptime_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.api.uptimeSeconds
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 16132c86e11f4ae1a80d5789b4ab7148
+          name: 'FileServer Monitor: database status'
+          type: DEPENDENT
+          key: fileserver.db.status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.database.status
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 81aece70c1fb4e7d8defcbb57a931349
+          name: 'FileServer Monitor: database query time'
+          type: DEPENDENT
+          key: fileserver.db.query_ms
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: ms
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.database.queryDurationMs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 66f707991b6c4cb592b5cc6ec995e4b6
+          name: 'FileServer Monitor: stored events'
+          type: DEPENDENT
+          key: fileserver.events.total
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.database.storedEvents
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: ec640524fb704a2f852842d80a085f33
+          name: 'FileServer Monitor: last event age'
+          type: DEPENDENT
+          key: fileserver.events.last_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.database.lastEventAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: ce91a9a3e3f447138050fe0eb1f4c4f3
+          name: 'FileServer Monitor: agents total'
+          type: DEPENDENT
+          key: fileserver.agents.total
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.total
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: c8568f3c8e4e42da94d8c70a00382838
+          name: 'FileServer Monitor: stale agents'
+          type: DEPENDENT
+          key: fileserver.agents.stale
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.stale
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 21e3a7c7d5d44397a4e89a7d97ab68c3
+          name: 'FileServer Monitor: unhealthy agents'
+          type: DEPENDENT
+          key: fileserver.agents.unhealthy
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.unhealthy
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 2555a9bbf576489b830f4bcd08c7ad86
+          name: 'FileServer Monitor: max agent queue'
+          type: DEPENDENT
+          key: fileserver.agents.max_pending_queue
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.maxPendingQueueEvents
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: b478f11732c844fd8e97e3c819bbcf42
+          name: 'FileServer Monitor: max heartbeat age'
+          type: DEPENDENT
+          key: fileserver.agents.max_heartbeat_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.agents.maxHeartbeatAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+      triggers:
+        - uuid: ba8cc84ff4ab4902a416070eb257a817
+          expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
+          name: 'FileServer Monitor: ambiente nao esta healthy'
+          priority: WARNING
+        - uuid: 9a3dec8ac473451aae4b20b474211911
+          expression: 'last(/Template App FileServer Monitor/fileserver.db.status)<>"healthy"'
+          name: 'FileServer Monitor: banco indisponivel ou degradado'
+          priority: HIGH
+        - uuid: b80b97d6edbd4400801359435c3b7d93
+          expression: 'last(/Template App FileServer Monitor/fileserver.agents.total)=0'
+          name: 'FileServer Monitor: nenhum agente registrado'
+          priority: HIGH
+        - uuid: 32091dc2b90642f295ffabf6a24b3fe4
+          expression: 'last(/Template App FileServer Monitor/fileserver.agents.stale)>0'
+          name: 'FileServer Monitor: agente sem heartbeat'
+          priority: HIGH
+        - uuid: b342a34ee4da42a9b645d3ef139dc79c
+          expression: 'last(/Template App FileServer Monitor/fileserver.agents.unhealthy)>0'
+          name: 'FileServer Monitor: agente em estado nao saudavel'
+          priority: WARNING
+        - uuid: 9f1210c43ddb4fcc82e1be33040c2c16
+          expression: 'last(/Template App FileServer Monitor/fileserver.agents.max_pending_queue)>={$FILESERVER_MONITOR_QUEUE_WARN}'
+          name: 'FileServer Monitor: fila local do agente alta'
+          priority: WARNING
+        - uuid: c1092e359fc24965a7e506d313cfd546
+          expression: 'last(/Template App FileServer Monitor/fileserver.events.last_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
+          name: 'FileServer Monitor: sem eventos recentes'
+          priority: INFO
+
