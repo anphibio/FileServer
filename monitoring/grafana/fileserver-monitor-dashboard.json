@@ -23,71 +23,36 @@
   "liveNow": false,
   "panels": [
     {
+      "id": 1,
+      "title": "",
+      "type": "text",
+      "datasource": null,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 5
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### FILESERVER MONITOR\n# Painel operacional e gerencial\nAcompanhe disponibilidade da API, saude do banco, batimento dos agentes, fila local de envio e fluxo de eventos a partir do endpoint `/metrics` coletado pelo Zabbix."
+      },
+      "transparent": false
+    },
+    {
+      "id": 2,
+      "title": "API pronta",
+      "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
         "uid": "${DS_ZABBIX}"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "options": {
-                "healthy": {
-                  "color": "green",
-                  "index": 0,
-                  "text": "Healthy"
-                },
-                "degraded": {
-                  "color": "orange",
-                  "index": 1,
-                  "text": "Degraded"
-                },
-                "critical": {
-                  "color": "red",
-                  "index": 2,
-                  "text": "Critical"
-                }
-              },
-              "type": "value"
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
       "gridPos": {
-        "h": 4,
-        "w": 6,
         "x": 0,
-        "y": 0
+        "y": 5,
+        "w": 4,
+        "h": 4
       },
-      "id": 1,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value"
-      },
-      "pluginVersion": "10.4.0",
       "targets": [
         {
           "application": {
@@ -110,14 +75,6 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Saude geral",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -125,19 +82,39 @@
           },
           "mappings": [
             {
+              "type": "value",
               "options": {
                 "healthy": {
                   "color": "green",
                   "index": 0,
-                  "text": "Healthy"
+                  "text": "OK"
+                },
+                "degraded": {
+                  "color": "orange",
+                  "index": 1,
+                  "text": "Degraded"
                 },
                 "critical": {
                   "color": "red",
-                  "index": 1,
+                  "index": 2,
                   "text": "Critical"
+                },
+                "running": {
+                  "color": "green",
+                  "index": 3,
+                  "text": "Running"
+                },
+                "stale": {
+                  "color": "red",
+                  "index": 4,
+                  "text": "Stale"
+                },
+                "backlog": {
+                  "color": "orange",
+                  "index": 5,
+                  "text": "Backlog"
                 }
-              },
-              "type": "value"
+              }
             }
           ],
           "thresholds": {
@@ -148,17 +125,11 @@
                 "value": null
               }
             ]
-          }
+          },
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 0
-      },
-      "id": 2,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -173,7 +144,22 @@
         },
         "textMode": "value"
       },
-      "pluginVersion": "10.4.0",
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 3,
+      "title": "Banco",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
       "targets": [
         {
           "application": {
@@ -196,33 +182,64 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Banco",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "healthy": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "OK"
+                },
+                "degraded": {
+                  "color": "orange",
+                  "index": 1,
+                  "text": "Degraded"
+                },
+                "critical": {
+                  "color": "red",
+                  "index": 2,
+                  "text": "Critical"
+                },
+                "running": {
+                  "color": "green",
+                  "index": 3,
+                  "text": "Running"
+                },
+                "stale": {
+                  "color": "red",
+                  "index": 4,
+                  "text": "Stale"
+                },
+                "backlog": {
+                  "color": "orange",
+                  "index": 5,
+                  "text": "Backlog"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 0
-      },
-      "id": 3,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
+        "colorMode": "background",
+        "graphMode": "none",
         "justifyMode": "center",
         "orientation": "horizontal",
         "reduceOptions": {
@@ -232,9 +249,24 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "textMode": "value"
       },
-      "pluginVersion": "10.4.0",
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 4,
+      "title": "Agentes",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
       "targets": [
         {
           "application": {
@@ -257,28 +289,21 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Agentes",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "red",
                 "value": null
               },
               {
-                "color": "red",
+                "color": "green",
                 "value": 1
               }
             ]
@@ -287,13 +312,6 @@
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 0
-      },
-      "id": 4,
       "options": {
         "colorMode": "background",
         "graphMode": "none",
@@ -308,7 +326,22 @@
         },
         "textMode": "auto"
       },
-      "pluginVersion": "10.4.0",
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 5,
+      "title": "Agentes stale",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
       "targets": [
         {
           "application": {
@@ -331,76 +364,208 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Agentes stale",
-      "type": "stat"
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
     },
     {
+      "id": 6,
+      "title": "Maior fila",
+      "type": "stat",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
         "uid": "${DS_ZABBIX}"
       },
+      "gridPos": {
+        "x": 16,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max agent queue"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
           },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
           },
-          "unit": "ms"
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 4
-      },
-      "id": 5,
       "options": {
-        "legend": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
           "calcs": [
-            "lastNotNull",
-            "max"
+            "lastNotNull"
           ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 7,
+      "title": "Eventos armazenados",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 5,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: stored events"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
         }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 8,
+      "title": "Latencia e frescor da coleta",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
       },
       "targets": [
         {
@@ -424,14 +589,6 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Tempo de resposta do banco",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -445,8 +602,8 @@
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
@@ -469,17 +626,19 @@
               "mode": "off"
             }
           },
-          "unit": "s"
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 4
-      },
-      "id": 6,
       "options": {
         "legend": {
           "calcs": [
@@ -494,6 +653,21 @@
           "mode": "single",
           "sort": "none"
         }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Idade do ultimo evento e heartbeat",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
       },
       "targets": [
         {
@@ -515,20 +689,174 @@
           },
           "refId": "A",
           "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max heartbeat age"
+          },
+          "refId": "B",
+          "resultFormat": "time_series"
         }
       ],
-      "title": "Idade do ultimo evento",
-      "type": "timeseries"
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
     },
     {
+      "id": 10,
+      "title": "Saude dos agentes",
+      "type": "bargauge",
       "datasource": {
         "type": "alexanderzobnin-zabbix-datasource",
         "uid": "${DS_ZABBIX}"
       },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: agents total"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: stale agents"
+          },
+          "refId": "B",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: unhealthy agents"
+          },
+          "refId": "C",
+          "resultFormat": "time_series"
+        }
+      ],
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "palette-classic"
           },
           "thresholds": {
             "mode": "absolute",
@@ -543,7 +871,7 @@
               },
               {
                 "color": "red",
-                "value": 1000
+                "value": 10
               }
             ]
           },
@@ -551,17 +879,12 @@
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 5,
-        "w": 8,
-        "x": 0,
-        "y": 12
-      },
-      "id": 7,
       "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "bottom",
         "orientation": "horizontal",
         "reduceOptions": {
           "calcs": [
@@ -570,9 +893,128 @@
           "fields": "",
           "values": false
         },
-        "textMode": "auto"
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
       },
-      "pluginVersion": "10.4.0",
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 11,
+      "title": "Fila e eventos",
+      "type": "bargauge",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 17,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: max agent queue"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: stored events"
+          },
+          "refId": "B",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "bottom",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 12,
+      "title": "Fila local do agente",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 17,
+        "w": 8,
+        "h": 6
+      },
       "targets": [
         {
           "application": {
@@ -595,18 +1037,42 @@
           "resultFormat": "time_series"
         }
       ],
-      "title": "Maior fila de agente",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "thresholds": {
             "mode": "absolute",
@@ -614,128 +1080,28 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "orange",
-                "value": 300
-              },
-              {
-                "color": "red",
-                "value": 600
               }
             ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 8,
-        "x": 8,
-        "y": 12
-      },
-      "id": 8,
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "application": {
-            "filter": "FileServer Monitor"
-          },
-          "datasource": {
-            "type": "alexanderzobnin-zabbix-datasource",
-            "uid": "${DS_ZABBIX}"
-          },
-          "group": {
-            "filter": "$zabbix_group"
-          },
-          "host": {
-            "filter": "$zabbix_host"
-          },
-          "item": {
-            "filter": "FileServer Monitor: max heartbeat age"
-          },
-          "refId": "A",
-          "resultFormat": "time_series"
-        }
-      ],
-      "title": "Heartbeat mais antigo",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "alexanderzobnin-zabbix-datasource",
-        "uid": "${DS_ZABBIX}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
           },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 5,
-        "w": 8,
-        "x": 16,
-        "y": 12
-      },
-      "id": 9,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
+        "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
-          "fields": "",
-          "values": false
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.4.0",
-      "targets": [
-        {
-          "application": {
-            "filter": "FileServer Monitor"
-          },
-          "datasource": {
-            "type": "alexanderzobnin-zabbix-datasource",
-            "uid": "${DS_ZABBIX}"
-          },
-          "group": {
-            "filter": "$zabbix_group"
-          },
-          "host": {
-            "filter": "$zabbix_host"
-          },
-          "item": {
-            "filter": "FileServer Monitor: stored events"
-          },
-          "refId": "A",
-          "resultFormat": "time_series"
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
         }
-      ],
-      "title": "Eventos armazenados",
-      "type": "stat"
+      }
     }
   ],
   "refresh": "30s",
@@ -750,7 +1116,7 @@
         "current": {},
         "hide": 0,
         "includeAll": false,
-        "label": "Zabbix",
+        "label": "Data source",
         "name": "DS_ZABBIX",
         "options": [],
         "query": "alexanderzobnin-zabbix-datasource",
@@ -766,7 +1132,8 @@
         },
         "definition": "Host groups from Zabbix",
         "hide": 0,
-        "includeAll": false,
+        "includeAll": true,
+        "allValue": "/.*/",
         "label": "Host group",
         "name": "zabbix_group",
         "options": [],
@@ -787,7 +1154,8 @@
         },
         "definition": "Hosts from selected Zabbix host group",
         "hide": 0,
-        "includeAll": false,
+        "includeAll": true,
+        "allValue": "/.*/",
         "label": "Host",
         "name": "zabbix_host",
         "options": [],
@@ -811,6 +1179,6 @@
   "timezone": "browser",
   "title": "FileServer Monitor",
   "uid": "fileserver-monitor",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
