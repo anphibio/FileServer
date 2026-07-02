@@ -35,3 +35,7 @@ Importe o arquivo:
 
 O dashboard espera o datasource do plugin Zabbix (`alexanderzobnin-zabbix-datasource`). Na importação, selecione o datasource e o host Zabbix onde o template foi vinculado.
 
+Depois da importação, use as variáveis no topo do dashboard:
+
+- `Host group`: grupo de hosts vindo do Zabbix.
+- `Host`: hosts filtrados pelo grupo selecionado.

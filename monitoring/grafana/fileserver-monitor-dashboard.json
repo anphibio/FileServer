@@ -759,42 +759,47 @@
         "type": "datasource"
       },
       {
-        "current": {
-          "selected": false,
-          "text": "FileServer Monitor",
-          "value": "FileServer Monitor"
+        "current": {},
+        "datasource": {
+          "type": "alexanderzobnin-zabbix-datasource",
+          "uid": "${DS_ZABBIX}"
         },
+        "definition": "Host groups from Zabbix",
         "hide": 0,
-        "label": "Grupo",
+        "includeAll": false,
+        "label": "Host group",
         "name": "zabbix_group",
-        "options": [
-          {
-            "selected": true,
-            "text": "FileServer Monitor",
-            "value": "FileServer Monitor"
-          }
-        ],
-        "query": "FileServer Monitor",
-        "type": "textbox"
+        "options": [],
+        "query": {
+          "group": "/.*/",
+          "queryType": "group"
+        },
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
       },
       {
-        "current": {
-          "selected": false,
-          "text": "FileServer Monitor API",
-          "value": "FileServer Monitor API"
+        "current": {},
+        "datasource": {
+          "type": "alexanderzobnin-zabbix-datasource",
+          "uid": "${DS_ZABBIX}"
         },
+        "definition": "Hosts from selected Zabbix host group",
         "hide": 0,
+        "includeAll": false,
         "label": "Host",
         "name": "zabbix_host",
-        "options": [
-          {
-            "selected": true,
-            "text": "FileServer Monitor API",
-            "value": "FileServer Monitor API"
-          }
-        ],
-        "query": "FileServer Monitor API",
-        "type": "textbox"
+        "options": [],
+        "query": {
+          "group": "$zabbix_group",
+          "host": "/.*/",
+          "queryType": "host"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
       }
     ]
   },
