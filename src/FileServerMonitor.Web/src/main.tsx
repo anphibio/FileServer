@@ -11,10 +11,14 @@ import {
   Download,
   FileClock,
   FolderTree,
+  KeyRound,
+  LogOut,
+  LockKeyhole,
   Plus,
   RefreshCcw,
   Search,
   Server,
+  ShieldCheck,
   ShieldAlert,
   Trash2
 } from "lucide-react";
@@ -42,6 +46,45 @@ type HealthResponse = {
   storageProvider: string;
   storedEvents: number;
   lastEventUtc: string | null;
+};
+
+type AuthStatusResponse = {
+  enabled: boolean;
+  configurationStatus: string;
+  loginMode: string;
+  updatedUtc: string;
+};
+
+type AuthConfig = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: string;
+  timeoutSeconds: number;
+  baseDn: string;
+  bindFormat: string;
+  domainSuffix: string;
+  netbiosDomain: string;
+  adminGroupDn: string;
+  operatorGroupDn: string;
+  readerGroupDn: string;
+  configurationStatus: string;
+  loginMode: string;
+  updatedUtc: string;
+};
+
+type AuthenticatedUser = {
+  username: string;
+  displayName: string;
+  distinguishedName: string;
+  role: "admin" | "operator" | "reader" | string;
+  groups: string[];
+};
+
+type LoginResponse = {
+  token: string;
+  user: AuthenticatedUser;
+  expiresUtc: string;
 };
 
 type FileAuditEvent = {
@@ -269,7 +312,10 @@ type GeneratedReport = {
   events: DisplayEvent[];
 };
 
-type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit";
+type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit" | "auth";
+
+const authTokenStorageKey = "fileserver-monitor.auth.token";
+const authUserStorageKey = "fileserver-monitor.auth.user";
 
 const emptyMonitoredPathForm: MonitoredPathForm = {
   server: "FileServer",
@@ -304,6 +350,8 @@ const EVENTS_PAGE_SIZE = 25;
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authUser, setAuthUser] = useState<AuthenticatedUser | null>(() => readStoredAuthUser());
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [events, setEvents] = useState<DisplayEvent[]>([]);
   const [alerts, setAlerts] = useState<FileServerAlert[]>([]);
@@ -322,6 +370,15 @@ function App() {
   const [eventsTotalPages, setEventsTotalPages] = useState(1);
   const [summaryFilters, setSummaryFilters] = useState<ActivitySummaryFilters>(defaultSummaryFilters);
 
+  async function loadAuthStatus() {
+    try {
+      setAuthStatus(await fetchJson<AuthStatusResponse>("/api/auth/status"));
+    } catch (statusError) {
+      console.warn("Falha ao consultar status de autenticacao.", statusError);
+      setAuthStatus({ enabled: false, configurationStatus: "unknown", loginMode: "api-key", updatedUtc: new Date().toISOString() });
+    }
+  }
+
   async function loadData() {
     setLoading(true);
     setError(null);
@@ -339,7 +396,7 @@ function App() {
           console.warn("Falha ao carregar anomalias de baseline.", anomalyError);
           return null;
         }),
-        fetchJson<AdminAuditEntry[]>("/api/admin-audit?take=100")
+        fetchJson<AdminAuditEntry[]>("/api/admin-audit?take=100").catch(() => [])
       ]);
 
       setHealth(healthResult);
@@ -362,10 +419,18 @@ function App() {
   }
 
   useEffect(() => {
+    loadAuthStatus();
+  }, []);
+
+  useEffect(() => {
+    if (authStatus?.enabled && !authUser) {
+      return undefined;
+    }
+
     loadData();
     const timer = window.setInterval(loadData, 30000);
     return () => window.clearInterval(timer);
-  }, [summaryFilters, eventsPage, eventFilter]);
+  }, [summaryFilters, eventsPage, eventFilter, authStatus?.enabled, authUser]);
 
   useEffect(() => {
     if (!notice) {
@@ -390,6 +455,24 @@ function App() {
   const safeEventsPage = Math.min(eventsPage, totalEventPages);
   const visibleDisplayedEvents = displayedEvents;
   const displayedEventCount = visibleDisplayedEvents.length;
+  const shouldShowLogin = authStatus?.enabled && !authUser;
+  const canAdmin = !authStatus?.enabled || authUser?.role === "admin";
+
+  function handleLogin(response: LoginResponse) {
+    localStorage.setItem(authTokenStorageKey, response.token);
+    localStorage.setItem(authUserStorageKey, JSON.stringify(response.user));
+    setAuthUser(response.user);
+    setNotice({ tone: "success", message: "Login corporativo realizado." });
+  }
+
+  function handleLogout() {
+    localStorage.removeItem(authTokenStorageKey);
+    localStorage.removeItem(authUserStorageKey);
+    setAuthUser(null);
+    setHealth(null);
+    setEvents([]);
+    setActiveTab("dashboard");
+  }
 
   useEffect(() => {
     setEventsPage((current) => Math.min(current, totalEventPages));
@@ -410,6 +493,10 @@ function App() {
     }),
     [safeEventsPage, totalEventPages, visibleDisplayedEvents.length, totalDisplayedEventCount]
   );
+
+  if (shouldShowLogin) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   return (
     <main className="app-shell">
@@ -447,6 +534,11 @@ function App() {
           <TabButton icon={<ClipboardList size={18} />} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} meta={adminAudit.length.toLocaleString("pt-BR")}>
             Auditoria
           </TabButton>
+          {canAdmin && (
+            <TabButton icon={<LockKeyhole size={18} />} active={activeTab === "auth"} onClick={() => setActiveTab("auth")} meta={authStatus?.enabled ? "AD" : "off"}>
+              LDAP/AD
+            </TabButton>
+          )}
         </nav>
       </aside>
 
@@ -466,6 +558,12 @@ function App() {
                 agentes {offlineAgents.length > 0 ? `${offlineAgents.length} atenção` : "estáveis"}
               </span>
             </div>
+            {authUser && (
+              <button className="text-button" type="button" onClick={handleLogout} title="Sair">
+                <LogOut size={16} />
+                {authUser.displayName}
+              </button>
+            )}
             <button className="icon-button" onClick={loadData} disabled={loading} title="Atualizar dados">
               <RefreshCcw size={18} />
             </button>
@@ -507,8 +605,253 @@ function App() {
         {activeTab === "paths" && <MonitoredPathsView paths={monitoredPaths} onChanged={loadData} onNotify={setNotice} />}
 
         {activeTab === "audit" && <AdminAuditView entries={adminAudit} />}
+
+        {activeTab === "auth" && <LdapAuthView onNotify={setNotice} onChanged={loadAuthStatus} />}
       </section>
     </main>
+  );
+}
+
+function LoginPage({ onLogin }: { onLogin: (response: LoginResponse) => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/auth/login`, {
+        method: "POST",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify({ username, password })
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Credenciais invalidas ou usuario sem grupo autorizado."));
+      }
+
+      onLogin((await response.json()) as LoginResponse);
+    } catch (loginError) {
+      setError(loginError instanceof Error ? loginError.message : "Nao foi possivel autenticar.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="login-shell">
+      <section className="login-visual" aria-label="Auditoria de arquivos">
+        <div className="login-visual-art">
+          <div className="server-stack">
+            <span />
+            <span />
+            <span />
+          </div>
+          <div className="shield-core">
+            <ShieldCheck size={82} />
+          </div>
+          <div className="audit-doc doc-a" />
+          <div className="audit-doc doc-b" />
+          <div className="audit-line line-a" />
+          <div className="audit-line line-b" />
+        </div>
+        <div className="login-copy">
+          <span>auditoria, rastreabilidade e evidencias</span>
+          <h1>Arquivos sob controle.</h1>
+          <p>Monitore criacoes, exclusoes, renomeacoes, acessos e movimentacoes em compartilhamentos corporativos.</p>
+        </div>
+      </section>
+
+      <section className="login-panel">
+        <div className="login-heading">
+          <div className="login-mark">
+            <ShieldAlert size={34} />
+          </div>
+          <div>
+            <span>FILE SERVER MONITOR</span>
+            <h2>Auditoria de Arquivos</h2>
+            <p>Acesso com credenciais institucionais ao painel de eventos, alertas e relatorios.</p>
+          </div>
+        </div>
+
+        <form className="login-card" onSubmit={submit}>
+          <span>Painel institucional</span>
+          <h3>Entrar</h3>
+          <label>
+            Usuario
+            <input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="Digite seu usuario institucional" autoComplete="username" />
+          </label>
+          <label>
+            Senha
+            <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Digite sua senha" type="password" autoComplete="current-password" />
+          </label>
+          {error && <div className="login-error">{error}</div>}
+          <button type="submit" disabled={submitting}>
+            {submitting ? "Validando..." : "Entrar"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | null) => void; onChanged: () => void }) {
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    fetchJson<AuthConfig>("/api/auth/config")
+      .then(setConfig)
+      .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar LDAP/AD." }));
+  }, [onNotify]);
+
+  function update<K extends keyof AuthConfig>(key: K, value: AuthConfig[K]) {
+    setConfig((current) => current ? { ...current, [key]: value } : current);
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+
+    if (!config) {
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/auth/config`, {
+        method: "PUT",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify(config)
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel salvar LDAP/AD."));
+      }
+
+      setConfig((await response.json()) as AuthConfig);
+      onChanged();
+      onNotify({ tone: "success", message: "Configuracao LDAP/AD salva." });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel salvar LDAP/AD." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!config) {
+    return <Panel title="LDAP/AD" subtitle="Carregando configuracao corporativa..." />;
+  }
+
+  return (
+    <div className="view-stack auth-view">
+      <section className="auth-hero">
+        <div>
+          <span>Controle de acesso</span>
+          <h2>Autenticacao LDAP/AD</h2>
+          <p>Defina a conexao com o Active Directory, mapeie grupos administrativos e valide o acesso corporativo antes de liberar o uso.</p>
+        </div>
+        <div className="auth-status-grid">
+          <StatusCard label="Integracao" value={config.enabled ? "Ativa" : "Inativa"} detail="Estado atual do login corporativo" />
+          <StatusCard label="Configuracao" value={config.configurationStatus === "complete" ? "Completa" : "Incompleta"} detail="Host, base DN e grupos" />
+          <StatusCard label="Modo de login" value={config.enabled ? "LDAP/AD" : "Chave API"} detail="Admin local fica como contingencia" />
+        </div>
+      </section>
+
+      <Panel title="Configuracao do acesso corporativo" subtitle="Preencha o servidor LDAP/AD, escolha o formato de autenticacao e informe os grupos que definem os perfis da aplicacao.">
+        <form className="auth-form" onSubmit={submit}>
+          <label className="check-row">
+            <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
+            Habilitar autenticacao LDAP/AD
+          </label>
+
+          <div className="form-grid four">
+            <label>
+              Host LDAP/AD
+              <input value={config.host} onChange={(event) => update("host", event.target.value)} placeholder="172.16.200.6" />
+            </label>
+            <label>
+              Porta
+              <input value={config.port} onChange={(event) => update("port", Number(event.target.value))} inputMode="numeric" />
+            </label>
+            <label>
+              Seguranca
+              <select value={config.security} onChange={(event) => update("security", event.target.value)}>
+                <option value="LDAPS">LDAPS</option>
+                <option value="LDAP">LDAP</option>
+              </select>
+            </label>
+            <label>
+              Timeout (segundos)
+              <input value={config.timeoutSeconds} onChange={(event) => update("timeoutSeconds", Number(event.target.value))} inputMode="numeric" />
+            </label>
+          </div>
+
+          <label>
+            Base DN
+            <input value={config.baseDn} onChange={(event) => update("baseDn", event.target.value)} placeholder="DC=tceal,DC=tc,DC=br" />
+          </label>
+
+          <div className="form-grid three">
+            <label>
+              Formato de bind
+              <select value={config.bindFormat} onChange={(event) => update("bindFormat", event.target.value)}>
+                <option value="DOMINIO\\usuario">DOMINIO\usuario</option>
+                <option value="usuario@dominio">usuario@dominio</option>
+                <option value="DN">DN informado pelo usuario</option>
+              </select>
+            </label>
+            <label>
+              Sufixo do dominio
+              <input value={config.domainSuffix} onChange={(event) => update("domainSuffix", event.target.value)} placeholder="tceal.tc.br" />
+            </label>
+            <label>
+              Dominio NetBIOS
+              <input value={config.netbiosDomain} onChange={(event) => update("netbiosDomain", event.target.value)} placeholder="tce-al" />
+            </label>
+          </div>
+
+          <div className="form-grid three">
+            <label>
+              Grupo Administrador
+              <input value={config.adminGroupDn} onChange={(event) => update("adminGroupDn", event.target.value)} placeholder="CN=FILESERV_ADMIN,OU=Grupos,DC=tceal,DC=tc,DC=br" />
+            </label>
+            <label>
+              Grupo Operador
+              <input value={config.operatorGroupDn} onChange={(event) => update("operatorGroupDn", event.target.value)} placeholder="CN=FILESERV_OPERADOR,OU=Grupos,DC=tceal,DC=tc,DC=br" />
+            </label>
+            <label>
+              Grupo Leitor
+              <input value={config.readerGroupDn} onChange={(event) => update("readerGroupDn", event.target.value)} placeholder="CN=FILESERV_LEITOR,OU=Grupos,DC=tceal,DC=tc,DC=br" />
+            </label>
+          </div>
+
+          <div className="auth-badges">
+            <span className="badge low">Configuracao salva</span>
+            <span className="badge info">Login comum via LDAP/AD</span>
+            <span className="badge neutral">Admin local para contingencia</span>
+          </div>
+
+          <button className="primary-button" type="submit" disabled={saving}>
+            <KeyRound size={18} />
+            {saving ? "Salvando..." : "Salvar configuracao"}
+          </button>
+        </form>
+      </Panel>
+    </div>
+  );
+}
+
+function StatusCard({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <article className="auth-status-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <p>{detail}</p>
+    </article>
   );
 }
 
@@ -2160,7 +2503,7 @@ function Metric({ icon, label, value, tone }: { icon: React.ReactNode; label: st
   );
 }
 
-function Panel({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
+function Panel({ title, subtitle, children }: { title: string; subtitle?: string; children?: React.ReactNode }) {
   return (
     <section className="panel">
       <header>
@@ -2656,9 +2999,14 @@ async function downloadCsv(url: string, fileName: string) {
 
 function buildHeaders() {
   const headers: Record<string, string> = {};
+  const token = localStorage.getItem(authTokenStorageKey);
 
   if (apiKey) {
     headers["X-Api-Key"] = apiKey;
+  }
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
   }
 
   if (actorName) {
@@ -2675,6 +3023,22 @@ function buildJsonHeaders() {
   };
 }
 
+function readStoredAuthUser() {
+  const raw = localStorage.getItem(authUserStorageKey);
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw) as AuthenticatedUser;
+  } catch {
+    localStorage.removeItem(authUserStorageKey);
+    localStorage.removeItem(authTokenStorageKey);
+    return null;
+  }
+}
+
 function titleForTab(tab: Tab) {
   const titles: Record<Tab, string> = {
     dashboard: "Dashboard",
@@ -2684,7 +3048,8 @@ function titleForTab(tab: Tab) {
     alerts: "Alertas",
     agents: "Agentes",
     paths: "Caminhos Monitorados",
-    audit: "Auditoria Administrativa"
+    audit: "Auditoria Administrativa",
+    auth: "LDAP/AD"
   };
 
   return titles[tab];

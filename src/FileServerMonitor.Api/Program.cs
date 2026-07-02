@@ -1,6 +1,10 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.DirectoryServices.Protocols;
+using System.Net;
 using System.Net.Http.Json;
+using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 #if SQLSERVER
@@ -20,6 +24,8 @@ builder.Services.AddSingleton<AlertRuleStore>();
 builder.Services.AddSingleton<AlertStore>();
 builder.Services.AddSingleton<MonitoredPathStore>();
 builder.Services.AddSingleton<AdminAuditStore>();
+builder.Services.AddSingleton<LdapAuthSettingsStore>();
+builder.Services.AddSingleton<LdapAuthenticator>();
 builder.Services.AddHostedService<RetentionWorker>();
 builder.Services.AddCors(options =>
 {
@@ -74,27 +80,39 @@ app.UseCors("WebApp");
 app.Use(async (context, next) =>
 {
     var authOptions = AuthOptions.FromConfiguration(context.RequestServices.GetRequiredService<IConfiguration>());
+    var ldapSettings = await context.RequestServices.GetRequiredService<LdapAuthSettingsStore>().GetAsync(context.RequestAborted);
+    var authRequired = authOptions.Enabled || ldapSettings.Enabled;
 
-    if (!authOptions.Enabled || AuthHelpers.IsAnonymousPath(context.Request.Path))
+    if (!authRequired || AuthHelpers.IsAnonymousPath(context.Request.Path))
     {
         await next(context);
         return;
     }
 
     var providedKey = AuthHelpers.GetProvidedApiKey(context.Request);
-    var requiresAdmin = AuthHelpers.RequiresAdminKey(context.Request);
+    var requiredRole = AuthHelpers.GetRequiredRole(context.Request);
+    var session = AuthSessionToken.TryValidate(
+        AuthHelpers.GetBearerToken(context.Request),
+        authOptions.GetSigningSecret());
 
-    if (!authOptions.MatchesAnyKey(providedKey))
+    if (!authOptions.MatchesAnyKey(providedKey) && session is null)
     {
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         await context.Response.WriteAsJsonAsync(new ErrorResponse("Nao autorizado."));
         return;
     }
 
-    if (requiresAdmin && !authOptions.MatchesAdminKey(providedKey))
+    if (session is not null)
+    {
+        context.User = session.ToPrincipal();
+    }
+
+    if (requiredRole is not null
+        && !authOptions.MatchesAdminKey(providedKey)
+        && !AuthHelpers.HasRequiredRole(session?.Role, requiredRole.Value))
     {
         context.Response.StatusCode = StatusCodes.Status403Forbidden;
-        await context.Response.WriteAsJsonAsync(new ErrorResponse("Chave administrativa obrigatoria."));
+        await context.Response.WriteAsJsonAsync(new ErrorResponse("Permissao insuficiente para esta operacao."));
         return;
     }
 
@@ -877,6 +895,67 @@ app.MapGet("/api/admin-audit", async (
         Take: take is > 0 and <= 500 ? take.Value : 100), cancellationToken);
 
     return Results.Ok(entries);
+});
+
+app.MapGet("/api/auth/status", async (
+    LdapAuthSettingsStore store,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+    return Results.Ok(AuthStatusResponse.FromSettings(settings));
+});
+
+app.MapPost("/api/auth/login", async (
+    LoginRequest request,
+    LdapAuthSettingsStore store,
+    LdapAuthenticator authenticator,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+
+    if (!settings.Enabled)
+    {
+        return Results.BadRequest(new ErrorResponse("Autenticacao LDAP/AD nao esta habilitada."));
+    }
+
+    var result = await authenticator.AuthenticateAsync(settings, request, cancellationToken);
+
+    if (!result.Success || result.User is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var token = AuthSessionToken.Create(result.User, AuthOptions.FromConfiguration(configuration).GetSigningSecret());
+    return Results.Ok(new LoginResponse(token, result.User, DateTimeOffset.UtcNow.AddHours(8)));
+});
+
+app.MapGet("/api/auth/config", async (
+    LdapAuthSettingsStore store,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+    return Results.Ok(AuthConfigResponse.FromSettings(settings));
+});
+
+app.MapPut("/api/auth/config", async (
+    LdapAuthSettingsRequest request,
+    LdapAuthSettingsStore store,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.SaveAsync(request, cancellationToken);
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "auth.ldap.update",
+        EntityType: "auth_settings",
+        EntityId: "ldap-ad",
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: AuthConfigResponse.FromSettings(settings)), cancellationToken);
+
+    return Results.Ok(AuthConfigResponse.FromSettings(settings));
 });
 
 app.MapPost("/api/monitored-paths", async (
@@ -5561,6 +5640,660 @@ internal sealed record MonitorOptions
     public int InMemoryMaxEvents { get; init; } = 10_000;
 }
 
+internal enum AuthRole
+{
+    Reader,
+    Operator,
+    Admin
+}
+
+internal sealed record LdapAuthSettings(
+    bool Enabled,
+    string Host,
+    int Port,
+    string Security,
+    int TimeoutSeconds,
+    string BaseDn,
+    string BindFormat,
+    string DomainSuffix,
+    string NetbiosDomain,
+    string AdminGroupDn,
+    string OperatorGroupDn,
+    string ReaderGroupDn,
+    DateTimeOffset UpdatedUtc)
+{
+    public static LdapAuthSettings Default => new(
+        Enabled: false,
+        Host: "",
+        Port: 636,
+        Security: "LDAPS",
+        TimeoutSeconds: 5,
+        BaseDn: "",
+        BindFormat: "DOMINIO\\usuario",
+        DomainSuffix: "",
+        NetbiosDomain: "",
+        AdminGroupDn: "",
+        OperatorGroupDn: "",
+        ReaderGroupDn: "",
+        UpdatedUtc: DateTimeOffset.UtcNow);
+}
+
+internal sealed record LdapAuthSettingsRequest(
+    bool Enabled,
+    string? Host,
+    int? Port,
+    string? Security,
+    int? TimeoutSeconds,
+    string? BaseDn,
+    string? BindFormat,
+    string? DomainSuffix,
+    string? NetbiosDomain,
+    string? AdminGroupDn,
+    string? OperatorGroupDn,
+    string? ReaderGroupDn);
+
+internal sealed record AuthConfigResponse(
+    bool Enabled,
+    string Host,
+    int Port,
+    string Security,
+    int TimeoutSeconds,
+    string BaseDn,
+    string BindFormat,
+    string DomainSuffix,
+    string NetbiosDomain,
+    string AdminGroupDn,
+    string OperatorGroupDn,
+    string ReaderGroupDn,
+    string ConfigurationStatus,
+    string LoginMode,
+    DateTimeOffset UpdatedUtc)
+{
+    public static AuthConfigResponse FromSettings(LdapAuthSettings settings)
+    {
+        return new AuthConfigResponse(
+            settings.Enabled,
+            settings.Host,
+            settings.Port,
+            settings.Security,
+            settings.TimeoutSeconds,
+            settings.BaseDn,
+            settings.BindFormat,
+            settings.DomainSuffix,
+            settings.NetbiosDomain,
+            settings.AdminGroupDn,
+            settings.OperatorGroupDn,
+            settings.ReaderGroupDn,
+            settings.IsComplete() ? "complete" : "incomplete",
+            settings.Enabled ? "ldap-ad" : "api-key",
+            settings.UpdatedUtc);
+    }
+}
+
+internal sealed record AuthStatusResponse(
+    bool Enabled,
+    string ConfigurationStatus,
+    string LoginMode,
+    DateTimeOffset UpdatedUtc)
+{
+    public static AuthStatusResponse FromSettings(LdapAuthSettings settings)
+    {
+        return new AuthStatusResponse(
+            settings.Enabled,
+            settings.IsComplete() ? "complete" : "incomplete",
+            settings.Enabled ? "ldap-ad" : "api-key",
+            settings.UpdatedUtc);
+    }
+}
+
+internal sealed record LoginRequest(string? Username, string? Password);
+
+internal sealed record AuthenticatedUser(
+    string Username,
+    string DisplayName,
+    string DistinguishedName,
+    string Role,
+    IReadOnlyCollection<string> Groups);
+
+internal sealed record LoginResponse(string Token, AuthenticatedUser User, DateTimeOffset ExpiresUtc);
+
+internal sealed record LdapAuthResult(bool Success, AuthenticatedUser? User, string? Error)
+{
+    public static LdapAuthResult Failed(string error) => new(false, null, error);
+}
+
+internal static class LdapAuthSettingsExtensions
+{
+    public static bool IsComplete(this LdapAuthSettings settings)
+    {
+        return !string.IsNullOrWhiteSpace(settings.Host)
+            && !string.IsNullOrWhiteSpace(settings.BaseDn)
+            && !string.IsNullOrWhiteSpace(settings.AdminGroupDn)
+            && !string.IsNullOrWhiteSpace(settings.OperatorGroupDn)
+            && !string.IsNullOrWhiteSpace(settings.ReaderGroupDn);
+    }
+}
+
+internal sealed class LdapAuthSettingsStore
+{
+    private LdapAuthSettings _settings = LdapAuthSettings.Default;
+#if SQLSERVER
+    private readonly bool _persistSettings;
+    private readonly string? _connectionString;
+#endif
+
+    public LdapAuthSettingsStore(IConfiguration configuration)
+    {
+#if SQLSERVER
+        _persistSettings = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+
+        _settings = Normalize(new LdapAuthSettingsRequest(
+            Enabled: configuration.GetValue("Auth:Ldap:Enabled", false),
+            Host: configuration.GetValue<string>("Auth:Ldap:Host"),
+            Port: configuration.GetValue<int?>("Auth:Ldap:Port"),
+            Security: configuration.GetValue<string>("Auth:Ldap:Security"),
+            TimeoutSeconds: configuration.GetValue<int?>("Auth:Ldap:TimeoutSeconds"),
+            BaseDn: configuration.GetValue<string>("Auth:Ldap:BaseDn"),
+            BindFormat: configuration.GetValue<string>("Auth:Ldap:BindFormat"),
+            DomainSuffix: configuration.GetValue<string>("Auth:Ldap:DomainSuffix"),
+            NetbiosDomain: configuration.GetValue<string>("Auth:Ldap:NetbiosDomain"),
+            AdminGroupDn: configuration.GetValue<string>("Auth:Ldap:AdminGroupDn"),
+            OperatorGroupDn: configuration.GetValue<string>("Auth:Ldap:OperatorGroupDn"),
+            ReaderGroupDn: configuration.GetValue<string>("Auth:Ldap:ReaderGroupDn")));
+    }
+
+    public async Task<LdapAuthSettings> GetAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            var persisted = await ReadSqlAsync(cancellationToken);
+            if (persisted is not null)
+            {
+                _settings = persisted;
+            }
+        }
+#endif
+
+        return _settings;
+    }
+
+    public async Task<LdapAuthSettings> SaveAsync(LdapAuthSettingsRequest request, CancellationToken cancellationToken)
+    {
+        var settings = Normalize(request);
+        _settings = settings;
+
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            await UpsertSqlAsync(settings, cancellationToken);
+        }
+#endif
+
+        return settings;
+    }
+
+    private static LdapAuthSettings Normalize(LdapAuthSettingsRequest request)
+    {
+        var security = NormalizeSecurity(request.Security);
+        var port = request.Port is > 0 and <= 65535
+            ? request.Port.Value
+            : security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase) ? 636 : 389;
+
+        return new LdapAuthSettings(
+            Enabled: request.Enabled,
+            Host: Trim(request.Host),
+            Port: port,
+            Security: security,
+            TimeoutSeconds: Math.Clamp(request.TimeoutSeconds ?? 5, 1, 60),
+            BaseDn: Trim(request.BaseDn),
+            BindFormat: string.IsNullOrWhiteSpace(request.BindFormat) ? "DOMINIO\\usuario" : request.BindFormat.Trim(),
+            DomainSuffix: Trim(request.DomainSuffix),
+            NetbiosDomain: Trim(request.NetbiosDomain),
+            AdminGroupDn: Trim(request.AdminGroupDn),
+            OperatorGroupDn: Trim(request.OperatorGroupDn),
+            ReaderGroupDn: Trim(request.ReaderGroupDn),
+            UpdatedUtc: DateTimeOffset.UtcNow);
+    }
+
+    private static string NormalizeSecurity(string? value)
+    {
+        var security = string.IsNullOrWhiteSpace(value) ? "LDAPS" : value.Trim().ToUpperInvariant();
+        return security is "LDAP" or "LDAPS" ? security : "LDAPS";
+    }
+
+    private static string Trim(string? value) => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim();
+
+#if SQLSERVER
+    private async Task<LdapAuthSettings?> ReadSqlAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
+                SELECT CAST(NULL AS BIT) AS Enabled WHERE 1 = 0;
+            ELSE
+                SELECT TOP (1)
+                    Enabled,
+                    HostName,
+                    PortNumber,
+                    SecurityMode,
+                    TimeoutSeconds,
+                    BaseDn,
+                    BindFormat,
+                    DomainSuffix,
+                    NetbiosDomain,
+                    AdminGroupDn,
+                    OperatorGroupDn,
+                    ReaderGroupDn,
+                    UpdatedUtc
+                FROM dbo.LdapAuthSettings
+                WHERE Id = 1;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSettings(reader) : null;
+    }
+
+    private async Task UpsertSqlAsync(LdapAuthSettings settings, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.LdapAuthSettings
+                (
+                    Id INT NOT NULL CONSTRAINT PK_LdapAuthSettings PRIMARY KEY,
+                    Enabled BIT NOT NULL,
+                    HostName NVARCHAR(256) NOT NULL,
+                    PortNumber INT NOT NULL,
+                    SecurityMode NVARCHAR(16) NOT NULL,
+                    TimeoutSeconds INT NOT NULL,
+                    BaseDn NVARCHAR(1024) NOT NULL,
+                    BindFormat NVARCHAR(64) NOT NULL,
+                    DomainSuffix NVARCHAR(256) NOT NULL,
+                    NetbiosDomain NVARCHAR(128) NOT NULL,
+                    AdminGroupDn NVARCHAR(1024) NOT NULL,
+                    OperatorGroupDn NVARCHAR(1024) NOT NULL,
+                    ReaderGroupDn NVARCHAR(1024) NOT NULL,
+                    UpdatedUtc DATETIME2(3) NOT NULL
+                );
+            END;
+
+            MERGE dbo.LdapAuthSettings AS target
+            USING (SELECT 1 AS Id) AS source
+                ON target.Id = source.Id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    Enabled = @Enabled,
+                    HostName = @HostName,
+                    PortNumber = @PortNumber,
+                    SecurityMode = @SecurityMode,
+                    TimeoutSeconds = @TimeoutSeconds,
+                    BaseDn = @BaseDn,
+                    BindFormat = @BindFormat,
+                    DomainSuffix = @DomainSuffix,
+                    NetbiosDomain = @NetbiosDomain,
+                    AdminGroupDn = @AdminGroupDn,
+                    OperatorGroupDn = @OperatorGroupDn,
+                    ReaderGroupDn = @ReaderGroupDn,
+                    UpdatedUtc = @UpdatedUtc
+            WHEN NOT MATCHED THEN
+                INSERT
+                (
+                    Id,
+                    Enabled,
+                    HostName,
+                    PortNumber,
+                    SecurityMode,
+                    TimeoutSeconds,
+                    BaseDn,
+                    BindFormat,
+                    DomainSuffix,
+                    NetbiosDomain,
+                    AdminGroupDn,
+                    OperatorGroupDn,
+                    ReaderGroupDn,
+                    UpdatedUtc
+                )
+                VALUES
+                (
+                    1,
+                    @Enabled,
+                    @HostName,
+                    @PortNumber,
+                    @SecurityMode,
+                    @TimeoutSeconds,
+                    @BaseDn,
+                    @BindFormat,
+                    @DomainSuffix,
+                    @NetbiosDomain,
+                    @AdminGroupDn,
+                    @OperatorGroupDn,
+                    @ReaderGroupDn,
+                    @UpdatedUtc
+                );
+            """;
+        AddParameters(command, settings);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private SqlConnection CreateSqlConnection()
+    {
+        if (string.IsNullOrWhiteSpace(_connectionString))
+        {
+            throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+        }
+
+        return new SqlConnection(_connectionString);
+    }
+
+    private static void AddParameters(SqlCommand command, LdapAuthSettings settings)
+    {
+        command.Parameters.AddWithValue("@Enabled", settings.Enabled);
+        command.Parameters.AddWithValue("@HostName", settings.Host);
+        command.Parameters.AddWithValue("@PortNumber", settings.Port);
+        command.Parameters.AddWithValue("@SecurityMode", settings.Security);
+        command.Parameters.AddWithValue("@TimeoutSeconds", settings.TimeoutSeconds);
+        command.Parameters.AddWithValue("@BaseDn", settings.BaseDn);
+        command.Parameters.AddWithValue("@BindFormat", settings.BindFormat);
+        command.Parameters.AddWithValue("@DomainSuffix", settings.DomainSuffix);
+        command.Parameters.AddWithValue("@NetbiosDomain", settings.NetbiosDomain);
+        command.Parameters.AddWithValue("@AdminGroupDn", settings.AdminGroupDn);
+        command.Parameters.AddWithValue("@OperatorGroupDn", settings.OperatorGroupDn);
+        command.Parameters.AddWithValue("@ReaderGroupDn", settings.ReaderGroupDn);
+        command.Parameters.AddWithValue("@UpdatedUtc", settings.UpdatedUtc.UtcDateTime);
+    }
+
+    private static LdapAuthSettings ReadSettings(SqlDataReader reader)
+    {
+        return new LdapAuthSettings(
+            Enabled: reader.GetBoolean(reader.GetOrdinal("Enabled")),
+            Host: reader.GetString(reader.GetOrdinal("HostName")),
+            Port: reader.GetInt32(reader.GetOrdinal("PortNumber")),
+            Security: reader.GetString(reader.GetOrdinal("SecurityMode")),
+            TimeoutSeconds: reader.GetInt32(reader.GetOrdinal("TimeoutSeconds")),
+            BaseDn: reader.GetString(reader.GetOrdinal("BaseDn")),
+            BindFormat: reader.GetString(reader.GetOrdinal("BindFormat")),
+            DomainSuffix: reader.GetString(reader.GetOrdinal("DomainSuffix")),
+            NetbiosDomain: reader.GetString(reader.GetOrdinal("NetbiosDomain")),
+            AdminGroupDn: reader.GetString(reader.GetOrdinal("AdminGroupDn")),
+            OperatorGroupDn: reader.GetString(reader.GetOrdinal("OperatorGroupDn")),
+            ReaderGroupDn: reader.GetString(reader.GetOrdinal("ReaderGroupDn")),
+            UpdatedUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("UpdatedUtc")), DateTimeKind.Utc)));
+    }
+#endif
+}
+
+internal sealed class LdapAuthenticator
+{
+    public Task<LdapAuthResult> AuthenticateAsync(
+        LdapAuthSettings settings,
+        LoginRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
+        {
+            return Task.FromResult(LdapAuthResult.Failed("Usuario e senha sao obrigatorios."));
+        }
+
+        if (!settings.IsComplete())
+        {
+            return Task.FromResult(LdapAuthResult.Failed("Configuracao LDAP/AD incompleta."));
+        }
+
+        try
+        {
+            var loginName = BuildBindName(settings, request.Username.Trim());
+            using var connection = CreateConnection(settings);
+            connection.AuthType = AuthType.Basic;
+            connection.Bind(new NetworkCredential(loginName, request.Password));
+
+            var user = SearchUser(connection, settings, request.Username.Trim());
+            if (user is null)
+            {
+                return Task.FromResult(LdapAuthResult.Failed("Usuario autenticado, mas nao encontrado no diretorio."));
+            }
+
+            if (!TryResolveRole(settings, user.Groups, out var role))
+            {
+                return Task.FromResult(LdapAuthResult.Failed("Usuario sem grupo autorizado."));
+            }
+
+            return Task.FromResult(new LdapAuthResult(
+                true,
+                user with { Role = role.ToString().ToLowerInvariant() },
+                null));
+        }
+        catch (Exception ex) when (ex is LdapException or DirectoryOperationException or InvalidOperationException)
+        {
+            return Task.FromResult(LdapAuthResult.Failed(ex.Message));
+        }
+    }
+
+    private static LdapConnection CreateConnection(LdapAuthSettings settings)
+    {
+        var identifier = new LdapDirectoryIdentifier(settings.Host, settings.Port, fullyQualifiedDnsHostName: false, connectionless: false);
+        var connection = new LdapConnection(identifier)
+        {
+            Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
+        };
+
+        connection.SessionOptions.ProtocolVersion = 3;
+
+        if (settings.Security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase))
+        {
+            connection.SessionOptions.SecureSocketLayer = true;
+        }
+
+        return connection;
+    }
+
+    private static string BuildBindName(LdapAuthSettings settings, string username)
+    {
+        if (username.Contains('\\') || username.Contains('@') || username.Contains("=", StringComparison.Ordinal))
+        {
+            return username;
+        }
+
+        return settings.BindFormat switch
+        {
+            "usuario@dominio" when !string.IsNullOrWhiteSpace(settings.DomainSuffix) => $"{username}@{settings.DomainSuffix}",
+            "DN" => username,
+            _ when !string.IsNullOrWhiteSpace(settings.NetbiosDomain) => $"{settings.NetbiosDomain}\\{username}",
+            _ when !string.IsNullOrWhiteSpace(settings.DomainSuffix) => $"{username}@{settings.DomainSuffix}",
+            _ => username
+        };
+    }
+
+    private static AuthenticatedUser? SearchUser(LdapConnection connection, LdapAuthSettings settings, string username)
+    {
+        var accountName = username.Contains('\\') ? username.Split('\\').Last() : username.Split('@').First();
+        var filter = $"(|(sAMAccountName={EscapeLdapFilter(accountName)})(userPrincipalName={EscapeLdapFilter(username)}))";
+        var request = new SearchRequest(
+            settings.BaseDn,
+            filter,
+            SearchScope.Subtree,
+            "displayName",
+            "distinguishedName",
+            "memberOf",
+            "sAMAccountName",
+            "userPrincipalName");
+        var response = (SearchResponse)connection.SendRequest(request);
+        var entry = response.Entries.Cast<SearchResultEntry>().FirstOrDefault();
+
+        if (entry is null)
+        {
+            return null;
+        }
+
+        var groups = GetAttributeValues(entry, "memberOf");
+        var displayName = GetAttributeValue(entry, "displayName")
+            ?? GetAttributeValue(entry, "sAMAccountName")
+            ?? accountName;
+        var distinguishedName = GetAttributeValue(entry, "distinguishedName") ?? string.Empty;
+
+        return new AuthenticatedUser(accountName, displayName, distinguishedName, "reader", groups);
+    }
+
+    private static bool TryResolveRole(LdapAuthSettings settings, IReadOnlyCollection<string> groups, out AuthRole role)
+    {
+        if (ContainsGroup(groups, settings.AdminGroupDn))
+        {
+            role = AuthRole.Admin;
+            return true;
+        }
+
+        if (ContainsGroup(groups, settings.OperatorGroupDn))
+        {
+            role = AuthRole.Operator;
+            return true;
+        }
+
+        if (ContainsGroup(groups, settings.ReaderGroupDn))
+        {
+            role = AuthRole.Reader;
+            return true;
+        }
+
+        role = AuthRole.Reader;
+        return false;
+    }
+
+    private static bool ContainsGroup(IEnumerable<string> groups, string configuredGroup)
+    {
+        return !string.IsNullOrWhiteSpace(configuredGroup)
+            && groups.Any(group => group.Equals(configuredGroup, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? GetAttributeValue(SearchResultEntry entry, string name)
+    {
+        return entry.Attributes.Contains(name) && entry.Attributes[name].Count > 0
+            ? entry.Attributes[name][0]?.ToString()
+            : null;
+    }
+
+    private static IReadOnlyCollection<string> GetAttributeValues(SearchResultEntry entry, string name)
+    {
+        if (!entry.Attributes.Contains(name))
+        {
+            return Array.Empty<string>();
+        }
+
+        return entry.Attributes[name]
+            .Cast<object>()
+            .Select(value => value.ToString())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Cast<string>()
+            .ToArray();
+    }
+
+    private static string EscapeLdapFilter(string value)
+    {
+        return value
+            .Replace("\\", "\\5c", StringComparison.Ordinal)
+            .Replace("*", "\\2a", StringComparison.Ordinal)
+            .Replace("(", "\\28", StringComparison.Ordinal)
+            .Replace(")", "\\29", StringComparison.Ordinal)
+            .Replace("\0", "\\00", StringComparison.Ordinal);
+    }
+}
+
+internal sealed record AuthSessionPayload(
+    string Username,
+    string DisplayName,
+    string DistinguishedName,
+    string Role,
+    IReadOnlyCollection<string> Groups,
+    long ExpiresUnixSeconds)
+{
+    public ClaimsPrincipal ToPrincipal()
+    {
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.Name, Username),
+            new(ClaimTypes.GivenName, DisplayName),
+            new(ClaimTypes.Role, Role)
+        };
+
+        claims.AddRange(Groups.Select(group => new Claim("ad_group", group)));
+        return new ClaimsPrincipal(new ClaimsIdentity(claims, "ldap-ad"));
+    }
+}
+
+internal static class AuthSessionToken
+{
+    public static string Create(AuthenticatedUser user, string secret)
+    {
+        var payload = new AuthSessionPayload(
+            user.Username,
+            user.DisplayName,
+            user.DistinguishedName,
+            user.Role,
+            user.Groups,
+            DateTimeOffset.UtcNow.AddHours(8).ToUnixTimeSeconds());
+        var json = JsonSerializer.Serialize(payload);
+        var body = Base64UrlEncode(Encoding.UTF8.GetBytes(json));
+        var signature = Sign(body, secret);
+
+        return $"{body}.{signature}";
+    }
+
+    public static AuthSessionPayload? TryValidate(string? token, string secret)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return null;
+        }
+
+        var parts = token.Split('.', 2);
+        if (parts.Length != 2 || !CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(Sign(parts[0], secret)),
+            Encoding.UTF8.GetBytes(parts[1])))
+        {
+            return null;
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<AuthSessionPayload>(Encoding.UTF8.GetString(Base64UrlDecode(parts[0])));
+            return payload is not null && payload.ExpiresUnixSeconds > DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                ? payload
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string Sign(string body, string secret)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        return Base64UrlEncode(hmac.ComputeHash(Encoding.UTF8.GetBytes(body)));
+    }
+
+    private static string Base64UrlEncode(byte[] bytes)
+    {
+        return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
+    private static byte[] Base64UrlDecode(string value)
+    {
+        var padded = value.Replace('-', '+').Replace('_', '/');
+        padded = padded.PadRight(padded.Length + (4 - padded.Length % 4) % 4, '=');
+        return Convert.FromBase64String(padded);
+    }
+}
+
 internal sealed record AuthOptions(bool Enabled, string? ApiKey, string? AdminApiKey)
 {
     public static AuthOptions FromConfiguration(IConfiguration configuration)
@@ -5582,7 +6315,14 @@ internal sealed record AuthOptions(bool Enabled, string? ApiKey, string? AdminAp
         return Matches(GetEffectiveAdminApiKey(), providedKey);
     }
 
-    private string? GetEffectiveAdminApiKey()
+    public string GetSigningSecret()
+    {
+        return GetEffectiveAdminApiKey()
+            ?? ApiKey
+            ?? "fileserver-monitor-local-session-development-secret";
+    }
+
+    public string? GetEffectiveAdminApiKey()
     {
         return string.IsNullOrWhiteSpace(AdminApiKey) ? ApiKey : AdminApiKey;
     }
@@ -5600,35 +6340,55 @@ internal static class AuthHelpers
     {
         return path == "/"
             || path.StartsWithSegments("/health")
-            || path.StartsWithSegments("/metrics");
+            || path.StartsWithSegments("/metrics")
+            || path.StartsWithSegments("/api/auth/login")
+            || path.StartsWithSegments("/api/auth/status");
     }
 
-    public static bool RequiresAdminKey(HttpRequest request)
+    public static AuthRole? GetRequiredRole(HttpRequest request)
     {
         if (request.Path.StartsWithSegments("/api/admin-audit"))
         {
-            return true;
+            return AuthRole.Admin;
         }
 
-        if (request.Path.StartsWithSegments("/api/alerts")
-            && HttpMethods.IsPost(request.Method))
+        if (request.Path.StartsWithSegments("/api/auth/config") && !HttpMethods.IsGet(request.Method))
         {
-            return true;
+            return AuthRole.Admin;
         }
 
-        if (request.Path.StartsWithSegments("/api/alert-rules")
-            && !HttpMethods.IsGet(request.Method))
+        if (request.Path.StartsWithSegments("/api/alerts") && HttpMethods.IsPost(request.Method))
         {
-            return true;
+            return AuthRole.Operator;
         }
 
-        if (request.Path.StartsWithSegments("/api/monitored-paths")
-            && !HttpMethods.IsGet(request.Method))
+        if (request.Path.StartsWithSegments("/api/alert-rules") && !HttpMethods.IsGet(request.Method))
         {
-            return true;
+            return AuthRole.Operator;
         }
 
-        return false;
+        if (request.Path.StartsWithSegments("/api/monitored-paths") && !HttpMethods.IsGet(request.Method))
+        {
+            return AuthRole.Operator;
+        }
+
+        return null;
+    }
+
+    public static bool HasRequiredRole(string? actualRole, AuthRole requiredRole)
+    {
+        return GetRoleWeight(actualRole) >= GetRoleWeight(requiredRole.ToString());
+    }
+
+    private static int GetRoleWeight(string? role)
+    {
+        return role?.ToLowerInvariant() switch
+        {
+            "admin" => 3,
+            "operator" => 2,
+            "reader" => 1,
+            _ => 0
+        };
     }
 
     public static string? GetProvidedApiKey(HttpRequest request)
@@ -5647,6 +6407,16 @@ internal static class AuthHelpers
         }
 
         return null;
+    }
+
+    public static string? GetBearerToken(HttpRequest request)
+    {
+        var authorization = request.Headers.Authorization.FirstOrDefault();
+
+        return !string.IsNullOrWhiteSpace(authorization)
+            && authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+            ? authorization["Bearer ".Length..].Trim()
+            : null;
     }
 }
 

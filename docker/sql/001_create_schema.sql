@@ -459,3 +459,25 @@ BEGIN
     CREATE INDEX IX_AdminAuditLog_Action_Entity_Time ON dbo.AdminAuditLog (ActionName, EntityType, TimestampUtc DESC);
 END;
 GO
+
+IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.LdapAuthSettings
+    (
+        Id INT NOT NULL CONSTRAINT PK_LdapAuthSettings PRIMARY KEY,
+        Enabled BIT NOT NULL,
+        HostName NVARCHAR(256) NOT NULL,
+        PortNumber INT NOT NULL,
+        SecurityMode NVARCHAR(16) NOT NULL,
+        TimeoutSeconds INT NOT NULL,
+        BaseDn NVARCHAR(1024) NOT NULL,
+        BindFormat NVARCHAR(64) NOT NULL,
+        DomainSuffix NVARCHAR(256) NOT NULL,
+        NetbiosDomain NVARCHAR(128) NOT NULL,
+        AdminGroupDn NVARCHAR(1024) NOT NULL,
+        OperatorGroupDn NVARCHAR(1024) NOT NULL,
+        ReaderGroupDn NVARCHAR(1024) NOT NULL,
+        UpdatedUtc DATETIME2(3) NOT NULL
+    );
+END;
+GO
