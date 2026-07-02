@@ -966,20 +966,28 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
 
   const eventTime = new Date(event.timestampUtc).getTime();
   const eventPath = normalizePath(event.path);
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && (candidate.action === "created"
-      || candidate.action === "created_or_appended"
-      || candidate.action === "renamed"
-      || candidate.action === "moved"
-      || candidate.action === "deleted")
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
-    && (
-      pathsReferToSameItem(candidate.path, event.path)
-      || pathsReferToSameItem(candidate.previousPath, event.path)
-      || eventPath === normalizePath(getParentPath(candidate.path))
-      || eventPath === normalizePath(getParentPath(candidate.previousPath ?? ""))
-    ));
+  return allEvents.some((candidate) => {
+    if (candidate.id === event.id
+      || (candidate.action !== "created"
+        && candidate.action !== "created_or_appended"
+        && candidate.action !== "renamed"
+        && candidate.action !== "moved"
+        && candidate.action !== "deleted")) {
+      return false;
+    }
+
+    const candidateWindowMs = candidate.action === "created" || candidate.action === "created_or_appended"
+      ? 5_000
+      : 10_000;
+
+    return Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= candidateWindowMs
+      && (
+        pathsReferToSameItem(candidate.path, event.path)
+        || pathsReferToSameItem(candidate.previousPath, event.path)
+        || eventPath === normalizePath(getParentPath(candidate.path))
+        || eventPath === normalizePath(getParentPath(candidate.previousPath ?? ""))
+      );
+  });
 }
 
 function deduplicateRawEvents(events: FileAuditEvent[]) {

@@ -166,6 +166,28 @@ test("does not let a near creation access echo replace the creation", () => {
   assert.deepEqual(display.map((event) => event.displayAction), ["Criação"]);
 });
 
+test("keeps a real access several seconds after creation", () => {
+  const path = "C:\\Corporativo\\codex-access-action\\access-root.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "created",
+      timestampUtc: "2026-07-02T02:52:12.000Z",
+      path,
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "accessed",
+      timestampUtc: "2026-07-02T02:52:20.000Z",
+      path,
+      action: "accessed",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => event.displayAction), ["Acessado", "Criação"]);
+});
+
 test("suppresses access and mojibake security creation echoes near a usn creation", () => {
   const correctPath = "C:\\Corporativo\\Anderson Fábio Costa Bandeira - Sobreaviso XX-2026.xlsx";
   const mojibakePath = "C:\\Corporativo\\Anderson F�bio Costa Bandeira - Sobreaviso XX-2026.xlsx";
@@ -700,6 +722,45 @@ test("suppresses access echoes immediately after a normal rename", () => {
   assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [
     ["C:\\Corporativo\\codex-client-check-010.txt", "Renomeado"],
     ["C:\\Corporativo\\codex-client-check-01.txt", "Criação"]
+  ]);
+});
+
+test("suppresses folder navigation echoes shortly before descendant renames", () => {
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "folder-access-kept",
+      timestampUtc: "2026-07-02T02:44:00.763Z",
+      path: "C:\\Corporativo\\Nova pasta",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "folder-access-echo",
+      timestampUtc: "2026-07-02T02:44:05.690Z",
+      path: "C:\\Corporativo\\Nova pasta",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "child-folder-access-echo",
+      timestampUtc: "2026-07-02T02:44:05.663Z",
+      path: "C:\\Corporativo\\Nova pasta\\Nova pasta",
+      action: "accessed",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "nested-folder-renamed",
+      timestampUtc: "2026-07-02T02:44:12.510Z",
+      path: "C:\\Corporativo\\Nova pasta\\Nova pasta - 10",
+      previousPath: "C:\\Corporativo\\Nova pasta\\Nova pasta",
+      action: "renamed",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.path]), [
+    ["Renomeado", "C:\\Corporativo\\Nova pasta\\Nova pasta - 10"],
+    ["Acessado", "C:\\Corporativo\\Nova pasta"]
   ]);
 });
 
