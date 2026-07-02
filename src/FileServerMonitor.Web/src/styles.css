@@ -822,7 +822,7 @@ tbody tr:hover {
 
 .agent-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(360px, 460px));
   gap: 14px;
   padding: 16px;
 }
@@ -831,6 +831,7 @@ tbody tr:hover {
   border: 1px solid #d9e0e7;
   border-radius: 8px;
   padding: 16px;
+  width: 100%;
 }
 
 .agent-header {
@@ -1214,6 +1215,7 @@ dd {
   .split-grid,
   .analytics-grid,
   .report-filters,
+  .agent-grid,
   .report-card-grid {
     grid-template-columns: 1fr;
   }
