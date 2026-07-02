@@ -64,6 +64,32 @@ BEGIN
 END;
 GO
 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditEvents_Timeline_Recent' AND object_id = OBJECT_ID(N'dbo.FileAuditEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditEvents_Timeline_Recent
+    ON dbo.FileAuditEvents (TimestampUtc DESC)
+    INCLUDE
+    (
+        ServerName,
+        ShareName,
+        FullPath,
+        PreviousPath,
+        ObjectType,
+        ActionName,
+        UserName,
+        Sid,
+        SourceHost,
+        SourceIp,
+        ProcessName,
+        FileSizeBytes,
+        Extension,
+        ResultName,
+        Severity,
+        SourceName
+    );
+END;
+GO
+
 IF OBJECT_ID(N'dbo.AgentHeartbeats', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AgentHeartbeats

@@ -207,6 +207,61 @@ app.MapGet("/api/events/timeline", async (
     return Results.Ok(timeline);
 });
 
+app.MapGet("/api/events/timeline/page", async (
+    string? server,
+    string? user,
+    string? action,
+    string? path,
+    string? search,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    int? page,
+    int? pageSize,
+    int? windowTake,
+    IEventRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    var safePage = Math.Max(1, page ?? 1);
+    var safePageSize = pageSize is > 0 and <= 100 ? pageSize.Value : 25;
+    var minimumWindow = safePage * safePageSize * 4;
+    var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 10_000);
+    var query = new EventQuery(
+        Server: server,
+        User: null,
+        Action: null,
+        Path: path,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: safeWindowTake);
+
+    var events = await repository.QueryAsync(query, cancellationToken);
+    var filteredTimeline = new FileServerMonitor.Core.EventTimelineProjector()
+        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
+        .Select(ToApiDisplayEvent)
+        .Where(item => string.IsNullOrWhiteSpace(user)
+            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
+        .Where(item => string.IsNullOrWhiteSpace(action)
+            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
+            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
+        .Where(item => MatchesTimelineSearch(item, search))
+        .ToArray();
+    var totalItems = filteredTimeline.Length;
+    var totalPages = Math.Max(1, (int)Math.Ceiling(totalItems / (double)safePageSize));
+    var clampedPage = Math.Min(safePage, totalPages);
+    var items = filteredTimeline
+        .Skip((clampedPage - 1) * safePageSize)
+        .Take(safePageSize)
+        .ToArray();
+
+    return Results.Ok(new TimelinePageResponse(
+        Items: items,
+        Page: clampedPage,
+        PageSize: safePageSize,
+        TotalItems: totalItems,
+        TotalPages: totalPages,
+        WindowRawEvents: events.Count));
+});
+
 app.MapGet("/api/events/export.csv", async (
     string? server,
     string? user,
@@ -684,6 +739,24 @@ static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditD
         auditEvent.Source,
         auditEvent.DisplayAction,
         auditEvent.DisplayTarget);
+}
+
+static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? search)
+{
+    if (string.IsNullOrWhiteSpace(search))
+    {
+        return true;
+    }
+
+    var needle = search.Trim();
+    return auditEvent.Server.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || auditEvent.Share.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || auditEvent.Path.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || (auditEvent.PreviousPath?.Contains(needle, StringComparison.OrdinalIgnoreCase) ?? false)
+        || auditEvent.User.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || auditEvent.Action.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || auditEvent.DisplayAction.Contains(needle, StringComparison.OrdinalIgnoreCase)
+        || auditEvent.Source.Contains(needle, StringComparison.OrdinalIgnoreCase);
 }
 
 internal interface IEventRepository
@@ -4249,6 +4322,14 @@ internal sealed record FileAuditDisplayEvent(
     string Source,
     string DisplayAction,
     string DisplayTarget);
+
+internal sealed record TimelinePageResponse(
+    IReadOnlyCollection<FileAuditDisplayEvent> Items,
+    int Page,
+    int PageSize,
+    int TotalItems,
+    int TotalPages,
+    int WindowRawEvents);
 
 internal sealed record FileAuditEventRequest(
     DateTimeOffset? TimestampUtc,

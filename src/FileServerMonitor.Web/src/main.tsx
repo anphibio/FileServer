@@ -59,6 +59,15 @@ type DisplayEvent = FileAuditEvent & {
   displayTarget?: string;
 };
 
+type TimelinePageResponse = {
+  items: DisplayEvent[];
+  page: number;
+  pageSize: number;
+  totalItems: number;
+  totalPages: number;
+  windowRawEvents: number;
+};
+
 type PaginationState = {
   page: number;
   totalPages: number;
@@ -271,6 +280,8 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [eventFilter, setEventFilter] = useState("");
   const [eventsPage, setEventsPage] = useState(1);
+  const [eventsTotalItems, setEventsTotalItems] = useState(0);
+  const [eventsTotalPages, setEventsTotalPages] = useState(1);
   const [summaryFilters, setSummaryFilters] = useState<ActivitySummaryFilters>(defaultSummaryFilters);
 
   async function loadData() {
@@ -280,7 +291,7 @@ function App() {
     try {
       const [healthResult, eventsResult, alertsResult, alertRulesResult, agentsResult, pathsResult, summaryResult, anomaliesResult, auditResult] = await Promise.all([
         fetchJson<HealthResponse>("/health"),
-        fetchJson<DisplayEvent[]>("/api/events/timeline?take=5000"),
+        fetchJson<TimelinePageResponse>(buildTimelinePageUrl(eventsPage, eventFilter)),
         fetchJson<FileServerAlert[]>("/api/alerts?take=100"),
         fetchJson<AlertRuleConfig[]>("/api/alert-rules"),
         fetchJson<AgentHealth[]>("/api/agents/health"),
@@ -291,7 +302,10 @@ function App() {
       ]);
 
       setHealth(healthResult);
-      setEvents(eventsResult);
+      setEvents(eventsResult.items);
+      setEventsPage(eventsResult.page);
+      setEventsTotalItems(eventsResult.totalItems);
+      setEventsTotalPages(eventsResult.totalPages);
       setAlerts(alertsResult);
       setAlertRules(alertRulesResult);
       setAgents(agentsResult);
@@ -310,7 +324,7 @@ function App() {
     loadData();
     const timer = window.setInterval(loadData, 30000);
     return () => window.clearInterval(timer);
-  }, [summaryFilters]);
+  }, [summaryFilters, eventsPage, eventFilter]);
 
   useEffect(() => {
     if (!notice) {
@@ -325,27 +339,11 @@ function App() {
   const criticalAlerts = openAlerts.filter((alert) => alert.severity === "critical");
   const offlineAgents = agents.filter((agent) => agent.isStale || agent.status !== "running" || agent.pendingQueueEvents >= agent.backlogWarningThreshold);
 
-  const filteredEvents = useMemo(() => {
-    const filter = eventFilter.trim().toLowerCase();
-
-    if (!filter) {
-      return events;
-    }
-
-    return events.filter((event) =>
-      [event.server, event.share, event.path, event.user, event.action, event.source]
-        .filter(Boolean)
-        .some((value) => value.toLowerCase().includes(filter))
-    );
-  }, [eventFilter, events]);
-  const displayedEvents = useMemo(() => filteredEvents as DisplayEvent[], [filteredEvents]);
-  const totalDisplayedEventCount = displayedEvents.length;
-  const totalEventPages = Math.max(1, Math.ceil(totalDisplayedEventCount / EVENTS_PAGE_SIZE));
+  const displayedEvents = events;
+  const totalDisplayedEventCount = eventsTotalItems;
+  const totalEventPages = eventsTotalPages;
   const safeEventsPage = Math.min(eventsPage, totalEventPages);
-  const visibleDisplayedEvents = useMemo(
-    () => displayedEvents.slice((safeEventsPage - 1) * EVENTS_PAGE_SIZE, safeEventsPage * EVENTS_PAGE_SIZE),
-    [displayedEvents, safeEventsPage]
-  );
+  const visibleDisplayedEvents = displayedEvents;
   const displayedEventCount = visibleDisplayedEvents.length;
 
   useEffect(() => {
@@ -1977,6 +1975,20 @@ function buildInvestigationUrl(filters: InvestigationFilters) {
   }
 
   return `/api/events/timeline?${params.toString()}`;
+}
+
+function buildTimelinePageUrl(page: number, search: string) {
+  const params = new URLSearchParams({
+    page: String(Math.max(1, page)),
+    pageSize: String(EVENTS_PAGE_SIZE),
+    windowTake: "2000"
+  });
+
+  if (search.trim()) {
+    params.set("search", search.trim());
+  }
+
+  return `/api/events/timeline/page?${params.toString()}`;
 }
 
 function buildAlertOperationsUrl(alert: FileServerAlert) {
