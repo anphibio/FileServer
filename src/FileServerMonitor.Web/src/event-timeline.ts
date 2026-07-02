@@ -902,7 +902,8 @@ function isRedundantDisplayCreateEcho(event: DisplayEvent, allEvents: DisplayEve
     candidate.id !== event.id
     && (candidate.action === "renamed" || candidate.action === "moved")
     && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && normalizePath(candidate.path) === normalizePath(event.path));
+    && normalizePath(candidate.path) === normalizePath(event.path)
+    && !isTransientArtifactPath(candidate.previousPath ?? ""));
 }
 
 function isRedundantDisplayCreatedDuplicate(event: DisplayEvent, allEvents: DisplayEvent[]) {
@@ -1089,6 +1090,10 @@ function isMove(previousPath: string, nextPath: string) {
 function isOperationalNoise(event: FileAuditEvent) {
   const path = event.path.toLowerCase();
   const previousPath = (event.previousPath ?? "").toLowerCase();
+  const isOfficeMaterialization = event.action === "renamed"
+    && isTransientArtifactPath(previousPath)
+    && !isTransientArtifactPath(event.path)
+    && isProvisionalDocumentName(event.path);
 
   return path.endsWith("\\appsettings.agent.json")
     || path.endsWith("\\agent-state.json")
@@ -1096,7 +1101,7 @@ function isOperationalNoise(event: FileAuditEvent) {
     || path.includes("\\logs\\")
     || path.endsWith("\\logs")
     || isTransientArtifactPath(event.path)
-    || isTransientArtifactPath(previousPath);
+    || (isTransientArtifactPath(previousPath) && !isOfficeMaterialization);
 }
 
 function isLikelyFolderPath(path: string) {
@@ -1349,6 +1354,13 @@ function isTransientRenameNoise(
     return false;
   }
 
+  if (current.action === "renamed"
+    && isTransientArtifactPath(current.previousPath ?? "")
+    && !isTransientArtifactPath(current.path)
+    && isProvisionalDocumentName(current.path)) {
+    return false;
+  }
+
   return cluster.some(({ event }) =>
     event.id !== current.id
     && event.action === "deleted"
@@ -1437,7 +1449,8 @@ function tryBuildExplicitTransition(
 
   const nextPath = current.path;
   const isProvisionalOrigin = current.action === "renamed"
-    && isProvisionalDocumentName(previousPath)
+    && (isProvisionalDocumentName(previousPath)
+      || (isTransientArtifactPath(previousPath) && isProvisionalDocumentName(nextPath)))
     && !hasNearbyTransitionDestination(relevant, previousPath, current.timestampUtc);
   const action = isMove(previousPath, nextPath) ? "moved" : "renamed";
   const displayAction = isProvisionalOrigin

@@ -27,7 +27,8 @@ export function shouldSuppressProvisionalCreate(event: EventLike, allEvents: Eve
     candidate.id !== event.id
     && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 45_000
     && (candidate.action === "renamed" || candidate.action === "moved")
-    && normalizePath(candidate.previousPath) === path);
+    && normalizePath(candidate.previousPath) === path
+    && !isTransientArtifactPath(candidate.path));
 }
 
 export function promoteLikelyInitialCreations<T extends EventLike>(events: T[]) {
