@@ -317,7 +317,10 @@ function App() {
         fetchJson<AgentHealth[]>("/api/agents/health"),
         fetchJson<MonitoredPath[]>("/api/monitored-paths"),
         fetchJson<ActivitySummary>(buildActivitySummaryUrl(summaryFilters)),
-        fetchJson<BaselineAnomalyResponse>(buildBaselineAnomaliesUrl(summaryFilters)),
+        fetchJson<BaselineAnomalyResponse>(buildBaselineAnomaliesUrl(summaryFilters)).catch((anomalyError) => {
+          console.warn("Falha ao carregar anomalias de baseline.", anomalyError);
+          return null;
+        }),
         fetchJson<AdminAuditEntry[]>("/api/admin-audit?take=100")
       ]);
 
@@ -1921,7 +1924,7 @@ async function readErrorMessage(response: Response, fallback: string) {
       const parsed = JSON.parse(raw) as { message?: string; error?: string; title?: string };
       return parsed.message || parsed.error || parsed.title || raw;
     } catch {
-      return raw;
+      return raw.length > 300 ? fallback : raw;
     }
   } catch {
     return fallback;

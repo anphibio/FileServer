@@ -580,6 +580,7 @@ app.MapGet("/api/reports/baseline-anomalies", async (
     string? action,
     int? take,
     IEventRepository repository,
+    ILoggerFactory loggerFactory,
     CancellationToken cancellationToken) =>
 {
     var now = DateTimeOffset.UtcNow;
@@ -592,9 +593,27 @@ app.MapGet("/api/reports/baseline-anomalies", async (
         Action: action,
         BaselineWindows: 7,
         Take: take is > 0 and <= 20 ? take.Value : 8);
-    var result = await repository.GetBaselineAnomaliesAsync(query, cancellationToken);
 
-    return Results.Ok(result);
+    try
+    {
+        var result = await repository.GetBaselineAnomaliesAsync(query, cancellationToken);
+
+        return Results.Ok(result);
+    }
+    catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+    {
+        loggerFactory
+            .CreateLogger("BaselineAnomalies")
+            .LogWarning(exception, "Falha ao calcular anomalias de baseline. Retornando lista vazia.");
+
+        return Results.Ok(new BaselineAnomalyResponse(
+            FromUtc: query.FromUtc,
+            ToUtc: query.ToUtc,
+            BaselineWindows: query.BaselineWindows,
+            ByAction: Array.Empty<BaselineAnomalyItem>(),
+            ByShare: Array.Empty<BaselineAnomalyItem>(),
+            ByUser: Array.Empty<BaselineAnomalyItem>()));
+    }
 });
 
 app.MapGet("/api/reports/baseline-anomalies/export.csv", async (
