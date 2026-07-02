@@ -51,4 +51,4 @@ Depois da importação, use as variáveis no topo do dashboard:
 - `Host group`: grupo de hosts vindo do Zabbix.
 - `Host`: hosts filtrados pelo grupo selecionado.
 
-Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status` e `database status`, devem usar query type `text` no Grafana. Contadores, tempos e idades usam query type de métrica.
+Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status` e `database status`, devem usar Query type `Text` no Grafana, mantendo `Group`, `Host`, `Application` e `Item` preenchidos. No JSON exportado pelo plugin, esse modo aparece como `queryType: "2"`. Contadores, tempos e idades usam Query type `Metrics`.

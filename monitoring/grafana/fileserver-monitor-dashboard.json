@@ -68,12 +68,45 @@
           "host": {
             "filter": "$zabbix_host"
           },
+          "itemTag": {
+            "filter": ""
+          },
           "item": {
             "filter": "FileServer Monitor: overall status"
           },
+          "macro": {
+            "filter": ""
+          },
+          "mode": 2,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "proxy": {
+            "filter": ""
+          },
           "refId": "A",
-          "resultFormat": "text",
-          "queryType": "text"
+          "resultFormat": "table",
+          "queryType": "2",
+          "schema": 12,
+          "table": {
+            "skipEmptyValues": false
+          },
+          "tags": {
+            "filter": ""
+          },
+          "textFilter": "",
+          "trigger": {
+            "filter": ""
+          },
+          "triggers": {
+            "acknowledged": 2
+          },
+          "useCaptureGroups": false
         }
       ],
       "fieldConfig": {
@@ -157,12 +190,45 @@
           "host": {
             "filter": "$zabbix_host"
           },
+          "itemTag": {
+            "filter": ""
+          },
           "item": {
             "filter": "FileServer Monitor: database status"
           },
+          "macro": {
+            "filter": ""
+          },
+          "mode": 2,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "proxy": {
+            "filter": ""
+          },
           "refId": "A",
-          "resultFormat": "text",
-          "queryType": "text"
+          "resultFormat": "table",
+          "queryType": "2",
+          "schema": 12,
+          "table": {
+            "skipEmptyValues": false
+          },
+          "tags": {
+            "filter": ""
+          },
+          "textFilter": "",
+          "trigger": {
+            "filter": ""
+          },
+          "triggers": {
+            "acknowledged": 2
+          },
+          "useCaptureGroups": false
         }
       ],
       "fieldConfig": {
