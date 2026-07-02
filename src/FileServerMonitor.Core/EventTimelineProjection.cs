@@ -371,7 +371,9 @@ public sealed class EventTimelineProjector
         var all = events.ToArray();
         return all.Select(item =>
         {
-            if (item.Action != "renamed" || string.IsNullOrWhiteSpace(item.PreviousPath) || !IsProvisionalDocumentName(item.PreviousPath))
+            if (item.Action != "renamed"
+                || string.IsNullOrWhiteSpace(item.PreviousPath)
+                || !IsMaterializedProvisionalDocumentRename(item.PreviousPath, item.Path))
             {
                 return item;
             }
@@ -530,7 +532,7 @@ public sealed class EventTimelineProjector
         }
 
         var isProvisionalOrigin = current.Action == "renamed"
-            && (IsProvisionalDocumentName(previousPath)
+            && (IsMaterializedProvisionalDocumentRename(previousPath, current.Path)
                 || (IsTransientArtifactPath(previousPath) && IsProvisionalDocumentName(current.Path)))
             && !HasNearbyTransitionDestination(relevant, previousPath, current.TimestampUtc);
         var action = IsMove(previousPath, current.Path) ? "moved" : "renamed";
@@ -1759,6 +1761,18 @@ public sealed class EventTimelineProjector
     private static bool IsProvisionalDocumentName(string path)
     {
         return GetProvisionalDocumentKind(path) is not null;
+    }
+
+    private static bool IsMaterializedProvisionalDocumentRename(string previousPath, string nextPath)
+    {
+        var previousKind = GetProvisionalDocumentKind(previousPath);
+        if (previousKind is null)
+        {
+            return false;
+        }
+
+        var nextKind = GetProvisionalDocumentKind(nextPath);
+        return nextKind is null || !string.Equals(previousKind, nextKind, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string? GetProvisionalDocumentKind(string path)

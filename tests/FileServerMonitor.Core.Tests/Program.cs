@@ -31,6 +31,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
     ("timeline trata append de texto do security log como alteracao", TimelineTreatsSecurityTextAppendCreateAsModification),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
+    ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
 };
 
@@ -689,6 +690,32 @@ static void TimelineCollapsesRenameDuplicateAfterUserResolution()
     Assert(display[0].Action == "renamed", "Evento preservado deveria continuar sendo rename.");
     Assert(display[0].Source == "usn-journal", "Quando ambos descrevem a mesma transicao, a entrada USN deve ser preferida.");
     Assert(display[0].User == @"FILESERVER\AnphibiO", "Rename USN preservado deveria herdar usuario do Security Log.");
+}
+
+static void TimelineKeepsRenameBetweenWindowsDefaultNames()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-02T19:38:19Z");
+    var previousPath = @"C:\Corporativo\Financeiro\Novo(a) Documento de Texto - Copia (1).txt";
+    var nextPath = @"C:\Corporativo\Financeiro\Novo(a) Documento de Texto - Copia (1) - 10.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "renamed", nextPath, previousPath, source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(240), "accessed", nextPath),
+        BuildTimelineEvent(timestamp.AddMilliseconds(240), "deleted", previousPath)
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+    var renamed = display.SingleOrDefault(item => item.Action == "renamed");
+
+    if (renamed is null)
+    {
+        throw new InvalidOperationException("Rename entre nomes padrao do Windows deveria permanecer como renomeado.");
+    }
+
+    Assert(renamed.Path == nextPath, "Rename deveria apontar para o novo nome.");
+    Assert(renamed.PreviousPath == previousPath, "Rename deveria preservar o nome anterior.");
+    Assert(display.All(item => item.Action != "created"), "Rename entre nomes padrao nao deveria virar criacao.");
 }
 
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)
