@@ -923,7 +923,9 @@ app.MapPost("/api/auth/login", async (
 
     if (!result.Success || result.User is null)
     {
-        return Results.Unauthorized();
+        return Results.Json(
+            new ErrorResponse(result.Error ?? "Credenciais invalidas ou usuario sem grupo autorizado."),
+            statusCode: StatusCodes.Status401Unauthorized);
     }
 
     var token = AuthSessionToken.Create(result.User, AuthOptions.FromConfiguration(configuration).GetSigningSecret());
@@ -6073,7 +6075,7 @@ internal sealed class LdapAuthenticator
                 user with { Role = role.ToString().ToLowerInvariant() },
                 null));
         }
-        catch (Exception ex) when (ex is LdapException or DirectoryOperationException or InvalidOperationException)
+        catch (Exception ex) when (ex is LdapException or DirectoryOperationException or InvalidOperationException or TypeInitializationException or DllNotFoundException)
         {
             return Task.FromResult(LdapAuthResult.Failed(ex.Message));
         }
