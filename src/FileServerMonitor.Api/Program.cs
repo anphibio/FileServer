@@ -6062,6 +6062,13 @@ internal sealed class LdapAuthSettingsStore
 
 internal sealed class LdapAuthenticator
 {
+    private readonly ILogger<LdapAuthenticator> _logger;
+
+    public LdapAuthenticator(ILogger<LdapAuthenticator> logger)
+    {
+        _logger = logger;
+    }
+
     public Task<LdapAuthResult> AuthenticateAsync(
         LdapAuthSettings settings,
         LoginRequest request,
@@ -6077,60 +6084,111 @@ internal sealed class LdapAuthenticator
             return Task.FromResult(LdapAuthResult.Failed("Configuracao LDAP/AD incompleta."));
         }
 
-        try
+        var errors = new List<string>();
+
+        foreach (var host in GetCandidateHosts(settings.Host))
         {
-            var loginName = BuildBindName(settings, request.Username.Trim());
-            using var connection = CreateConnection(settings);
-            connection.AuthType = AuthType.Basic;
-            connection.Bind(new NetworkCredential(loginName, request.Password));
-
-            var user = SearchUser(connection, settings, request.Username.Trim());
-            if (user is null)
+            try
             {
-                return Task.FromResult(LdapAuthResult.Failed("Usuario autenticado, mas nao encontrado no diretorio."));
-            }
+                var loginName = BuildBindName(settings, request.Username.Trim());
+                using var connection = CreateConnection(settings, host);
+                connection.AuthType = AuthType.Basic;
+                connection.Bind(new NetworkCredential(loginName, request.Password));
 
-            if (!TryResolveRole(settings, user.Groups, out var role))
+                var user = SearchUser(connection, settings, request.Username.Trim());
+                if (user is null)
+                {
+                    return Task.FromResult(LdapAuthResult.Failed("Usuario autenticado, mas nao encontrado no diretorio."));
+                }
+
+                if (!TryResolveRole(settings, user.Groups, out var role))
+                {
+                    return Task.FromResult(LdapAuthResult.Failed("Usuario sem grupo autorizado."));
+                }
+
+                return Task.FromResult(new LdapAuthResult(
+                    true,
+                    user with { Role = role.ToString().ToLowerInvariant() },
+                    null));
+            }
+            catch (Exception ex) when (ex is LdapException or DirectoryOperationException or InvalidOperationException or TypeInitializationException or DllNotFoundException)
             {
-                return Task.FromResult(LdapAuthResult.Failed("Usuario sem grupo autorizado."));
+                var detail = DescribeLdapFailure(host, ex);
+                errors.Add(detail);
+                _logger.LogWarning(ex, "Falha LDAP/AD ao autenticar em {Host}:{Port}. Detalhe: {Detail}", host, settings.Port, detail);
             }
+        }
 
-            return Task.FromResult(new LdapAuthResult(
-                true,
-                user with { Role = role.ToString().ToLowerInvariant() },
-                null));
-        }
-        catch (Exception ex) when (ex is LdapException or DirectoryOperationException or InvalidOperationException or TypeInitializationException or DllNotFoundException)
-        {
-            return Task.FromResult(LdapAuthResult.Failed(ex.Message));
-        }
+        return Task.FromResult(LdapAuthResult.Failed(errors.Count == 0
+            ? "Nao foi possivel conectar ao LDAP/AD."
+            : string.Join(" | ", errors)));
     }
 
-    private static LdapConnection CreateConnection(LdapAuthSettings settings)
+    private static LdapConnection CreateConnection(LdapAuthSettings settings, string host)
     {
         Environment.SetEnvironmentVariable(
             "LDAPTLS_REQCERT",
             settings.ValidateTlsCertificate ? "demand" : "never");
 
-        var identifier = new LdapDirectoryIdentifier(settings.Host, settings.Port, fullyQualifiedDnsHostName: false, connectionless: false);
+        var identifier = new LdapDirectoryIdentifier(host, settings.Port, fullyQualifiedDnsHostName: !IPAddress.TryParse(host, out _), connectionless: false);
         var connection = new LdapConnection(identifier)
         {
             Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
         };
 
         connection.SessionOptions.ProtocolVersion = 3;
+        connection.SessionOptions.ReferralChasing = ReferralChasingOptions.None;
 
         if (settings.Security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase))
         {
-            connection.SessionOptions.SecureSocketLayer = true;
-
             if (!settings.ValidateTlsCertificate)
             {
                 connection.SessionOptions.VerifyServerCertificate = (_, _) => true;
             }
+
+            connection.SessionOptions.SecureSocketLayer = true;
         }
 
         return connection;
+    }
+
+    private static IReadOnlyCollection<string> GetCandidateHosts(string configuredHost)
+    {
+        var hosts = new List<string> { configuredHost };
+
+        if (IPAddress.TryParse(configuredHost, out var address))
+        {
+            try
+            {
+                var hostEntry = Dns.GetHostEntry(address);
+                if (!string.IsNullOrWhiteSpace(hostEntry.HostName))
+                {
+                    hosts.Insert(0, hostEntry.HostName);
+                }
+            }
+            catch
+            {
+                // Mantem o IP configurado como candidato principal se o DNS reverso falhar.
+            }
+        }
+
+        return hosts
+            .Where(host => !string.IsNullOrWhiteSpace(host))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string DescribeLdapFailure(string host, Exception exception)
+    {
+        if (exception is LdapException ldapException)
+        {
+            var serverError = string.IsNullOrWhiteSpace(ldapException.ServerErrorMessage)
+                ? null
+                : $" server='{ldapException.ServerErrorMessage}'";
+            return $"{host}: LDAP {ldapException.ErrorCode} - {ldapException.Message}{serverError}";
+        }
+
+        return $"{host}: {exception.GetType().Name} - {exception.Message}";
     }
 
     private static string BuildBindName(LdapAuthSettings settings, string username)
