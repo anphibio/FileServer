@@ -764,6 +764,43 @@ test("suppresses folder navigation echoes shortly before descendant renames", ()
   ]);
 });
 
+test("keeps default nested folder creation before it is renamed", () => {
+  const folderPath = "C:\\Corporativo\\Nova pasta -10\\Nova pasta";
+  const renamedPath = "C:\\Corporativo\\Nova pasta -10\\Nova pasta - 20";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "nested-folder-created",
+      timestampUtc: "2026-07-02T04:13:17.000Z",
+      path: folderPath,
+      action: "created",
+      objectType: "folder",
+      source: "usn-journal"
+    }),
+    buildEvent({
+      id: "nested-folder-changed",
+      timestampUtc: "2026-07-02T04:13:18.000Z",
+      path: folderPath,
+      action: "changed",
+      objectType: "folder",
+      source: "usn-journal"
+    }),
+    buildEvent({
+      id: "nested-folder-renamed",
+      timestampUtc: "2026-07-02T04:13:24.000Z",
+      path: renamedPath,
+      previousPath: folderPath,
+      action: "renamed",
+      objectType: "folder",
+      source: "usn-journal"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.path]), [
+    ["Renomeado", renamedPath],
+    ["Criação", folderPath]
+  ]);
+});
+
 test("suppresses security delete echoes after a rename with mojibake accents", () => {
   const display = buildDisplayEvents([
     buildEvent({

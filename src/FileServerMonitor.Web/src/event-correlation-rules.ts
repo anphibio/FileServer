@@ -16,7 +16,7 @@ export function shouldSuppressProvisionalCreate(event: EventLike, allEvents: Eve
     return false;
   }
 
-  if (!isProvisionalDocumentName(event.path) && !isProvisionalFolderName(event.path)) {
+  if (!isProvisionalDocumentName(event.path)) {
     return false;
   }
 

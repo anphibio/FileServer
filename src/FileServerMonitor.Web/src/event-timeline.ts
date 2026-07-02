@@ -1337,8 +1337,7 @@ function isRedundantCreationNoise(
 
     if ((event.action === "renamed" || event.action === "moved")
       && normalizePath(event.previousPath) === currentPath
-      && !isProvisionalDocumentName(current.path)
-      && !isProvisionalFolderName(current.path)) {
+      && !isProvisionalDocumentName(current.path)) {
       return false;
     }
 
