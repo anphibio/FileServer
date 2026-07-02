@@ -455,6 +455,36 @@ test("promotes a security modified event to creation when it is part of a creati
   ].sort());
 });
 
+test("keeps a real modification before a later access echo", () => {
+  const targetPath = "C:\\Corporativo\\RH\\Novo(a) Documento de Texto - Copia (3).txt";
+  const siblingPath = "C:\\Corporativo\\RH\\codex-created-nearby.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "target-modified",
+      timestampUtc: "2026-07-02T10:40:47.000Z",
+      path: targetPath,
+      action: "modified",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "sibling-created",
+      timestampUtc: "2026-07-02T10:40:48.000Z",
+      path: siblingPath,
+      action: "created",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "target-accessed",
+      timestampUtc: "2026-07-02T10:40:55.000Z",
+      path: targetPath,
+      action: "accessed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.filter((event) => event.path === targetPath).map((event) => event.displayAction), ["Alterado"]);
+});
+
 test("promotes a modified folder to creation when its children are created in the same batch", () => {
   const folderPath = "C:\\Corporativo\\teste";
   const childPath = "C:\\Corporativo\\teste\\Example txt file.txt";

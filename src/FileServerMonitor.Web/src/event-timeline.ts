@@ -221,6 +221,7 @@ function getSyntheticCreationCandidate(
       && !hasEarlierStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
       && !hasEarlierRawChange(path, rawEvent.timestampUtc, rawEvents)
       && !hasLaterLifecycleSignal(path, rawEvent.timestampUtc, rawEvents)
+      && !hasLaterAccessEchoSignal(path, rawEvent.timestampUtc, rawEvents)
       && hasNearbySiblingCreationSignal(rawEvent, rawEvents)) {
       return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
     }
@@ -481,6 +482,19 @@ function hasLaterLifecycleSignal(path: string, timestampUtc: string, rawEvents: 
     return candidate.action === "deleted"
       || candidate.action === "renamed"
       || candidate.action === "moved";
+  });
+}
+
+function hasLaterAccessEchoSignal(path: string, timestampUtc: string, rawEvents: FileAuditEvent[]) {
+  const eventTime = new Date(timestampUtc).getTime();
+
+  return rawEvents.some((candidate) => {
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    return candidate.action === "accessed"
+      && candidateTime > eventTime
+      && candidateTime - eventTime >= 2_000
+      && candidateTime - eventTime <= 30_000
+      && normalizePath(candidate.path) === path;
   });
 }
 
@@ -987,6 +1001,13 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
         && normalizeUser(candidate.user) === normalizeUser(event.user)
         && candidateTime > eventTime
         && candidateTime - eventTime <= 5_000;
+    }
+
+    if (candidate.action === "changed" || candidate.action === "modified") {
+      return isFileLikePath(event.path)
+        && pathsReferToSameItem(candidate.path, event.path)
+        && candidateTime < eventTime
+        && eventTime - candidateTime <= 15_000;
     }
 
     if (candidate.action !== "created"

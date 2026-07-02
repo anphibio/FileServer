@@ -174,8 +174,8 @@ function getProvisionalDocumentKind(path: string) {
 
   const provisionalKinds: Array<[string, RegExp[]]> = [
     ["text", [
-      /^novo documento de texto\.txt$/,
-      /^new text document\.txt$/
+      /^.*novo.*documento de texto.*\.txt$/,
+      /^.*new text document.*\.txt$/
     ]],
     ["excel", [
       /^novo\(a\) planilha do microsoft excel.*\.xlsx$/,

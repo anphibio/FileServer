@@ -211,6 +211,7 @@ public sealed class EventTimelineProjector
                 && !HasEarlierStrongRawHistory(path, rawEvent.TimestampUtc, rawEvents)
                 && !HasEarlierRawChange(path, rawEvent.TimestampUtc, rawEvents)
                 && !HasLaterLifecycleSignal(path, rawEvent.TimestampUtc, rawEvents)
+                && !HasLaterAccessEchoSignal(path, rawEvent.TimestampUtc, rawEvents)
                 && HasNearbySiblingCreationSignal(rawEvent, rawEvents))
             {
                 return BuildSyntheticCreationEvent(rawEvent, rawEvent.Path);
@@ -1200,6 +1201,14 @@ public sealed class EventTimelineProjector
                     && candidate.TimestampUtc - item.TimestampUtc <= TimeSpan.FromSeconds(5);
             }
 
+            if (candidate.Action is "changed" or "modified")
+            {
+                return IsFileLikePath(item.Path)
+                    && PathsReferToSameItem(candidate.Path, item.Path)
+                    && candidate.TimestampUtc < item.TimestampUtc
+                    && item.TimestampUtc - candidate.TimestampUtc <= TimeSpan.FromSeconds(15);
+            }
+
             if (candidate.Action is not ("created" or "created_or_appended" or "renamed" or "moved" or "deleted"))
             {
                 return false;
@@ -1432,6 +1441,16 @@ public sealed class EventTimelineProjector
             && item.TimestampUtc - timestampUtc <= TimeSpan.FromMinutes(5)
             && (NormalizePath(item.Path) == path || NormalizePath(item.PreviousPath) == path)
             && item.Action is "deleted" or "renamed" or "moved");
+    }
+
+    private static bool HasLaterAccessEchoSignal(string path, DateTimeOffset timestampUtc, IEnumerable<FileAuditEvent> rawEvents)
+    {
+        return rawEvents.Any(item =>
+            item.Action == "accessed"
+            && item.TimestampUtc > timestampUtc
+            && item.TimestampUtc - timestampUtc >= TimeSpan.FromSeconds(2)
+            && item.TimestampUtc - timestampUtc <= TimeSpan.FromSeconds(30)
+            && NormalizePath(item.Path) == path);
     }
 
     private static bool HasNearbySiblingCreationSignal(FileAuditEvent item, IEnumerable<FileAuditEvent> rawEvents)

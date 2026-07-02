@@ -28,6 +28,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
     ("timeline preserva alteracao real antes de exclusao", TimelineKeepsRealModificationBeforeDelete),
+    ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
 };
@@ -630,6 +631,27 @@ static void TimelineKeepsRealModificationBeforeDelete()
     Assert(display[0].Action == "modified", "Primeiro evento deveria continuar sendo alteracao.");
     Assert(display[0].DisplayAction == "Alterado", "Alteracao real nao deveria virar criacao.");
     Assert(display[1].Action == "deleted", "Exclusao posterior deveria ser preservada.");
+}
+
+static void TimelineKeepsRealModificationBeforeAccess()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-02T10:40:47Z");
+    var path = @"C:\Corporativo\RH\Novo(a) Documento de Texto - Copia (3).txt";
+    var siblingPath = @"C:\Corporativo\RH\codex-created-nearby.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "modified", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "created", siblingPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(8), "accessed", path, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var targetEvents = display.Where(item => item.Path == path).ToArray();
+
+    Assert(targetEvents.Length == 1, "Acesso posterior a alteracao deveria ser tratado como eco.");
+    Assert(targetEvents[0].Action == "modified", "Alteracao real nao deveria virar criacao quando depois chega acesso.");
+    Assert(targetEvents[0].DisplayAction == "Alterado", "Evento final do arquivo deveria permanecer Alterado.");
 }
 
 static void TimelineCollapsesRenameDuplicateAfterUserResolution()
