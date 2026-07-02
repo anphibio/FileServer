@@ -150,8 +150,11 @@ app.MapGet("/metrics", async (
     var retention = new RetentionMetrics(
         Enabled: configuration.GetValue("Retention:Enabled", false),
         EventsDays: configuration.GetValue("Retention:EventsDays", 180),
+        TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays")
+            ?? configuration.GetValue("Retention:EventsDays", 180),
         AlertsDays: configuration.GetValue("Retention:AlertsDays", 365),
-        IntervalHours: configuration.GetValue("Retention:IntervalHours", 24));
+        IntervalHours: configuration.GetValue("Retention:IntervalHours", 24),
+        PurgeBatchSize: configuration.GetValue("Retention:PurgeBatchSize", 10_000));
     var api = new ApiMetrics(
         Status: "healthy",
         StorageProvider: repository.ProviderName,
@@ -1530,6 +1533,8 @@ internal interface ITimelineRepository
     Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(BaselineAnomalyQuery query, CancellationToken cancellationToken);
 
     Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken);
+
+    Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
 }
 
 #if SQLSERVER
@@ -1722,6 +1727,42 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
             ToUtc: reader["ToUtc"] == DBNull.Value
                 ? null
                 : new DateTimeOffset(DateTime.SpecifyKind((DateTime)reader["ToUtc"], DateTimeKind.Utc)));
+    }
+
+    public async Task<int> PurgeOlderThanAsync(
+        DateTimeOffset cutoffUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        var totalDeleted = 0;
+        var safeBatchSize = Math.Clamp(batchSize, 100, 100_000);
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                DELETE TOP (@BatchSize)
+                FROM dbo.FileAuditTimelineEvents
+                WHERE TimestampUtc < @CutoffUtc;
+
+                SELECT @@ROWCOUNT;
+                """;
+            command.Parameters.AddWithValue("@BatchSize", safeBatchSize);
+            command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
+
+            var deleted = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+            totalDeleted += deleted;
+
+            if (deleted < safeBatchSize)
+            {
+                break;
+            }
+        }
+
+        return totalDeleted;
     }
 
     private static string BuildTimelineQuerySql(TimelineQuery query, SqlCommand command)
@@ -2972,6 +3013,28 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
             Count: values.LongLength,
             FromUtc: values.Min(item => item.TimestampUtc),
             ToUtc: values.Max(item => item.TimestampUtc)));
+    }
+
+    public Task<int> PurgeOlderThanAsync(
+        DateTimeOffset cutoffUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        var deleted = 0;
+        var idsToRemove = _events.Values
+            .Where(item => item.TimestampUtc < cutoffUtc)
+            .Select(item => item.Id)
+            .ToArray();
+
+        foreach (var id in idsToRemove)
+        {
+            if (_events.TryRemove(id, out _))
+            {
+                deleted++;
+            }
+        }
+
+        return Task.FromResult(deleted);
     }
 
     private static IEnumerable<string> SplitFilterValues(string? value)
@@ -5950,22 +6013,27 @@ internal sealed class AlertNotificationService
 internal sealed class RetentionWorker : BackgroundService
 {
     private readonly IEventRepository _events;
+    private readonly ITimelineRepository _timeline;
     private readonly AlertStore _alerts;
     private readonly RetentionOptions _options;
     private readonly ILogger<RetentionWorker> _logger;
 
     public RetentionWorker(
         IEventRepository events,
+        ITimelineRepository timeline,
         AlertStore alerts,
         IConfiguration configuration,
         ILogger<RetentionWorker> logger)
     {
         _events = events;
+        _timeline = timeline;
         _alerts = alerts;
         _logger = logger;
         _options = new RetentionOptions(
             Enabled: configuration.GetValue("Retention:Enabled", false),
             EventsDays: configuration.GetValue("Retention:EventsDays", 180),
+            TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays")
+                ?? configuration.GetValue("Retention:EventsDays", 180),
             AlertsDays: configuration.GetValue("Retention:AlertsDays", 365),
             IntervalHours: configuration.GetValue("Retention:IntervalHours", 24),
             PurgeBatchSize: configuration.GetValue("Retention:PurgeBatchSize", 10_000));
@@ -5991,19 +6059,22 @@ internal sealed class RetentionWorker : BackgroundService
     private async Task RunOnceAsync(CancellationToken cancellationToken)
     {
         var eventCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.EventsDays));
+        var timelineCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.TimelineDays));
         var alertCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, _options.AlertsDays));
         var batchSize = Math.Clamp(_options.PurgeBatchSize, 100, 100_000);
 
         try
         {
             var deletedEvents = await _events.PurgeOlderThanAsync(eventCutoff, batchSize, cancellationToken);
+            var deletedTimelineEvents = await _timeline.PurgeOlderThanAsync(timelineCutoff, batchSize, cancellationToken);
             var deletedAlerts = await _alerts.PurgeOlderThanAsync(alertCutoff, batchSize, cancellationToken);
 
-            if (deletedEvents > 0 || deletedAlerts > 0)
+            if (deletedEvents > 0 || deletedTimelineEvents > 0 || deletedAlerts > 0)
             {
                 _logger.LogInformation(
-                    "Retencao executada. Eventos removidos: {DeletedEvents}. Alertas removidos: {DeletedAlerts}.",
+                    "Retencao executada. Eventos brutos removidos: {DeletedEvents}. Timeline removida: {DeletedTimelineEvents}. Alertas removidos: {DeletedAlerts}.",
                     deletedEvents,
+                    deletedTimelineEvents,
                     deletedAlerts);
             }
         }
@@ -6949,6 +7020,7 @@ internal sealed record NotificationOptions(
 internal sealed record RetentionOptions(
     bool Enabled,
     int EventsDays,
+    int TimelineDays,
     int AlertsDays,
     int IntervalHours,
     int PurgeBatchSize);
@@ -7594,8 +7666,10 @@ internal sealed record AgentMetricsItem(
 internal sealed record RetentionMetrics(
     bool Enabled,
     int EventsDays,
+    int TimelineDays,
     int AlertsDays,
-    int IntervalHours);
+    int IntervalHours,
+    int PurgeBatchSize);
 
 internal sealed record MetricsThresholds(
     int AgentStaleMinutes,

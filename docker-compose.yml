@@ -40,6 +40,7 @@ services:
       Notifications__MinimumSeverity: ${NOTIFICATIONS_MINIMUM_SEVERITY:-critical}
       Retention__Enabled: ${RETENTION_ENABLED:-false}
       Retention__EventsDays: ${RETENTION_EVENTS_DAYS:-180}
+      Retention__TimelineDays: ${RETENTION_TIMELINE_DAYS:-180}
       Retention__AlertsDays: ${RETENTION_ALERTS_DAYS:-365}
       Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
       Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}

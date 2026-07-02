@@ -588,12 +588,13 @@ Configuracoes principais:
 ```text
 RETENTION_ENABLED=true
 RETENTION_EVENTS_DAYS=180
+RETENTION_TIMELINE_DAYS=180
 RETENTION_ALERTS_DAYS=365
 RETENTION_INTERVAL_HOURS=24
 RETENTION_PURGE_BATCH_SIZE=10000
 ```
 
-Quando habilitada, a API remove eventos e alertas antigos em lotes para reduzir impacto no SQL Server. Ajuste os dias conforme politica interna, LGPD, auditoria e capacidade do banco.
+Quando habilitada, a API remove eventos brutos, eventos correlacionados da linha do tempo e alertas antigos em lotes para reduzir impacto no SQL Server. Ajuste os dias conforme politica interna, LGPD, auditoria e capacidade do banco.
 
 ## Interface Web
 
