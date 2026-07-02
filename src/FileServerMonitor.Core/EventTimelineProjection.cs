@@ -182,6 +182,8 @@ public sealed class EventTimelineProjector
                 && !HasDisplayCreation(displayEvents, path)
                 && !HasEarlierStrongRawHistory(path, rawEvent.TimestampUtc, rawEvents)
                 && !HasEarlierRawChange(path, rawEvent.TimestampUtc, rawEvents)
+                && (rawEvent.Source.Equals("usn-journal", StringComparison.OrdinalIgnoreCase)
+                    || HasNearbySiblingCreationSignal(rawEvent, rawEvents))
                 && HasLaterLifecycleSignal(path, rawEvent.TimestampUtc, rawEvents))
             {
                 return BuildSyntheticCreationEvent(rawEvent, rawEvent.Path);
@@ -208,6 +210,7 @@ public sealed class EventTimelineProjector
             if (!HasDisplayCreation(displayEvents, path)
                 && !HasEarlierStrongRawHistory(path, rawEvent.TimestampUtc, rawEvents)
                 && !HasEarlierRawChange(path, rawEvent.TimestampUtc, rawEvents)
+                && !HasLaterLifecycleSignal(path, rawEvent.TimestampUtc, rawEvents)
                 && HasNearbySiblingCreationSignal(rawEvent, rawEvents))
             {
                 return BuildSyntheticCreationEvent(rawEvent, rawEvent.Path);
@@ -438,6 +441,15 @@ public sealed class EventTimelineProjector
             && (NormalizePath(candidate.Path) == path || NormalizePath(candidate.PreviousPath) == path));
 
         if (earlier.Any(candidate => IsStrongLifecycleAction(candidate.Action) && !IsIgnorableEarlierLifecycle(candidate, path)))
+        {
+            return false;
+        }
+
+        var hasEarlierIgnorableLifecycle = earlier.Any(candidate => IsIgnorableEarlierLifecycle(candidate, path));
+
+        if (!item.Source.Equals("usn-journal", StringComparison.OrdinalIgnoreCase)
+            && !hasEarlierIgnorableLifecycle
+            && !HasNearbySiblingInitialCreationSignal(item, events))
         {
             return false;
         }
@@ -1432,6 +1444,22 @@ public sealed class EventTimelineProjector
             && NormalizePath(candidate.Path) != path
             && NormalizePath(GetParentPath(candidate.Path)) == parent
             && candidate.Action is "created" or "created_or_appended");
+    }
+
+    private static bool HasNearbySiblingInitialCreationSignal(
+        FileAuditDisplayEvent item,
+        IReadOnlyCollection<FileAuditDisplayEvent> events)
+    {
+        var parent = NormalizePath(GetParentPath(item.Path));
+        var path = NormalizePath(item.Path);
+        return events.Any(candidate =>
+            candidate.Id != item.Id
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
+            && NormalizePath(candidate.Path) != path
+            && NormalizePath(GetParentPath(candidate.Path)) == parent
+            && (candidate.Action is "created" or "created_or_appended"
+                || candidate.Action is "changed" or "modified"
+                    && candidate.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase)));
     }
 
     private static bool HasNearbyChildCreationSignal(FileAuditEvent item, IEnumerable<FileAuditEvent> rawEvents)

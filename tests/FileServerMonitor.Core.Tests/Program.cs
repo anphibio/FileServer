@@ -27,6 +27,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
+    ("timeline preserva alteracao real antes de exclusao", TimelineKeepsRealModificationBeforeDelete),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
 };
@@ -610,6 +611,25 @@ static void TimelineSuppressesDeleteEchoAroundRename()
     Assert(display.Length == 1, "Delete usado como eco de rename nao deveria aparecer na timeline final.");
     Assert(display[0].Action == "renamed", "O rename deveria ser preservado.");
     Assert(display[0].PreviousPath == @"C:\Corporativo\codex-client-check-02.md", "Caminho anterior do rename deveria ser preservado.");
+}
+
+static void TimelineKeepsRealModificationBeforeDelete()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-02T10:26:55Z");
+    var path = @"C:\Corporativo\RH\Novo(a) Documento de Texto - Copia (6).txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "modified", path, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(30), "deleted", path, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    Assert(display.Length == 2, "Alteracao real seguida de exclusao deveria manter os dois eventos.");
+    Assert(display[0].Action == "modified", "Primeiro evento deveria continuar sendo alteracao.");
+    Assert(display[0].DisplayAction == "Alterado", "Alteracao real nao deveria virar criacao.");
+    Assert(display[1].Action == "deleted", "Exclusao posterior deveria ser preservada.");
 }
 
 static void TimelineCollapsesRenameDuplicateAfterUserResolution()

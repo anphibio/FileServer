@@ -199,6 +199,7 @@ function getSyntheticCreationCandidate(
       && !hasDisplayCreation(displayEvents, path)
       && !hasEarlierStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
       && !hasEarlierRawChange(path, rawEvent.timestampUtc, rawEvents)
+      && (rawEvent.source === "usn-journal" || hasNearbySiblingCreationSignal(rawEvent, rawEvents))
       && hasLaterLifecycleSignal(path, rawEvent.timestampUtc, rawEvents)) {
       return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
     }
@@ -219,6 +220,7 @@ function getSyntheticCreationCandidate(
     if (!hasDisplayCreation(displayEvents, path)
       && !hasEarlierStrongRawHistory(path, rawEvent.timestampUtc, rawEvents)
       && !hasEarlierRawChange(path, rawEvent.timestampUtc, rawEvents)
+      && !hasLaterLifecycleSignal(path, rawEvent.timestampUtc, rawEvents)
       && hasNearbySiblingCreationSignal(rawEvent, rawEvents)) {
       return buildSyntheticCreationEvent(rawEvent, rawEvent.path);
     }

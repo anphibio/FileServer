@@ -180,6 +180,29 @@ test("promotes direct final-name creations when later move or delete confirms th
   assert.equal(promoted[3]?.action, "created");
 });
 
+test("does not promote a real modification before deletion into creation", () => {
+  const path = "C:\\Corporativo\\RH\\Novo(a) Documento de Texto - Copia (6).txt";
+  const promoted = promoteLikelyInitialCreations([
+    {
+      id: "modified",
+      timestampUtc: "2026-07-02T10:26:55.000Z",
+      path,
+      action: "modified",
+      source: "usn-journal+security-log"
+    },
+    {
+      id: "deleted",
+      timestampUtc: "2026-07-02T10:27:25.000Z",
+      path,
+      action: "deleted",
+      source: "windows-security-log"
+    }
+  ]);
+
+  assert.equal(promoted[0]?.action, "modified");
+  assert.equal(promoted[0]?.displayAction, undefined);
+});
+
 test("still promotes when earlier strong history only comes from a transient rename into the same file", () => {
   const promoted = promoteLikelyInitialCreations([
     {

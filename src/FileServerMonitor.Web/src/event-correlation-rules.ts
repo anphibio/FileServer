@@ -69,6 +69,11 @@ export function isLikelyInitialCreationEvent<T extends EventLike>(event: T, even
     return false;
   }
 
+  const hasEarlierIgnorableLifecycle = earlierRelatedHistory.some((candidate) => isIgnorableEarlierLifecycle(candidate, path));
+  if (event.source !== "usn-journal" && !hasEarlierIgnorableLifecycle && !hasNearbySiblingInitialCreationSignal(event, events)) {
+    return false;
+  }
+
   return events.some((candidate) =>
     candidate.id !== event.id
     && new Date(candidate.timestampUtc).getTime() >= eventTime
@@ -82,6 +87,35 @@ export function isLikelyInitialCreationEvent<T extends EventLike>(event: T, even
       || candidate.action === "renamed"
       || candidate.action === "moved"
     ));
+}
+
+function hasNearbySiblingInitialCreationSignal<T extends EventLike>(event: T, events: T[]) {
+  const eventTime = new Date(event.timestampUtc).getTime();
+  const parentPath = normalizePath(getParentPath(event.path));
+  const path = normalizePath(event.path);
+
+  return events.some((candidate) => {
+    if (candidate.id === event.id) {
+      return false;
+    }
+
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    if (Math.abs(candidateTime - eventTime) > 15_000) {
+      return false;
+    }
+
+    if (normalizePath(candidate.path) === path) {
+      return false;
+    }
+
+    if (normalizePath(getParentPath(candidate.path)) !== parentPath) {
+      return false;
+    }
+
+    return candidate.action === "created"
+      || candidate.action === "created_or_appended"
+      || ((candidate.action === "changed" || candidate.action === "modified") && candidate.source.includes("usn-journal"));
+  });
 }
 
 function isIgnorableEarlierLifecycle(event: EventLike, targetPath: string) {
@@ -121,6 +155,12 @@ function isFileLikePath(path: string) {
 function getLeafName(path: string) {
   const segments = path.split("\\").filter(Boolean);
   return segments[segments.length - 1] ?? path;
+}
+
+function getParentPath(path: string) {
+  const normalized = normalizePath(path);
+  const index = normalized.lastIndexOf("\\");
+  return index > -1 ? normalized.slice(0, index) : "";
 }
 
 function isProvisionalDocumentName(path: string) {
