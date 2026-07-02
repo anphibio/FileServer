@@ -1194,7 +1194,7 @@ dd {
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(8, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(42px, 1fr));
   }
 
   .nav-tabs button {

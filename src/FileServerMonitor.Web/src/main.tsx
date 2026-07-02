@@ -456,7 +456,6 @@ function App() {
   const visibleDisplayedEvents = displayedEvents;
   const displayedEventCount = visibleDisplayedEvents.length;
   const shouldShowLogin = authStatus?.enabled && !authUser;
-  const canAdmin = !authStatus?.enabled || authUser?.role === "admin";
 
   function handleLogin(response: LoginResponse) {
     localStorage.setItem(authTokenStorageKey, response.token);
@@ -534,11 +533,9 @@ function App() {
           <TabButton icon={<ClipboardList size={18} />} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} meta={adminAudit.length.toLocaleString("pt-BR")}>
             Auditoria
           </TabButton>
-          {canAdmin && (
-            <TabButton icon={<LockKeyhole size={18} />} active={activeTab === "auth"} onClick={() => setActiveTab("auth")} meta={authStatus?.enabled ? "AD" : "off"}>
-              LDAP/AD
-            </TabButton>
-          )}
+          <TabButton icon={<LockKeyhole size={18} />} active={activeTab === "auth"} onClick={() => setActiveTab("auth")} meta={authStatus?.enabled ? "AD" : "off"}>
+            Configuração
+          </TabButton>
         </nav>
       </aside>
 
@@ -3049,7 +3046,7 @@ function titleForTab(tab: Tab) {
     agents: "Agentes",
     paths: "Caminhos Monitorados",
     audit: "Auditoria Administrativa",
-    auth: "LDAP/AD"
+    auth: "Configuração"
   };
 
   return titles[tab];
