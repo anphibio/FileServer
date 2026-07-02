@@ -245,25 +245,23 @@ app.MapGet("/api/events/timeline", async (
     IEventRepository repository,
     CancellationToken cancellationToken) =>
 {
-    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
-    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
-    var query = new EventQuery(
-        Server: server,
-        Share: share,
-        User: prefilteredUser,
-        Action: prefilteredAction,
-        Path: path,
-        SourceHost: sourceHost,
-        SourceIp: sourceIp,
-        Extension: extension,
-        Result: result,
-        Severity: severity,
-        Source: source,
-        FromUtc: fromUtc,
-        ToUtc: toUtc,
-        Take: take is > 0 and <= 20_000 ? take.Value : 100);
-
-    var events = await repository.QueryAsync(query, cancellationToken);
+    var events = await QueryTimelineSourceEventsAsync(
+        server,
+        share,
+        user,
+        action,
+        path,
+        sourceHost,
+        sourceIp,
+        extension,
+        result,
+        severity,
+        source,
+        fromUtc,
+        toUtc,
+        take is > 0 and <= 20_000 ? take.Value : 100,
+        repository,
+        cancellationToken);
     var timeline = ProjectTimeline(events, user, action);
 
     return Results.Ok(timeline);
@@ -287,25 +285,23 @@ app.MapGet("/api/events/timeline/export.csv", async (
     IEventRepository repository,
     CancellationToken cancellationToken) =>
 {
-    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
-    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
-    var query = new EventQuery(
-        Server: server,
-        Share: share,
-        User: prefilteredUser,
-        Action: prefilteredAction,
-        Path: path,
-        SourceHost: sourceHost,
-        SourceIp: sourceIp,
-        Extension: extension,
-        Result: result,
-        Severity: severity,
-        Source: source,
-        FromUtc: fromUtc,
-        ToUtc: toUtc,
-        Take: take is > 0 and <= 20_000 ? take.Value : 10_000);
-
-    var events = await repository.QueryAsync(query, cancellationToken);
+    var events = await QueryTimelineSourceEventsAsync(
+        server,
+        share,
+        user,
+        action,
+        path,
+        sourceHost,
+        sourceIp,
+        extension,
+        result,
+        severity,
+        source,
+        fromUtc,
+        toUtc,
+        take is > 0 and <= 20_000 ? take.Value : 10_000,
+        repository,
+        cancellationToken);
     var timeline = ProjectTimeline(events, user, action);
     var csv = TimelineCsvExporter.Export(timeline);
 
@@ -337,25 +333,23 @@ app.MapGet("/api/events/timeline/page", async (
     var safePageSize = pageSize is > 0 and <= 100 ? pageSize.Value : 25;
     var minimumWindow = safePage * safePageSize * 4;
     var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 20_000);
-    var prefilteredAction = ShouldPreFilterTimelineQuery(action) ? action : null;
-    var prefilteredUser = ShouldPreFilterTimelineQuery(action) ? user : null;
-    var query = new EventQuery(
-        Server: server,
-        Share: share,
-        User: prefilteredUser,
-        Action: prefilteredAction,
-        Path: path,
-        SourceHost: sourceHost,
-        SourceIp: sourceIp,
-        Extension: extension,
-        Result: result,
-        Severity: severity,
-        Source: source,
-        FromUtc: fromUtc,
-        ToUtc: toUtc,
-        Take: safeWindowTake);
-
-    var events = await repository.QueryAsync(query, cancellationToken);
+    var events = await QueryTimelineSourceEventsAsync(
+        server,
+        share,
+        user,
+        action,
+        path,
+        sourceHost,
+        sourceIp,
+        extension,
+        result,
+        severity,
+        source,
+        fromUtc,
+        toUtc,
+        safeWindowTake,
+        repository,
+        cancellationToken);
     var filteredTimeline = ProjectTimeline(events, user, action)
         .Where(item => MatchesTimelineSearch(item, search))
         .ToArray();
@@ -897,9 +891,83 @@ static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditD
         auditEvent.DisplayTarget);
 }
 
-static bool ShouldPreFilterTimelineQuery(string? action)
+static async Task<IReadOnlyCollection<FileAuditEvent>> QueryTimelineSourceEventsAsync(
+    string? server,
+    string? share,
+    string? user,
+    string? action,
+    string? path,
+    string? sourceHost,
+    string? sourceIp,
+    string? extension,
+    string? result,
+    string? severity,
+    string? source,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    int take,
+    IEventRepository repository,
+    CancellationToken cancellationToken)
 {
-    return action?.Equals("deleted", StringComparison.OrdinalIgnoreCase) == true;
+    var actionFilter = BuildTimelineSourceActionFilter(action);
+    var shouldFocusUserInBaseQuery = !string.IsNullOrWhiteSpace(user)
+        && !string.IsNullOrWhiteSpace(actionFilter)
+        && IsDirectTimelineAction(action);
+    var baseTake = !shouldFocusUserInBaseQuery && !string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(actionFilter)
+        ? Math.Min(take, 5_000)
+        : take;
+    var baseQuery = new EventQuery(
+        Server: server,
+        Share: share,
+        User: shouldFocusUserInBaseQuery ? user : null,
+        Action: actionFilter,
+        Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: baseTake);
+
+    var events = (await repository.QueryAsync(baseQuery, cancellationToken)).ToList();
+
+    if (!shouldFocusUserInBaseQuery && !string.IsNullOrWhiteSpace(user) && !string.IsNullOrWhiteSpace(actionFilter))
+    {
+        var userFocused = await repository.QueryAsync(baseQuery with { User = user, Take = take }, cancellationToken);
+        var seen = events.Select(item => item.Id).ToHashSet();
+        foreach (var item in userFocused)
+        {
+            if (seen.Add(item.Id))
+            {
+                events.Add(item);
+            }
+        }
+    }
+
+    return events;
+}
+
+static string? BuildTimelineSourceActionFilter(string? action)
+{
+    return action?.Trim().ToLowerInvariant() switch
+    {
+        "accessed" => "accessed",
+        "created" => "created,created_or_appended,renamed,changed,modified",
+        "deleted" => "deleted",
+        "modified" => "modified,changed,created_or_appended",
+        "moved" => "moved,renamed,deleted,accessed,created,created_or_appended,modified,changed",
+        "permission_changed" => "permission_changed",
+        "renamed" => "renamed,moved,deleted,accessed,created,created_or_appended,modified,changed",
+        _ => null
+    };
+}
+
+static bool IsDirectTimelineAction(string? action)
+{
+    return action?.Trim().ToLowerInvariant() is "accessed" or "created" or "deleted" or "modified" or "permission_changed";
 }
 
 static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
@@ -1415,10 +1483,25 @@ internal sealed class SqlServerEventRepository : IEventRepository
             command.Parameters.AddWithValue("@User", $"%{query.User}%");
         }
 
-        if (!string.IsNullOrWhiteSpace(query.Action))
+        var actions = SplitFilterValues(query.Action)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (actions.Length == 1)
         {
             predicates.Add("ActionName = @Action");
-            command.Parameters.AddWithValue("@Action", query.Action);
+            command.Parameters.AddWithValue("@Action", actions[0]);
+        }
+        else if (actions.Length > 1)
+        {
+            var parameterNames = new List<string>();
+            for (var index = 0; index < actions.Length; index++)
+            {
+                var parameterName = $"@Action{index}";
+                parameterNames.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, actions[index]);
+            }
+
+            predicates.Add($"ActionName IN ({string.Join(", ", parameterNames)})");
         }
 
         if (!string.IsNullOrWhiteSpace(query.Path))
@@ -1845,9 +1928,12 @@ internal sealed class InMemoryEventRepository : IEventRepository
             events = events.Where(item => item.User.Contains(query.User, StringComparison.OrdinalIgnoreCase));
         }
 
-        if (!string.IsNullOrWhiteSpace(query.Action))
+        var actions = SplitFilterValues(query.Action)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (actions.Length > 0)
         {
-            events = events.Where(item => item.Action.Equals(query.Action, StringComparison.OrdinalIgnoreCase));
+            events = events.Where(item => actions.Contains(item.Action, StringComparer.OrdinalIgnoreCase));
         }
 
         if (!string.IsNullOrWhiteSpace(query.Path))
