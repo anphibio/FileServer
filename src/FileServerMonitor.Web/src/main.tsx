@@ -272,7 +272,7 @@ type GeneratedReport = {
 type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit";
 
 const emptyMonitoredPathForm: MonitoredPathForm = {
-  server: "FS01",
+  server: "FileServer",
   share: "",
   path: "",
   status: "planned",
@@ -593,7 +593,7 @@ function Dashboard({
           </label>
           <label>
             <span>Servidor</span>
-            <input value={summaryFilters.server} onChange={(event) => updateFilter("server", event.target.value)} placeholder="FS01" />
+            <input value={summaryFilters.server} onChange={(event) => updateFilter("server", event.target.value)} placeholder="FileServer" />
           </label>
           <label>
             <span>Compartilhamento</span>
@@ -861,7 +861,7 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
           )}
           <label>
             Servidor
-            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FS01" />
+            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FileServer" />
           </label>
           <label>
             Usuário
@@ -1087,7 +1087,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
           )}
           <label>
             Servidor
-            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FS01" />
+            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FileServer" />
           </label>
           <label>
             Compartilhamento
@@ -1483,7 +1483,7 @@ function AlertRulesEditor({
                 <input
                   value={rule.serverFilter ?? ""}
                   onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, serverFilter: event.target.value || null } })}
-                  placeholder="FS01"
+                  placeholder="FileServer"
                 />
               </td>
               <td>
