@@ -966,7 +966,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     setGeneratedReport(null);
 
     try {
-      const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, 1000));
+      const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, 5000));
       setEvents(result);
       setPage(1);
       setSearched(true);
@@ -2406,7 +2406,7 @@ function buildInvestigationUrl(filters: InvestigationFilters) {
   return `/api/events/timeline?${params.toString()}`;
 }
 
-function buildReportEventsUrl(filters: ReportFilters, take = 1000) {
+function buildReportEventsUrl(filters: ReportFilters, take = 5000) {
   const params = buildReportQueryParams(filters, take);
   return `/api/events/timeline?${params.toString()}`;
 }
