@@ -1038,14 +1038,14 @@ dd {
   justify-content: flex-end;
 }
 
-.report-results-grid {
+.report-results-stack {
   display: grid;
-  grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr);
   gap: 16px;
 }
 
 .report-group-list {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
   padding: 16px;
 }
@@ -1214,8 +1214,7 @@ dd {
   .split-grid,
   .analytics-grid,
   .report-filters,
-  .report-card-grid,
-  .report-results-grid {
+  .report-card-grid {
     grid-template-columns: 1fr;
   }
 

@@ -1171,7 +1171,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
 
       {error && <div className="error-banner">{error}</div>}
 
-      <section className="report-results-grid">
+      <section className="report-results-stack">
         <Panel title="Resumo por agrupamento" subtitle={`Top ${labelForReportGroup(filters.groupBy).toLowerCase()} no recorte investigado.`}>
           {groupedRows.length > 0 ? <ReportGroupList rows={groupedRows} total={events.length} /> : <EmptyState text="Consulte um recorte para gerar o resumo." />}
         </Panel>
