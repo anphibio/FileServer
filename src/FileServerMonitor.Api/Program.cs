@@ -5655,6 +5655,7 @@ internal sealed record LdapAuthSettings(
     int Port,
     string Security,
     int TimeoutSeconds,
+    bool ValidateTlsCertificate,
     string BaseDn,
     string BindFormat,
     string DomainSuffix,
@@ -5670,6 +5671,7 @@ internal sealed record LdapAuthSettings(
         Port: 636,
         Security: "LDAPS",
         TimeoutSeconds: 5,
+        ValidateTlsCertificate: true,
         BaseDn: "",
         BindFormat: "DOMINIO\\usuario",
         DomainSuffix: "",
@@ -5686,6 +5688,7 @@ internal sealed record LdapAuthSettingsRequest(
     int? Port,
     string? Security,
     int? TimeoutSeconds,
+    bool? ValidateTlsCertificate,
     string? BaseDn,
     string? BindFormat,
     string? DomainSuffix,
@@ -5700,6 +5703,7 @@ internal sealed record AuthConfigResponse(
     int Port,
     string Security,
     int TimeoutSeconds,
+    bool ValidateTlsCertificate,
     string BaseDn,
     string BindFormat,
     string DomainSuffix,
@@ -5719,6 +5723,7 @@ internal sealed record AuthConfigResponse(
             settings.Port,
             settings.Security,
             settings.TimeoutSeconds,
+            settings.ValidateTlsCertificate,
             settings.BaseDn,
             settings.BindFormat,
             settings.DomainSuffix,
@@ -5798,6 +5803,7 @@ internal sealed class LdapAuthSettingsStore
             Port: configuration.GetValue<int?>("Auth:Ldap:Port"),
             Security: configuration.GetValue<string>("Auth:Ldap:Security"),
             TimeoutSeconds: configuration.GetValue<int?>("Auth:Ldap:TimeoutSeconds"),
+            ValidateTlsCertificate: configuration.GetValue<bool?>("Auth:Ldap:ValidateTlsCertificate"),
             BaseDn: configuration.GetValue<string>("Auth:Ldap:BaseDn"),
             BindFormat: configuration.GetValue<string>("Auth:Ldap:BindFormat"),
             DomainSuffix: configuration.GetValue<string>("Auth:Ldap:DomainSuffix"),
@@ -5851,6 +5857,7 @@ internal sealed class LdapAuthSettingsStore
             Port: port,
             Security: security,
             TimeoutSeconds: Math.Clamp(request.TimeoutSeconds ?? 5, 1, 60),
+            ValidateTlsCertificate: request.ValidateTlsCertificate ?? true,
             BaseDn: Trim(request.BaseDn),
             BindFormat: string.IsNullOrWhiteSpace(request.BindFormat) ? "DOMINIO\\usuario" : request.BindFormat.Trim(),
             DomainSuffix: Trim(request.DomainSuffix),
@@ -5874,28 +5881,27 @@ internal sealed class LdapAuthSettingsStore
     {
         await using var connection = CreateSqlConnection();
         await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
 
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
-                SELECT CAST(NULL AS BIT) AS Enabled WHERE 1 = 0;
-            ELSE
-                SELECT TOP (1)
-                    Enabled,
-                    HostName,
-                    PortNumber,
-                    SecurityMode,
-                    TimeoutSeconds,
-                    BaseDn,
-                    BindFormat,
-                    DomainSuffix,
-                    NetbiosDomain,
-                    AdminGroupDn,
-                    OperatorGroupDn,
-                    ReaderGroupDn,
-                    UpdatedUtc
-                FROM dbo.LdapAuthSettings
-                WHERE Id = 1;
+            SELECT TOP (1)
+                Enabled,
+                HostName,
+                PortNumber,
+                SecurityMode,
+                TimeoutSeconds,
+                ValidateTlsCertificate,
+                BaseDn,
+                BindFormat,
+                DomainSuffix,
+                NetbiosDomain,
+                AdminGroupDn,
+                OperatorGroupDn,
+                ReaderGroupDn,
+                UpdatedUtc
+            FROM dbo.LdapAuthSettings
+            WHERE Id = 1;
             """;
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -5906,30 +5912,10 @@ internal sealed class LdapAuthSettingsStore
     {
         await using var connection = CreateSqlConnection();
         await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
 
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
-            BEGIN
-                CREATE TABLE dbo.LdapAuthSettings
-                (
-                    Id INT NOT NULL CONSTRAINT PK_LdapAuthSettings PRIMARY KEY,
-                    Enabled BIT NOT NULL,
-                    HostName NVARCHAR(256) NOT NULL,
-                    PortNumber INT NOT NULL,
-                    SecurityMode NVARCHAR(16) NOT NULL,
-                    TimeoutSeconds INT NOT NULL,
-                    BaseDn NVARCHAR(1024) NOT NULL,
-                    BindFormat NVARCHAR(64) NOT NULL,
-                    DomainSuffix NVARCHAR(256) NOT NULL,
-                    NetbiosDomain NVARCHAR(128) NOT NULL,
-                    AdminGroupDn NVARCHAR(1024) NOT NULL,
-                    OperatorGroupDn NVARCHAR(1024) NOT NULL,
-                    ReaderGroupDn NVARCHAR(1024) NOT NULL,
-                    UpdatedUtc DATETIME2(3) NOT NULL
-                );
-            END;
-
             MERGE dbo.LdapAuthSettings AS target
             USING (SELECT 1 AS Id) AS source
                 ON target.Id = source.Id
@@ -5940,6 +5926,7 @@ internal sealed class LdapAuthSettingsStore
                     PortNumber = @PortNumber,
                     SecurityMode = @SecurityMode,
                     TimeoutSeconds = @TimeoutSeconds,
+                    ValidateTlsCertificate = @ValidateTlsCertificate,
                     BaseDn = @BaseDn,
                     BindFormat = @BindFormat,
                     DomainSuffix = @DomainSuffix,
@@ -5957,6 +5944,7 @@ internal sealed class LdapAuthSettingsStore
                     PortNumber,
                     SecurityMode,
                     TimeoutSeconds,
+                    ValidateTlsCertificate,
                     BaseDn,
                     BindFormat,
                     DomainSuffix,
@@ -5974,6 +5962,7 @@ internal sealed class LdapAuthSettingsStore
                     @PortNumber,
                     @SecurityMode,
                     @TimeoutSeconds,
+                    @ValidateTlsCertificate,
                     @BaseDn,
                     @BindFormat,
                     @DomainSuffix,
@@ -5985,6 +5974,40 @@ internal sealed class LdapAuthSettingsStore
                 );
             """;
         AddParameters(command, settings);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureSqlSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.LdapAuthSettings
+                (
+                    Id INT NOT NULL CONSTRAINT PK_LdapAuthSettings PRIMARY KEY,
+                    Enabled BIT NOT NULL,
+                    HostName NVARCHAR(256) NOT NULL,
+                    PortNumber INT NOT NULL,
+                    SecurityMode NVARCHAR(16) NOT NULL,
+                    TimeoutSeconds INT NOT NULL,
+                    ValidateTlsCertificate BIT NOT NULL,
+                    BaseDn NVARCHAR(1024) NOT NULL,
+                    BindFormat NVARCHAR(64) NOT NULL,
+                    DomainSuffix NVARCHAR(256) NOT NULL,
+                    NetbiosDomain NVARCHAR(128) NOT NULL,
+                    AdminGroupDn NVARCHAR(1024) NOT NULL,
+                    OperatorGroupDn NVARCHAR(1024) NOT NULL,
+                    ReaderGroupDn NVARCHAR(1024) NOT NULL,
+                    UpdatedUtc DATETIME2(3) NOT NULL
+                );
+            END;
+            ELSE IF COL_LENGTH(N'dbo.LdapAuthSettings', N'ValidateTlsCertificate') IS NULL
+            BEGIN
+                ALTER TABLE dbo.LdapAuthSettings
+                ADD ValidateTlsCertificate BIT NOT NULL CONSTRAINT DF_LdapAuthSettings_ValidateTlsCertificate DEFAULT (1);
+            END;
+            """;
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -6005,6 +6028,7 @@ internal sealed class LdapAuthSettingsStore
         command.Parameters.AddWithValue("@PortNumber", settings.Port);
         command.Parameters.AddWithValue("@SecurityMode", settings.Security);
         command.Parameters.AddWithValue("@TimeoutSeconds", settings.TimeoutSeconds);
+        command.Parameters.AddWithValue("@ValidateTlsCertificate", settings.ValidateTlsCertificate);
         command.Parameters.AddWithValue("@BaseDn", settings.BaseDn);
         command.Parameters.AddWithValue("@BindFormat", settings.BindFormat);
         command.Parameters.AddWithValue("@DomainSuffix", settings.DomainSuffix);
@@ -6023,6 +6047,7 @@ internal sealed class LdapAuthSettingsStore
             Port: reader.GetInt32(reader.GetOrdinal("PortNumber")),
             Security: reader.GetString(reader.GetOrdinal("SecurityMode")),
             TimeoutSeconds: reader.GetInt32(reader.GetOrdinal("TimeoutSeconds")),
+            ValidateTlsCertificate: reader.GetBoolean(reader.GetOrdinal("ValidateTlsCertificate")),
             BaseDn: reader.GetString(reader.GetOrdinal("BaseDn")),
             BindFormat: reader.GetString(reader.GetOrdinal("BindFormat")),
             DomainSuffix: reader.GetString(reader.GetOrdinal("DomainSuffix")),
@@ -6083,6 +6108,10 @@ internal sealed class LdapAuthenticator
 
     private static LdapConnection CreateConnection(LdapAuthSettings settings)
     {
+        Environment.SetEnvironmentVariable(
+            "LDAPTLS_REQCERT",
+            settings.ValidateTlsCertificate ? "demand" : "never");
+
         var identifier = new LdapDirectoryIdentifier(settings.Host, settings.Port, fullyQualifiedDnsHostName: false, connectionless: false);
         var connection = new LdapConnection(identifier)
         {
@@ -6094,6 +6123,11 @@ internal sealed class LdapAuthenticator
         if (settings.Security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase))
         {
             connection.SessionOptions.SecureSocketLayer = true;
+
+            if (!settings.ValidateTlsCertificate)
+            {
+                connection.SessionOptions.VerifyServerCertificate = (_, _) => true;
+            }
         }
 
         return connection;

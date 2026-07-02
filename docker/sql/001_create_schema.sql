@@ -470,6 +470,7 @@ BEGIN
         PortNumber INT NOT NULL,
         SecurityMode NVARCHAR(16) NOT NULL,
         TimeoutSeconds INT NOT NULL,
+        ValidateTlsCertificate BIT NOT NULL,
         BaseDn NVARCHAR(1024) NOT NULL,
         BindFormat NVARCHAR(64) NOT NULL,
         DomainSuffix NVARCHAR(256) NOT NULL,

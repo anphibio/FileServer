@@ -61,6 +61,7 @@ type AuthConfig = {
   port: number;
   security: string;
   timeoutSeconds: number;
+  validateTlsCertificate: boolean;
   baseDn: string;
   bindFormat: string;
   domainSuffix: string;
@@ -763,6 +764,10 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
           <label className="check-row">
             <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
             Habilitar autenticacao LDAP/AD
+          </label>
+          <label className="check-row">
+            <input type="checkbox" checked={config.validateTlsCertificate} onChange={(event) => update("validateTlsCertificate", event.target.checked)} />
+            Validar certificado TLS
           </label>
 
           <div className="form-grid four">
