@@ -19,10 +19,6 @@ import {
   Trash2
 } from "lucide-react";
 import "./styles.css";
-import {
-  buildDisplayEvents as buildTimelineDisplayEvents,
-  type FileAuditEvent as TimelineFileAuditEvent
-} from "./event-timeline";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 const apiKey = import.meta.env.VITE_API_KEY ?? "";
@@ -262,7 +258,7 @@ const EVENTS_PAGE_SIZE = 25;
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("dashboard");
   const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [events, setEvents] = useState<FileAuditEvent[]>([]);
+  const [events, setEvents] = useState<DisplayEvent[]>([]);
   const [alerts, setAlerts] = useState<FileServerAlert[]>([]);
   const [alertRules, setAlertRules] = useState<AlertRuleConfig[]>([]);
   const [agents, setAgents] = useState<AgentHealth[]>([]);
@@ -610,7 +606,7 @@ function Dashboard({
 
       <section className="split-grid">
         <Panel title="Eventos Recentes" subtitle="Linha curta para leitura operacional rápida.">
-          <EventTable events={latestEvents} compact precomputed />
+          <EventTable events={latestEvents} compact />
         </Panel>
         <Panel title="Alertas Recentes" subtitle="Itens abertos mais recentes e mais acionáveis.">
           <AlertList alerts={openAlerts.slice(0, 8)} />
@@ -674,7 +670,7 @@ function EventsView({
   onNotify,
   pagination
 }: {
-  events: FileAuditEvent[];
+  events: DisplayEvent[];
   filter: string;
   onFilterChange: (value: string) => void;
   onNotify: (notice: Notice | null) => void;
@@ -697,7 +693,7 @@ function EventsView({
         </button>
       </div>
       <Panel title="Linha do Tempo">
-        <EventTable events={events} precomputed pagination={pagination} />
+        <EventTable events={events} pagination={pagination} />
       </Panel>
     </div>
   );
@@ -705,7 +701,7 @@ function EventsView({
 
 function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
   const [filters, setFilters] = useState<InvestigationFilters>(defaultInvestigationFilters);
-  const [events, setEvents] = useState<FileAuditEvent[]>([]);
+  const [events, setEvents] = useState<DisplayEvent[]>([]);
   const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -852,7 +848,6 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
         {searched ? (
           <InvestigationTable
             events={visibleDisplayEvents}
-            precomputed
             pagination={{
               page: safePage,
               totalPages,
@@ -1596,19 +1591,12 @@ function AdminAuditView({ entries }: { entries: AdminAuditEntry[] }) {
 function EventTable({
   events,
   compact = false,
-  precomputed = false,
   pagination
 }: {
-  events: FileAuditEvent[];
+  events: DisplayEvent[];
   compact?: boolean;
-  precomputed?: boolean;
   pagination?: PaginationState;
 }) {
-  const displayEvents = useMemo<DisplayEvent[]>(
-    () => (precomputed ? (events as DisplayEvent[]) : buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[]),
-    [events, precomputed]
-  );
-
   return (
     <div className="table-wrap">
       <table>
@@ -1622,7 +1610,7 @@ function EventTable({
           </tr>
         </thead>
         <tbody>
-          {displayEvents.map((event) => (
+          {events.map((event) => (
             <tr key={event.id}>
               <td>{formatDate(event.timestampUtc)}</td>
               <td>
@@ -1654,7 +1642,7 @@ function EventTable({
           ))}
         </tbody>
       </table>
-      {displayEvents.length === 0 && <EmptyState text="Nenhum evento encontrado." />}
+      {events.length === 0 && <EmptyState text="Nenhum evento encontrado." />}
       {pagination && pagination.totalItems > 0 && <PaginationFooter pagination={pagination} />}
     </div>
   );
@@ -1662,18 +1650,11 @@ function EventTable({
 
 function InvestigationTable({
   events,
-  precomputed = false,
   pagination
 }: {
-  events: FileAuditEvent[];
-  precomputed?: boolean;
+  events: DisplayEvent[];
   pagination?: PaginationState;
 }) {
-  const displayEvents = useMemo<DisplayEvent[]>(
-    () => (precomputed ? (events as DisplayEvent[]) : buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[]),
-    [events, precomputed]
-  );
-
   return (
     <div className="table-wrap">
       <table>
@@ -1690,7 +1671,7 @@ function InvestigationTable({
           </tr>
         </thead>
         <tbody>
-          {displayEvents.map((event) => (
+          {events.map((event) => (
             <tr key={event.id}>
               <td>{formatDate(event.timestampUtc)}</td>
               <td>
@@ -1709,7 +1690,7 @@ function InvestigationTable({
           ))}
         </tbody>
       </table>
-      {displayEvents.length === 0 && <EmptyState text="Nenhum evento encontrado para os filtros informados." />}
+      {events.length === 0 && <EmptyState text="Nenhum evento encontrado para os filtros informados." />}
       {pagination && pagination.totalItems > 0 && <PaginationFooter pagination={pagination} />}
     </div>
   );
