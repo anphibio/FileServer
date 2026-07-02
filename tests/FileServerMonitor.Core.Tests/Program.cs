@@ -29,6 +29,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
     ("timeline preserva alteracao real antes de exclusao", TimelineKeepsRealModificationBeforeDelete),
     ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
+    ("timeline trata append de texto do security log como alteracao", TimelineTreatsSecurityTextAppendCreateAsModification),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
 };
@@ -652,6 +653,24 @@ static void TimelineKeepsRealModificationBeforeAccess()
     Assert(targetEvents.Length == 1, "Acesso posterior a alteracao deveria ser tratado como eco.");
     Assert(targetEvents[0].Action == "modified", "Alteracao real nao deveria virar criacao quando depois chega acesso.");
     Assert(targetEvents[0].DisplayAction == "Alterado", "Evento final do arquivo deveria permanecer Alterado.");
+}
+
+static void TimelineTreatsSecurityTextAppendCreateAsModification()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-02T10:50:12Z");
+    var path = @"C:\Corporativo\RH\Novo(a) Documento de Texto - Copia (2).txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(6), "accessed", path, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    Assert(display.Length == 1, "Append de texto seguido de acesso deveria aparecer como uma unica alteracao.");
+    Assert(display[0].Action == "modified", "Criacao/append do Security Log em arquivo texto existente deveria virar alteracao.");
+    Assert(display[0].DisplayAction == "Alterado", "Evento final deveria aparecer como Alterado.");
 }
 
 static void TimelineCollapsesRenameDuplicateAfterUserResolution()

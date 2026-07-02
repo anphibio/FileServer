@@ -106,7 +106,8 @@ public sealed class EventTimelineProjector
     {
         var normalized = NormalizeProvisionalCreateTransitions(events).ToArray();
         var resolvedUsers = ResolveUnknownDisplayUsers(normalized).ToArray();
-        var syntheticCreations = SynthesizeLikelyCreations(resolvedUsers, rawEvents).ToArray();
+        var normalizedSecurityTextAppends = NormalizeSecurityTextAppendCreates(resolvedUsers).ToArray();
+        var syntheticCreations = SynthesizeLikelyCreations(normalizedSecurityTextAppends, rawEvents).ToArray();
         var syntheticDeletes = SynthesizeLikelyDescendantDeletions(syntheticCreations).ToArray();
         var promotedCreations = PromoteLikelyInitialCreations(syntheticDeletes).ToArray();
 
@@ -389,6 +390,50 @@ public sealed class EventTimelineProjector
                 DisplayTarget = GetLeafName(item.Path)
             };
         });
+    }
+
+    private static IEnumerable<FileAuditDisplayEvent> NormalizeSecurityTextAppendCreates(IEnumerable<FileAuditDisplayEvent> events)
+    {
+        var all = events.ToArray();
+        return all.Select(item =>
+        {
+            if (item.Action is not ("created" or "created_or_appended")
+                || !item.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
+                || GetProvisionalDocumentKind(item.Path) != "text"
+                || HasNearbyUsnCreation(item, all)
+                || !HasLaterDisplayAccessEcho(item, all))
+            {
+                return item;
+            }
+
+            return item with
+            {
+                Action = "modified",
+                DisplayAction = "Alterado",
+                DisplayTarget = GetLeafName(item.Path)
+            };
+        });
+    }
+
+    private static bool HasNearbyUsnCreation(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
+    {
+        return all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase)
+            && candidate.Action is "created" or "created_or_appended"
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
+            && PathsReferToSameItem(candidate.Path, item.Path));
+    }
+
+    private static bool HasLaterDisplayAccessEcho(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
+    {
+        return all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Action == "accessed"
+            && candidate.TimestampUtc > item.TimestampUtc
+            && candidate.TimestampUtc - item.TimestampUtc >= TimeSpan.FromSeconds(2)
+            && candidate.TimestampUtc - item.TimestampUtc <= TimeSpan.FromSeconds(30)
+            && PathsReferToSameItem(candidate.Path, item.Path));
     }
 
     private static IEnumerable<FileAuditDisplayEvent> ResolveUnknownDisplayUsers(IEnumerable<FileAuditDisplayEvent> events)
@@ -1719,7 +1764,7 @@ public sealed class EventTimelineProjector
     private static string? GetProvisionalDocumentKind(string path)
     {
         var leaf = Regex.Replace(GetLeafName(path).ToLowerInvariant(), @" \(\d+\)(?=\.[^.]+$)", "");
-        if ((leaf.Contains("novo documento de texto") || leaf.Contains("new text document")) && leaf.EndsWith(".txt", StringComparison.Ordinal))
+        if ((leaf.Contains("documento de texto") || leaf.Contains("new text document")) && leaf.EndsWith(".txt", StringComparison.Ordinal))
         {
             return "text";
         }

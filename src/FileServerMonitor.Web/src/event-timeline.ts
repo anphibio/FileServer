@@ -132,7 +132,8 @@ export function buildDisplayEvents(events: FileAuditEvent[]) {
 function refineDisplayEvents(events: DisplayEvent[], rawEvents: FileAuditEvent[]) {
   const withProvisionalCreates = normalizeProvisionalCreateTransitions(events);
   const withResolvedUsers = resolveUnknownDisplayUsers(withProvisionalCreates);
-  const withSyntheticCreations = synthesizeLikelyCreations(withResolvedUsers, rawEvents);
+  const withNormalizedSecurityTextAppends = normalizeSecurityTextAppendCreates(withResolvedUsers);
+  const withSyntheticCreations = synthesizeLikelyCreations(withNormalizedSecurityTextAppends, rawEvents);
   const withSyntheticDeletes = synthesizeLikelyDescendantDeletions(withSyntheticCreations);
   const withPromotedCreations = promoteLikelyInitialCreations(withSyntheticDeletes);
 
@@ -243,6 +244,48 @@ function buildSyntheticCreationEvent(event: FileAuditEvent, path: string, timest
     displayAction: "Criação",
     displayTarget: getLeafName(path)
   } satisfies DisplayEvent;
+}
+
+function normalizeSecurityTextAppendCreates(events: DisplayEvent[]) {
+  return events.map((event) => {
+    if ((event.action !== "created" && event.action !== "created_or_appended")
+      || event.source !== "windows-security-log"
+      || getProvisionalDocumentKind(event.path) !== "text"
+      || hasNearbyUsnCreation(event, events)
+      || !hasLaterDisplayAccessEcho(event, events)) {
+      return event;
+    }
+
+    return {
+      ...event,
+      action: "modified",
+      displayAction: "Alterado",
+      displayTarget: getLeafName(event.path)
+    } satisfies DisplayEvent;
+  });
+}
+
+function hasNearbyUsnCreation(event: DisplayEvent, events: DisplayEvent[]) {
+  const eventTime = new Date(event.timestampUtc).getTime();
+  return events.some((candidate) =>
+    candidate.id !== event.id
+    && candidate.source.includes("usn-journal")
+    && (candidate.action === "created" || candidate.action === "created_or_appended")
+    && Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) <= 5_000
+    && pathsReferToSameItem(candidate.path, event.path));
+}
+
+function hasLaterDisplayAccessEcho(event: DisplayEvent, events: DisplayEvent[]) {
+  const eventTime = new Date(event.timestampUtc).getTime();
+  return events.some((candidate) => {
+    const candidateTime = new Date(candidate.timestampUtc).getTime();
+    return candidate.id !== event.id
+      && candidate.action === "accessed"
+      && candidateTime > eventTime
+      && candidateTime - eventTime >= 2_000
+      && candidateTime - eventTime <= 30_000
+      && pathsReferToSameItem(candidate.path, event.path);
+  });
 }
 
 function synthesizeLikelyDescendantDeletions(events: DisplayEvent[]) {
@@ -1761,8 +1804,8 @@ function getProvisionalDocumentKind(path: string) {
 
   const provisionalKinds: Array<[string, RegExp[]]> = [
     ["text", [
-      /^novo documento de texto\.txt$/,
-      /^new text document\.txt$/
+      /^.*documento de texto.*\.txt$/,
+      /^.*new text document.*\.txt$/
     ]],
     ["excel", [
       /^novo\(a\) planilha do microsoft excel.*\.xlsx$/,

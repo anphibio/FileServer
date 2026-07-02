@@ -485,6 +485,28 @@ test("keeps a real modification before a later access echo", () => {
   assert.deepEqual(display.filter((event) => event.path === targetPath).map((event) => event.displayAction), ["Alterado"]);
 });
 
+test("treats security log text append creation as modification", () => {
+  const targetPath = "C:\\Corporativo\\RH\\Novo(a) Documento de Texto - Copia (2).txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "target-created",
+      timestampUtc: "2026-07-02T10:50:12.000Z",
+      path: targetPath,
+      action: "created",
+      source: "windows-security-log"
+    }),
+    buildEvent({
+      id: "target-accessed",
+      timestampUtc: "2026-07-02T10:50:18.000Z",
+      path: targetPath,
+      action: "accessed",
+      source: "usn-journal+security-log"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.path, event.displayAction]), [[targetPath, "Alterado"]]);
+});
+
 test("promotes a modified folder to creation when its children are created in the same batch", () => {
   const folderPath = "C:\\Corporativo\\teste";
   const childPath = "C:\\Corporativo\\teste\\Example txt file.txt";
