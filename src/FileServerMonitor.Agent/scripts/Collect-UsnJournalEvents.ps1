@@ -15,7 +15,9 @@ param(
 
     [string]$RawCsvPath,
 
-    [string]$KnownPathByFileIdJson
+    [string]$KnownPathByFileIdJson,
+
+    [string]$KnownPathByFileIdJsonPath
 )
 
 Set-StrictMode -Version Latest
@@ -377,9 +379,16 @@ $selectedRecords = @(
 $currentPathByFileId = @{}
 $pendingRenameOldPathByFileId = @{}
 
-if (-not [string]::IsNullOrWhiteSpace($KnownPathByFileIdJson)) {
+$effectiveKnownPathByFileIdJson = $KnownPathByFileIdJson
+if ([string]::IsNullOrWhiteSpace($effectiveKnownPathByFileIdJson) -and -not [string]::IsNullOrWhiteSpace($KnownPathByFileIdJsonPath)) {
+    if (Test-Path -LiteralPath $KnownPathByFileIdJsonPath) {
+        $effectiveKnownPathByFileIdJson = Get-Content -LiteralPath $KnownPathByFileIdJsonPath -Raw
+    }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($effectiveKnownPathByFileIdJson)) {
     try {
-        $knownPaths = $KnownPathByFileIdJson | ConvertFrom-Json
+        $knownPaths = $effectiveKnownPathByFileIdJson | ConvertFrom-Json
         foreach ($property in $knownPaths.PSObject.Properties) {
             Add-ResolvedPath -Map $currentPathByFileId -FileId $property.Name -Path ([string]$property.Value) -BasePath $normalizedBasePath
         }

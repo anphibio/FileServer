@@ -184,7 +184,6 @@ internal sealed class FileServerAgent
             .OrderBy(item => item.Usn ?? long.MaxValue)
             .ThenBy(item => item.RecordId ?? long.MaxValue)
             .ThenBy(item => item.TimestampUtc)
-            .Take(_options.BatchSize)
             .ToArray();
 
         Console.WriteLine($"Coleta final: brutos={collected.Count}; pos-correlacao={output.Count}; pos-filtro={filtered.Length}");
@@ -260,6 +259,7 @@ internal sealed class FileServerAgent
 
     private string BuildUsnJournalArguments(string scriptPath, string volume, long startUsn, string basePath)
     {
+        var knownPathMapPath = WriteKnownPathMapFile(volume);
         var parts = new List<string>
         {
             "-NoProfile",
@@ -280,7 +280,28 @@ internal sealed class FileServerAgent
             Quote(GetEffectiveDefaultShare())
         };
 
+        if (!string.IsNullOrWhiteSpace(knownPathMapPath))
+        {
+            parts.Add("-KnownPathByFileIdJsonPath");
+            parts.Add(Quote(knownPathMapPath));
+        }
+
         return string.Join(" ", parts);
+    }
+
+    private string? WriteKnownPathMapFile(string volume)
+    {
+        if (!_state.KnownPathByFileIdByVolume.TryGetValue(volume, out var knownPaths) || knownPaths.Count == 0)
+        {
+            return null;
+        }
+
+        var stateDirectory = Path.GetDirectoryName(_options.StateFile) ?? ".";
+        Directory.CreateDirectory(stateDirectory);
+        var safeVolume = volume.Replace(":", "", StringComparison.Ordinal).Replace('\\', '_').Replace('/', '_');
+        var path = Path.Combine(stateDirectory, $"known-paths-{safeVolume}.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(knownPaths, JsonOptions), Encoding.UTF8);
+        return path;
     }
 
     private string GetEffectiveUsnBasePath(string volume)
@@ -369,16 +390,21 @@ internal sealed class FileServerAgent
 
         try
         {
-            using var response = await _httpClient.PostAsJsonAsync("/api/events/batch", events, JsonOptions, cancellationToken);
-
-            if (response.IsSuccessStatusCode)
+            foreach (var chunk in events.Chunk(1_000))
             {
-                return true;
+                using var response = await _httpClient.PostAsJsonAsync("/api/events/batch", chunk, JsonOptions, cancellationToken);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    continue;
+                }
+
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                Console.Error.WriteLine($"API rejeitou lote: {(int)response.StatusCode} {body}");
+                return false;
             }
 
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
-            Console.Error.WriteLine($"API rejeitou lote: {(int)response.StatusCode} {body}");
-            return false;
+            return true;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
@@ -621,8 +647,34 @@ internal sealed class FileServerAgent
                     : 0;
 
                 _state.LastUsnByVolume[item.Volume] = Math.Max(current, item.Usn.Value);
+
+                UpdateKnownPathMap(item);
             }
         }
+    }
+
+    private void UpdateKnownPathMap(CollectedFileEvent item)
+    {
+        if (string.IsNullOrWhiteSpace(item.Volume)
+            || string.IsNullOrWhiteSpace(item.FileReferenceId)
+            || string.IsNullOrWhiteSpace(item.Path))
+        {
+            return;
+        }
+
+        if (!_state.KnownPathByFileIdByVolume.TryGetValue(item.Volume, out var knownPaths))
+        {
+            knownPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            _state.KnownPathByFileIdByVolume[item.Volume] = knownPaths;
+        }
+
+        if (item.Action.Equals("deleted", StringComparison.OrdinalIgnoreCase))
+        {
+            knownPaths.Remove(item.FileReferenceId);
+            return;
+        }
+
+        knownPaths[item.FileReferenceId] = item.Path;
     }
 
     private static IEnumerable<CollectedFileEvent> DeduplicateCollectedEvents(IEnumerable<CollectedFileEvent> events)
@@ -803,6 +855,8 @@ internal sealed record AgentState
 
     public Dictionary<string, long> LastUsnByVolume { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    public Dictionary<string, Dictionary<string, string>> KnownPathByFileIdByVolume { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public DateTimeOffset? LastSuccessfulSendUtc { get; set; }
 
     public static AgentState Load(string path)
@@ -818,6 +872,14 @@ internal sealed record AgentState
 
         state.LastUsnByVolume = new Dictionary<string, long>(
             state.LastUsnByVolume ?? new Dictionary<string, long>(),
+            StringComparer.OrdinalIgnoreCase);
+
+        state.KnownPathByFileIdByVolume = new Dictionary<string, Dictionary<string, string>>(
+            (state.KnownPathByFileIdByVolume ?? new Dictionary<string, Dictionary<string, string>>())
+                .ToDictionary(
+                    item => item.Key,
+                    item => new Dictionary<string, string>(item.Value ?? new Dictionary<string, string>(), StringComparer.OrdinalIgnoreCase),
+                    StringComparer.OrdinalIgnoreCase),
             StringComparer.OrdinalIgnoreCase);
 
         return state;

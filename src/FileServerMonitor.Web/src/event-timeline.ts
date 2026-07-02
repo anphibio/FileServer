@@ -945,18 +945,25 @@ function isRedundantDisplayChangedEcho(event: DisplayEvent, allEvents: DisplayEv
     return false;
   }
 
-  return allEvents.some((candidate) =>
-    candidate.id !== event.id
-    && Math.abs(new Date(candidate.timestampUtc).getTime() - new Date(event.timestampUtc).getTime()) <= 15_000
-    && (
-      normalizePath(candidate.path) === normalizePath(event.path)
-      || normalizePath(candidate.previousPath) === normalizePath(event.path)
-    )
-    && (candidate.action === "renamed"
-      || candidate.action === "moved"
-      || candidate.action === "created"
-      || candidate.action === "created_or_appended"
-      || candidate.action === "deleted"));
+  const eventPath = normalizePath(event.path);
+  const eventTime = new Date(event.timestampUtc).getTime();
+
+  return allEvents.some((candidate) => {
+    if (candidate.id === event.id
+      || Math.abs(new Date(candidate.timestampUtc).getTime() - eventTime) > 15_000
+      || (candidate.action !== "renamed"
+        && candidate.action !== "moved"
+        && candidate.action !== "created"
+        && candidate.action !== "created_or_appended"
+        && candidate.action !== "deleted")) {
+      return false;
+    }
+
+    return normalizePath(candidate.path) === eventPath
+      || normalizePath(candidate.previousPath) === eventPath
+      || eventPath === normalizePath(getParentPath(candidate.path))
+      || eventPath === normalizePath(getParentPath(candidate.previousPath ?? ""));
+  });
 }
 
 function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayEvent[]) {
@@ -1585,6 +1592,24 @@ function tryBuildSecurityLogRenameTransition(
     && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500
     && isLikelySecurityTransitionTarget(deleted.event.path, event.path, deletedExtension));
   if (!target) {
+    return null;
+  }
+
+  const targetLooksNew = relevant.some(({ event }) =>
+    event.id !== target.event.id
+    && (event.action === "created" || event.action === "created_or_appended")
+    && pathsReferToSameItem(event.path, target.event.path)
+    && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500);
+  if (targetLooksNew) {
+    return null;
+  }
+
+  const targetWasDeletedInSameWindow = relevant.some(({ event }) =>
+    event.id !== target.event.id
+    && event.action === "deleted"
+    && pathsReferToSameItem(event.path, target.event.path)
+    && Math.abs(new Date(event.timestampUtc).getTime() - deletedTime) <= 2_500);
+  if (targetWasDeletedInSameWindow) {
     return null;
   }
 

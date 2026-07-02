@@ -1297,6 +1297,106 @@ test("reconstructs a file move from security delete and destination access", () 
   ]);
 });
 
+test("does not turn parallel same-name deletes into moves", () => {
+  const left = "C:\\Corporativo\\load\\worker-02\\delete-tree";
+  const right = "C:\\Corporativo\\load\\worker-04\\delete-tree";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "right-deleted",
+      timestampUtc: "2026-07-02T04:58:26.370Z",
+      path: right,
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "left-accessed",
+      timestampUtc: "2026-07-02T04:58:26.370Z",
+      path: left,
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "left-parent-touched",
+      timestampUtc: "2026-07-02T04:58:26.370Z",
+      path: "C:\\Corporativo\\load\\worker-02",
+      action: "modified",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator",
+      objectType: "folder"
+    }),
+    buildEvent({
+      id: "left-deleted",
+      timestampUtc: "2026-07-02T04:58:26.373Z",
+      path: left,
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.deepEqual(display.map((event) => [event.displayAction, event.path, event.previousPath]), [
+    ["Excluído", left, null],
+    ["Excluído", right, null]
+  ]);
+});
+
+test("does not treat a newly created sibling path as a move destination", () => {
+  const source = "C:\\Corporativo\\load\\worker-03\\move-04.txt";
+  const unrelatedNewFile = "C:\\Corporativo\\load\\worker-04\\move-04.txt";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "source-deleted",
+      timestampUtc: "2026-07-02T05:08:53.670Z",
+      path: source,
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator"
+    }),
+    buildEvent({
+      id: "target-created",
+      timestampUtc: "2026-07-02T05:08:53.390Z",
+      path: unrelatedNewFile,
+      action: "created_or_appended",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator"
+    }),
+    buildEvent({
+      id: "target-accessed",
+      timestampUtc: "2026-07-02T05:08:53.390Z",
+      path: unrelatedNewFile,
+      action: "accessed",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator"
+    }),
+    buildEvent({
+      id: "target-deleted",
+      timestampUtc: "2026-07-02T05:08:53.643Z",
+      path: unrelatedNewFile,
+      action: "deleted",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator"
+    }),
+    buildEvent({
+      id: "target-parent-touched",
+      timestampUtc: "2026-07-02T05:08:53.390Z",
+      path: "C:\\Corporativo\\load\\worker-04",
+      action: "modified",
+      source: "windows-security-log",
+      user: "FILESERVER\\Administrator",
+      objectType: "folder"
+    })
+  ]);
+
+  assert.equal(display.some((event) => event.displayAction === "Movido"), false);
+  assert.equal(display.some((event) => event.displayAction === "Excluído" && event.path === source), true);
+  assert.equal(display.some((event) => event.displayAction === "Criação" && event.path === unrelatedNewFile), true);
+});
+
 test("reconstructs a folder move from security delete and destination access despite same-path usn rename", () => {
   const display = buildDisplayEvents([
     buildEvent({
