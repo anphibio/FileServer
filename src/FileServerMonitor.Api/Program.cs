@@ -9,6 +9,8 @@ using Microsoft.Data.SqlClient;
 
 var builder = WebApplication.CreateBuilder(args);
 var apiStartedUtc = DateTimeOffset.UtcNow;
+const string TimelineCorrelationVersion = "core-v1";
+const int TimelineRebuildPaddingSeconds = 30;
 
 builder.Services.Configure<MonitorOptions>(
     builder.Configuration.GetSection(MonitorOptions.SectionName));
@@ -53,14 +55,17 @@ if (storageProvider.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
 {
 #if SQLSERVER
     builder.Services.AddSingleton<IEventRepository, SqlServerEventRepository>();
+    builder.Services.AddSingleton<ITimelineRepository, SqlServerTimelineRepository>();
 #else
     Console.Error.WriteLine("SQL Server desativado neste build. Usando armazenamento em memoria.");
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
+    builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
 #endif
 }
 else
 {
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
+    builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
 }
 
 var app = builder.Build();
@@ -152,11 +157,13 @@ app.MapGet("/metrics", async (
 app.MapPost("/api/events", async (
     FileAuditEventRequest request,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
     var auditEvent = request.ToAuditEvent();
     await repository.AddAsync(auditEvent, cancellationToken);
+    await RebuildTimelineForIngestedEventsAsync(new[] { auditEvent }, repository, timelineRepository, cancellationToken);
     var generatedAlerts = await alerts.AnalyzeAsync(new[] { auditEvent }, cancellationToken);
 
     return Results.Created($"/api/events/{auditEvent.Id}", new EventIngestResponse(auditEvent, generatedAlerts));
@@ -165,6 +172,7 @@ app.MapPost("/api/events", async (
 app.MapPost("/api/events/batch", async (
     FileAuditEventRequest[] requests,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
@@ -180,6 +188,7 @@ app.MapPost("/api/events/batch", async (
 
     var events = requests.Select(request => request.ToAuditEvent()).ToArray();
     await repository.AddBatchAsync(events, cancellationToken);
+    await RebuildTimelineForIngestedEventsAsync(events, repository, timelineRepository, cancellationToken);
     var generatedAlerts = await alerts.AnalyzeAsync(events, cancellationToken);
 
     return Results.Accepted(value: new BatchIngestResponse(
@@ -243,8 +252,30 @@ app.MapGet("/api/events/timeline", async (
     DateTimeOffset? toUtc,
     int? take,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     CancellationToken cancellationToken) =>
 {
+    var timelineQuery = new TimelineQuery(
+        Server: server,
+        Share: share,
+        User: user,
+        Action: action,
+        Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: take is > 0 and <= 20_000 ? take.Value : 100);
+    var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(timelineQuery, timelineRepository, cancellationToken);
+    if (persistedTimeline is not null)
+    {
+        return Results.Ok(persistedTimeline);
+    }
+
     var events = await QueryTimelineSourceEventsAsync(
         server,
         share,
@@ -259,7 +290,7 @@ app.MapGet("/api/events/timeline", async (
         source,
         fromUtc,
         toUtc,
-        take is > 0 and <= 20_000 ? take.Value : 100,
+        timelineQuery.Take,
         repository,
         cancellationToken);
     var timeline = ProjectTimeline(events, user, action);
@@ -283,8 +314,31 @@ app.MapGet("/api/events/timeline/export.csv", async (
     DateTimeOffset? toUtc,
     int? take,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     CancellationToken cancellationToken) =>
 {
+    var timelineQuery = new TimelineQuery(
+        Server: server,
+        Share: share,
+        User: user,
+        Action: action,
+        Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: take is > 0 and <= 20_000 ? take.Value : 10_000);
+    var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(timelineQuery, timelineRepository, cancellationToken);
+    if (persistedTimeline is not null)
+    {
+        var persistedCsv = TimelineCsvExporter.Export(persistedTimeline);
+        return Results.Text(persistedCsv, "text/csv; charset=utf-8");
+    }
+
     var events = await QueryTimelineSourceEventsAsync(
         server,
         share,
@@ -299,7 +353,7 @@ app.MapGet("/api/events/timeline/export.csv", async (
         source,
         fromUtc,
         toUtc,
-        take is > 0 and <= 20_000 ? take.Value : 10_000,
+        timelineQuery.Take,
         repository,
         cancellationToken);
     var timeline = ProjectTimeline(events, user, action);
@@ -327,32 +381,57 @@ app.MapGet("/api/events/timeline/page", async (
     int? pageSize,
     int? windowTake,
     IEventRepository repository,
+    ITimelineRepository timelineRepository,
     CancellationToken cancellationToken) =>
 {
     var safePage = Math.Max(1, page ?? 1);
     var safePageSize = pageSize is > 0 and <= 100 ? pageSize.Value : 25;
     var minimumWindow = safePage * safePageSize * 4;
     var safeWindowTake = Math.Clamp(Math.Max(windowTake ?? 1_000, minimumWindow), 100, 20_000);
-    var events = await QueryTimelineSourceEventsAsync(
-        server,
-        share,
-        user,
-        action,
-        path,
-        sourceHost,
-        sourceIp,
-        extension,
-        result,
-        severity,
-        source,
-        fromUtc,
-        toUtc,
-        safeWindowTake,
-        repository,
-        cancellationToken);
-    var filteredTimeline = ProjectTimeline(events, user, action)
+    var pageQuery = new TimelineQuery(
+        Server: server,
+        Share: share,
+        User: user,
+        Action: action,
+        Path: path,
+        SourceHost: sourceHost,
+        SourceIp: sourceIp,
+        Extension: extension,
+        Result: result,
+        Severity: severity,
+        Source: source,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: safeWindowTake);
+    var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(pageQuery, timelineRepository, cancellationToken);
+    var windowEvents = persistedTimeline?.Count ?? 0;
+    var filteredTimeline = (persistedTimeline ?? Array.Empty<FileAuditDisplayEvent>())
         .Where(item => MatchesTimelineSearch(item, search))
         .ToArray();
+    if (persistedTimeline is null)
+    {
+        var events = await QueryTimelineSourceEventsAsync(
+            server,
+            share,
+            user,
+            action,
+            path,
+            sourceHost,
+            sourceIp,
+            extension,
+            result,
+            severity,
+            source,
+            fromUtc,
+            toUtc,
+            safeWindowTake,
+            repository,
+            cancellationToken);
+        windowEvents = events.Count;
+        filteredTimeline = ProjectTimeline(events, user, action)
+            .Where(item => MatchesTimelineSearch(item, search))
+            .ToArray();
+    }
     var totalItems = filteredTimeline.Length;
     var totalPages = Math.Max(1, (int)Math.Ceiling(totalItems / (double)safePageSize));
     var clampedPage = Math.Min(safePage, totalPages);
@@ -367,7 +446,7 @@ app.MapGet("/api/events/timeline/page", async (
         PageSize: safePageSize,
         TotalItems: totalItems,
         TotalPages: totalPages,
-        WindowRawEvents: events.Count));
+        WindowRawEvents: windowEvents));
 });
 
 app.MapGet("/api/events/export.csv", async (
@@ -420,6 +499,48 @@ app.MapGet("/api/events/{id:guid}", async (
     return auditEvent is null
         ? Results.NotFound(new ErrorResponse("Evento nao encontrado."))
         : Results.Ok(auditEvent);
+});
+
+app.MapPost("/api/events/timeline/rebuild", async (
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    int? take,
+    IEventRepository repository,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken) =>
+{
+    var safeTake = take is > 0 and <= 50_000 ? take.Value : 20_000;
+    var query = new EventQuery(
+        Server: null,
+        Share: null,
+        User: null,
+        Action: null,
+        Path: null,
+        SourceHost: null,
+        SourceIp: null,
+        Extension: null,
+        Result: null,
+        Severity: null,
+        Source: null,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: safeTake);
+    var rawEvents = await repository.QueryAsync(query, cancellationToken);
+    var timeline = ProjectTimeline(rawEvents, user: null, action: null);
+
+    if (rawEvents.Count > 0)
+    {
+        var fromWindow = fromUtc ?? rawEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
+        var toWindow = toUtc ?? rawEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
+        await timelineRepository.ReplaceWindowAsync(fromWindow, toWindow, timeline, TimelineCorrelationVersion, cancellationToken);
+    }
+
+    return Results.Ok(new TimelineRebuildResponse(
+        RawEvents: rawEvents.Count,
+        TimelineEvents: timeline.Count,
+        FromUtc: rawEvents.Count == 0 ? fromUtc : rawEvents.Min(item => item.TimestampUtc),
+        ToUtc: rawEvents.Count == 0 ? toUtc : rawEvents.Max(item => item.TimestampUtc),
+        CorrelationVersion: TimelineCorrelationVersion));
 });
 
 app.MapGet("/api/alerts", async (
@@ -970,6 +1091,60 @@ static bool IsDirectTimelineAction(string? action)
     return action?.Trim().ToLowerInvariant() is "accessed" or "created" or "deleted" or "modified" or "permission_changed";
 }
 
+static async Task RebuildTimelineForIngestedEventsAsync(
+    IReadOnlyCollection<FileAuditEvent> ingestedEvents,
+    IEventRepository repository,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    if (ingestedEvents.Count == 0)
+    {
+        return;
+    }
+
+    var fromUtc = ingestedEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
+    var toUtc = ingestedEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
+    var query = new EventQuery(
+        Server: null,
+        Share: null,
+        User: null,
+        Action: null,
+        Path: null,
+        SourceHost: null,
+        SourceIp: null,
+        Extension: null,
+        Result: null,
+        Severity: null,
+        Source: null,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: 20_000);
+    var rawEvents = await repository.QueryAsync(query, cancellationToken);
+    var timeline = ProjectTimeline(rawEvents, user: null, action: null);
+
+    await timelineRepository.ReplaceWindowAsync(fromUtc, toUtc, timeline, TimelineCorrelationVersion, cancellationToken);
+}
+
+static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTimelineIfCoveredAsync(
+    TimelineQuery query,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    if (!string.IsNullOrWhiteSpace(query.User)
+        && query.Action?.Equals("accessed", StringComparison.OrdinalIgnoreCase) == true)
+    {
+        return null;
+    }
+
+    var coverage = await timelineRepository.GetCoverageAsync(cancellationToken);
+    if (coverage.Count == 0 || (query.FromUtc is not null && coverage.FromUtc is not null && coverage.FromUtc > query.FromUtc))
+    {
+        return null;
+    }
+
+    return await timelineRepository.QueryAsync(query, cancellationToken);
+}
+
 static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
     IReadOnlyCollection<FileAuditEvent> events,
     string? user,
@@ -1203,7 +1378,391 @@ internal interface IEventRepository
     Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
 }
 
+internal interface ITimelineRepository
+{
+    Task ReplaceWindowAsync(
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        IReadOnlyCollection<FileAuditDisplayEvent> events,
+        string correlationVersion,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryAsync(TimelineQuery query, CancellationToken cancellationToken);
+
+    Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken);
+}
+
 #if SQLSERVER
+internal sealed class SqlServerTimelineRepository : ITimelineRepository
+{
+    private readonly string _connectionString;
+
+    public SqlServerTimelineRepository(IConfiguration configuration)
+    {
+        _connectionString = configuration.GetConnectionString("SqlServer")
+            ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+    }
+
+    public async Task ReplaceWindowAsync(
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        IReadOnlyCollection<FileAuditDisplayEvent> events,
+        string correlationVersion,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            await using (var delete = connection.CreateCommand())
+            {
+                delete.Transaction = transaction;
+                delete.CommandText = """
+                    DELETE FROM dbo.FileAuditTimelineEvents
+                    WHERE TimestampUtc >= @FromUtc AND TimestampUtc <= @ToUtc;
+                    """;
+                delete.Parameters.AddWithValue("@FromUtc", fromUtc.UtcDateTime);
+                delete.Parameters.AddWithValue("@ToUtc", toUtc.UtcDateTime);
+                await delete.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            foreach (var item in events)
+            {
+                await using var insert = connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO dbo.FileAuditTimelineEvents
+                    (
+                        Id,
+                        TimestampUtc,
+                        ServerName,
+                        ShareName,
+                        FullPath,
+                        PreviousPath,
+                        ObjectType,
+                        ActionName,
+                        UserName,
+                        Sid,
+                        SourceHost,
+                        SourceIp,
+                        ProcessName,
+                        FileSizeBytes,
+                        Extension,
+                        ResultName,
+                        Severity,
+                        SourceName,
+                        DisplayAction,
+                        DisplayTarget,
+                        CorrelationVersion,
+                        CorrelatedUtc
+                    )
+                    VALUES
+                    (
+                        @Id,
+                        @TimestampUtc,
+                        @ServerName,
+                        @ShareName,
+                        @FullPath,
+                        @PreviousPath,
+                        @ObjectType,
+                        @ActionName,
+                        @UserName,
+                        @Sid,
+                        @SourceHost,
+                        @SourceIp,
+                        @ProcessName,
+                        @FileSizeBytes,
+                        @Extension,
+                        @ResultName,
+                        @Severity,
+                        @SourceName,
+                        @DisplayAction,
+                        @DisplayTarget,
+                        @CorrelationVersion,
+                        SYSUTCDATETIME()
+                    );
+                    """;
+                AddTimelineParameters(insert, item, correlationVersion);
+                await insert.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryAsync(TimelineQuery query, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = BuildTimelineQuerySql(query, command);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var events = new List<FileAuditDisplayEvent>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            events.Add(ReadTimelineEvent(reader));
+        }
+
+        return events;
+    }
+
+    public async Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                COUNT_BIG(1) AS TimelineEvents,
+                MIN(TimestampUtc) AS FromUtc,
+                MAX(TimestampUtc) AS ToUtc
+            FROM dbo.FileAuditTimelineEvents;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return new TimelineCoverage(0, null, null);
+        }
+
+        return new TimelineCoverage(
+            Count: Convert.ToInt64(reader["TimelineEvents"]),
+            FromUtc: reader["FromUtc"] == DBNull.Value
+                ? null
+                : new DateTimeOffset(DateTime.SpecifyKind((DateTime)reader["FromUtc"], DateTimeKind.Utc)),
+            ToUtc: reader["ToUtc"] == DBNull.Value
+                ? null
+                : new DateTimeOffset(DateTime.SpecifyKind((DateTime)reader["ToUtc"], DateTimeKind.Utc)));
+    }
+
+    private static string BuildTimelineQuerySql(TimelineQuery query, SqlCommand command)
+    {
+        command.Parameters.AddWithValue("@Take", query.Take);
+        var predicates = new List<string>();
+
+        if (!string.IsNullOrWhiteSpace(query.Server))
+        {
+            predicates.Add("ServerName LIKE @Server");
+            command.Parameters.AddWithValue("@Server", $"%{query.Server}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Share))
+        {
+            predicates.Add("ShareName LIKE @Share");
+            command.Parameters.AddWithValue("@Share", $"%{query.Share}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.User))
+        {
+            predicates.Add("UserName LIKE @User");
+            command.Parameters.AddWithValue("@User", $"%{query.User}%");
+        }
+
+        var actions = BuildTimelineResultActionFilter(query.Action);
+        if (actions.Length == 1)
+        {
+            predicates.Add("ActionName = @TimelineAction");
+            command.Parameters.AddWithValue("@TimelineAction", actions[0]);
+        }
+        else if (actions.Length > 1)
+        {
+            var parameterNames = new List<string>();
+            for (var index = 0; index < actions.Length; index++)
+            {
+                var parameterName = $"@TimelineAction{index}";
+                parameterNames.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, actions[index]);
+            }
+
+            predicates.Add($"ActionName IN ({string.Join(", ", parameterNames)})");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Path))
+        {
+            predicates.Add("(FullPath LIKE @Path OR PreviousPath LIKE @Path)");
+            command.Parameters.AddWithValue("@Path", $"%{query.Path}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceHost))
+        {
+            predicates.Add("SourceHost LIKE @SourceHost");
+            command.Parameters.AddWithValue("@SourceHost", $"%{query.SourceHost}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceIp))
+        {
+            predicates.Add("SourceIp LIKE @SourceIp");
+            command.Parameters.AddWithValue("@SourceIp", $"%{query.SourceIp}%");
+        }
+
+        var extensions = SplitFilterValues(query.Extension)
+            .Select(NormalizeExtensionFilter)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (extensions.Length > 0)
+        {
+            var parameterNames = new List<string>();
+            for (var index = 0; index < extensions.Length; index++)
+            {
+                var parameterName = $"@TimelineExtension{index}";
+                parameterNames.Add(parameterName);
+                command.Parameters.AddWithValue(parameterName, extensions[index]);
+            }
+
+            predicates.Add($"Extension IN ({string.Join(", ", parameterNames)})");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Result))
+        {
+            predicates.Add("ResultName LIKE @Result");
+            command.Parameters.AddWithValue("@Result", $"%{query.Result}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Severity))
+        {
+            predicates.Add("Severity = @Severity");
+            command.Parameters.AddWithValue("@Severity", query.Severity);
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Source))
+        {
+            predicates.Add("SourceName LIKE @Source");
+            command.Parameters.AddWithValue("@Source", $"%{query.Source}%");
+        }
+
+        if (query.FromUtc is not null)
+        {
+            predicates.Add("TimestampUtc >= @FromUtc");
+            command.Parameters.AddWithValue("@FromUtc", query.FromUtc.Value.UtcDateTime);
+        }
+
+        if (query.ToUtc is not null)
+        {
+            predicates.Add("TimestampUtc <= @ToUtc");
+            command.Parameters.AddWithValue("@ToUtc", query.ToUtc.Value.UtcDateTime);
+        }
+
+        var where = predicates.Count == 0
+            ? string.Empty
+            : $"WHERE {string.Join(" AND ", predicates)}";
+
+        return $$"""
+            SELECT TOP (@Take)
+                Id,
+                TimestampUtc,
+                ServerName,
+                ShareName,
+                FullPath,
+                PreviousPath,
+                ObjectType,
+                ActionName,
+                UserName,
+                Sid,
+                SourceHost,
+                SourceIp,
+                ProcessName,
+                FileSizeBytes,
+                Extension,
+                ResultName,
+                Severity,
+                SourceName,
+                DisplayAction,
+                DisplayTarget
+            FROM dbo.FileAuditTimelineEvents
+            {{where}}
+            ORDER BY TimestampUtc DESC;
+            """;
+    }
+
+    private static void AddTimelineParameters(SqlCommand command, FileAuditDisplayEvent item, string correlationVersion)
+    {
+        command.Parameters.AddWithValue("@Id", item.Id);
+        command.Parameters.AddWithValue("@TimestampUtc", item.TimestampUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@ServerName", item.Server);
+        command.Parameters.AddWithValue("@ShareName", item.Share);
+        command.Parameters.AddWithValue("@FullPath", item.Path);
+        command.Parameters.AddWithValue("@PreviousPath", (object?)item.PreviousPath ?? DBNull.Value);
+        command.Parameters.AddWithValue("@ObjectType", item.ObjectType);
+        command.Parameters.AddWithValue("@ActionName", item.Action);
+        command.Parameters.AddWithValue("@UserName", item.User);
+        command.Parameters.AddWithValue("@Sid", (object?)item.Sid ?? DBNull.Value);
+        command.Parameters.AddWithValue("@SourceHost", (object?)item.SourceHost ?? DBNull.Value);
+        command.Parameters.AddWithValue("@SourceIp", (object?)item.SourceIp ?? DBNull.Value);
+        command.Parameters.AddWithValue("@ProcessName", (object?)item.ProcessName ?? DBNull.Value);
+        command.Parameters.AddWithValue("@FileSizeBytes", (object?)item.FileSizeBytes ?? DBNull.Value);
+        command.Parameters.AddWithValue("@Extension", (object?)item.Extension ?? DBNull.Value);
+        command.Parameters.AddWithValue("@ResultName", item.Result);
+        command.Parameters.AddWithValue("@Severity", item.Severity);
+        command.Parameters.AddWithValue("@SourceName", item.Source);
+        command.Parameters.AddWithValue("@DisplayAction", item.DisplayAction);
+        command.Parameters.AddWithValue("@DisplayTarget", item.DisplayTarget);
+        command.Parameters.AddWithValue("@CorrelationVersion", correlationVersion);
+    }
+
+    private static FileAuditDisplayEvent ReadTimelineEvent(SqlDataReader reader)
+    {
+        return new FileAuditDisplayEvent(
+            Id: reader.GetGuid(reader.GetOrdinal("Id")),
+            TimestampUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("TimestampUtc")), DateTimeKind.Utc)),
+            Server: reader.GetString(reader.GetOrdinal("ServerName")),
+            Share: reader.GetString(reader.GetOrdinal("ShareName")),
+            Path: reader.GetString(reader.GetOrdinal("FullPath")),
+            PreviousPath: reader["PreviousPath"] as string,
+            ObjectType: reader.GetString(reader.GetOrdinal("ObjectType")),
+            Action: reader.GetString(reader.GetOrdinal("ActionName")),
+            User: reader.GetString(reader.GetOrdinal("UserName")),
+            Sid: reader["Sid"] as string,
+            SourceHost: reader["SourceHost"] as string,
+            SourceIp: reader["SourceIp"] as string,
+            ProcessName: reader["ProcessName"] as string,
+            FileSizeBytes: reader["FileSizeBytes"] == DBNull.Value ? null : Convert.ToInt64(reader["FileSizeBytes"]),
+            Extension: reader["Extension"] as string,
+            Result: reader.GetString(reader.GetOrdinal("ResultName")),
+            Severity: reader.GetString(reader.GetOrdinal("Severity")),
+            Source: reader.GetString(reader.GetOrdinal("SourceName")),
+            DisplayAction: reader.GetString(reader.GetOrdinal("DisplayAction")),
+            DisplayTarget: reader.GetString(reader.GetOrdinal("DisplayTarget")));
+    }
+
+    private static IEnumerable<string> SplitFilterValues(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? Array.Empty<string>()
+            : value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static string NormalizeExtensionFilter(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.StartsWith(".", StringComparison.Ordinal)
+            ? trimmed.ToLowerInvariant()
+            : $".{trimmed.ToLowerInvariant()}";
+    }
+
+    private static string[] BuildTimelineResultActionFilter(string? action)
+    {
+        return action?.Trim().ToLowerInvariant() switch
+        {
+            "created" => new[] { "created", "created_or_appended" },
+            "modified" => new[] { "modified", "changed" },
+            "accessed" => new[] { "accessed" },
+            "deleted" => new[] { "deleted" },
+            "renamed" => new[] { "renamed" },
+            "moved" => new[] { "moved" },
+            "permission_changed" => new[] { "permission_changed" },
+            _ => Array.Empty<string>()
+        };
+    }
+}
+
 internal sealed class SqlServerEventRepository : IEventRepository
 {
     private readonly string _connectionString;
@@ -1875,6 +2434,164 @@ internal sealed class SqlServerEventRepository : IEventRepository
     }
 }
 #endif
+
+internal sealed class InMemoryTimelineRepository : ITimelineRepository
+{
+    private readonly ConcurrentDictionary<Guid, FileAuditDisplayEvent> _events = new();
+
+    public Task ReplaceWindowAsync(
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        IReadOnlyCollection<FileAuditDisplayEvent> events,
+        string correlationVersion,
+        CancellationToken cancellationToken)
+    {
+        var idsToRemove = _events.Values
+            .Where(item => item.TimestampUtc >= fromUtc && item.TimestampUtc <= toUtc)
+            .Select(item => item.Id)
+            .ToArray();
+
+        foreach (var id in idsToRemove)
+        {
+            _events.TryRemove(id, out _);
+        }
+
+        foreach (var item in events)
+        {
+            _events[item.Id] = item;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryAsync(TimelineQuery query, CancellationToken cancellationToken)
+    {
+        IEnumerable<FileAuditDisplayEvent> events = _events.Values;
+
+        if (!string.IsNullOrWhiteSpace(query.Server))
+        {
+            events = events.Where(item => item.Server.Contains(query.Server, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Share))
+        {
+            events = events.Where(item => item.Share.Contains(query.Share, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.User))
+        {
+            events = events.Where(item => item.User.Contains(query.User, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var actions = BuildTimelineResultActionFilter(query.Action);
+        if (actions.Length > 0)
+        {
+            events = events.Where(item => actions.Contains(item.Action, StringComparer.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Path))
+        {
+            events = events.Where(item =>
+                item.Path.Contains(query.Path, StringComparison.OrdinalIgnoreCase)
+                || (item.PreviousPath?.Contains(query.Path, StringComparison.OrdinalIgnoreCase) ?? false));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceHost))
+        {
+            events = events.Where(item => item.SourceHost?.Contains(query.SourceHost, StringComparison.OrdinalIgnoreCase) ?? false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.SourceIp))
+        {
+            events = events.Where(item => item.SourceIp?.Contains(query.SourceIp, StringComparison.OrdinalIgnoreCase) ?? false);
+        }
+
+        var extensions = SplitFilterValues(query.Extension)
+            .Select(NormalizeExtensionFilter)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (extensions.Length > 0)
+        {
+            events = events.Where(item => item.Extension is not null && extensions.Contains(item.Extension, StringComparer.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Result))
+        {
+            events = events.Where(item => item.Result.Contains(query.Result, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Severity))
+        {
+            events = events.Where(item => item.Severity.Equals(query.Severity, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(query.Source))
+        {
+            events = events.Where(item => item.Source.Contains(query.Source, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (query.FromUtc is not null)
+        {
+            events = events.Where(item => item.TimestampUtc >= query.FromUtc);
+        }
+
+        if (query.ToUtc is not null)
+        {
+            events = events.Where(item => item.TimestampUtc <= query.ToUtc);
+        }
+
+        IReadOnlyCollection<FileAuditDisplayEvent> result = events
+            .OrderByDescending(item => item.TimestampUtc)
+            .Take(query.Take)
+            .ToArray();
+
+        return Task.FromResult(result);
+    }
+
+    public Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken)
+    {
+        var values = _events.Values.ToArray();
+        if (values.Length == 0)
+        {
+            return Task.FromResult(new TimelineCoverage(0, null, null));
+        }
+
+        return Task.FromResult(new TimelineCoverage(
+            Count: values.LongLength,
+            FromUtc: values.Min(item => item.TimestampUtc),
+            ToUtc: values.Max(item => item.TimestampUtc)));
+    }
+
+    private static IEnumerable<string> SplitFilterValues(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? Array.Empty<string>()
+            : value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static string NormalizeExtensionFilter(string value)
+    {
+        var trimmed = value.Trim();
+        return trimmed.StartsWith(".", StringComparison.Ordinal)
+            ? trimmed.ToLowerInvariant()
+            : $".{trimmed.ToLowerInvariant()}";
+    }
+
+    private static string[] BuildTimelineResultActionFilter(string? action)
+    {
+        return action?.Trim().ToLowerInvariant() switch
+        {
+            "created" => new[] { "created", "created_or_appended" },
+            "modified" => new[] { "modified", "changed" },
+            "accessed" => new[] { "accessed" },
+            "deleted" => new[] { "deleted" },
+            "renamed" => new[] { "renamed" },
+            "moved" => new[] { "moved" },
+            "permission_changed" => new[] { "permission_changed" },
+            _ => Array.Empty<string>()
+        };
+    }
+}
 
 internal sealed class InMemoryEventRepository : IEventRepository
 {
@@ -5006,6 +5723,34 @@ internal sealed record TimelinePageResponse(
     int TotalItems,
     int TotalPages,
     int WindowRawEvents);
+
+internal sealed record TimelineQuery(
+    string? Server,
+    string? Share,
+    string? User,
+    string? Action,
+    string? Path,
+    string? SourceHost,
+    string? SourceIp,
+    string? Extension,
+    string? Result,
+    string? Severity,
+    string? Source,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc,
+    int Take);
+
+internal sealed record TimelineRebuildResponse(
+    int RawEvents,
+    int TimelineEvents,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc,
+    string CorrelationVersion);
+
+internal sealed record TimelineCoverage(
+    long Count,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc);
 
 internal sealed record FileAuditEventRequest(
     DateTimeOffset? TimestampUtc,

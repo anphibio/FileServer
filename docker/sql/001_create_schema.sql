@@ -90,6 +90,60 @@ BEGIN
 END;
 GO
 
+IF OBJECT_ID(N'dbo.FileAuditTimelineEvents', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.FileAuditTimelineEvents
+    (
+        Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_FileAuditTimelineEvents PRIMARY KEY,
+        TimestampUtc DATETIME2(3) NOT NULL,
+        ServerName NVARCHAR(128) NOT NULL,
+        ShareName NVARCHAR(256) NOT NULL,
+        FullPath NVARCHAR(2048) NOT NULL,
+        PreviousPath NVARCHAR(2048) NULL,
+        ObjectType NVARCHAR(32) NOT NULL,
+        ActionName NVARCHAR(64) NOT NULL,
+        UserName NVARCHAR(256) NOT NULL,
+        Sid NVARCHAR(256) NULL,
+        SourceHost NVARCHAR(256) NULL,
+        SourceIp NVARCHAR(64) NULL,
+        ProcessName NVARCHAR(256) NULL,
+        FileSizeBytes BIGINT NULL,
+        Extension NVARCHAR(64) NULL,
+        ResultName NVARCHAR(64) NOT NULL,
+        Severity NVARCHAR(32) NOT NULL,
+        SourceName NVARCHAR(128) NOT NULL,
+        DisplayAction NVARCHAR(128) NOT NULL,
+        DisplayTarget NVARCHAR(512) NOT NULL,
+        CorrelationVersion NVARCHAR(64) NOT NULL,
+        CorrelatedUtc DATETIME2(3) NOT NULL CONSTRAINT DF_FileAuditTimelineEvents_CorrelatedUtc DEFAULT SYSUTCDATETIME()
+    );
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_TimestampUtc' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_TimestampUtc ON dbo.FileAuditTimelineEvents (TimestampUtc DESC);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_User_Action_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_User_Action_Time ON dbo.FileAuditTimelineEvents (UserName, ActionName, TimestampUtc DESC);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Server_Share_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_Server_Share_Time ON dbo.FileAuditTimelineEvents (ServerName, ShareName, TimestampUtc DESC);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Path_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_Path_Time ON dbo.FileAuditTimelineEvents (FullPath, TimestampUtc DESC);
+END;
+GO
+
 IF OBJECT_ID(N'dbo.AgentHeartbeats', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AgentHeartbeats
