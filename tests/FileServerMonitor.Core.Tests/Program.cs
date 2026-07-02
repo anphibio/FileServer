@@ -22,7 +22,11 @@ var tests = new (string Name, Action Test)[]
     ("classifica rename entre pastas como movimentacao", ClassifiesCrossFolderRenameAsMove),
     ("nao correlaciona arquivos diferentes por proximidade", DoesNotCorrelateDifferentFilesByTiming),
     ("nao cruza bitmaps provisorios repetidos", DoesNotCrossCorrelateRepeatedBitmapProvisionals),
-    ("nao cruza planilhas provisorias repetidas", DoesNotCrossCorrelateRepeatedExcelProvisionals)
+    ("nao cruza planilhas provisorias repetidas", DoesNotCrossCorrelateRepeatedExcelProvisionals),
+    ("timeline colapsa acessos repetidos ao mesmo arquivo", TimelineCollapsesRepeatedFileAccess),
+    ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
+    ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
+    ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename)
 };
 
 var failures = new List<string>();
@@ -37,7 +41,7 @@ foreach (var (name, test) in tests)
     catch (Exception ex)
     {
         failures.Add($"{name}: {ex.Message}");
-        Console.Error.WriteLine($"FAIL {name}: {ex.Message}");
+        Console.Error.WriteLine($"FAIL {name}: {ex}");
     }
 }
 
@@ -449,6 +453,75 @@ static void DoesNotCrossCorrelateRepeatedExcelProvisionals()
     Assert(createdEvents.All(item => item.PreviousPath is null), "Criacoes finais nao deveriam expor nomes provisorios.");
 }
 
+static void TimelineCollapsesRepeatedFileAccess()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "accessed", @"C:\Corporativo\Novo(a) Documento de Texto - Copia (4).txt", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "accessed", @"C:\Corporativo\Novo(a) Documento de Texto - Copia (4).txt", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "accessed", @"C:\Corporativo\Novo(a) Documento de Texto - Copia (4).txt", source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+
+    Assert(display.Length == 1, "Acessos repetidos ao mesmo arquivo em poucos segundos deveriam virar um unico evento.");
+    Assert(display[0].Action == "accessed", "Evento restante deveria continuar sendo acesso.");
+}
+
+static void TimelineKeepsDistinctFolderAccess()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "accessed", @"C:\Corporativo\Nova pasta", objectType: "folder", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "accessed", @"C:\Corporativo\Nova pasta\Nova pasta", objectType: "folder", source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.Path).ToArray();
+
+    Assert(display.Length == 2, "Acessos em pastas diferentes nao deveriam ser colapsados como ruido.");
+    Assert(display.All(item => item.Action == "accessed"), "Eventos de pasta deveriam continuar como acesso.");
+}
+
+static void TimelineSynthesizesKnownDescendantDeletes()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", @"C:\Corporativo\Example folder", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "created", @"C:\Corporativo\Example folder\Example txt file.txt", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "created", @"C:\Corporativo\Example folder\Another example txt file.txt", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(10), "deleted", @"C:\Corporativo\Example folder", objectType: "folder", source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+
+    Assert(display.Count(item => item.Action == "deleted") == 3, "Excluir pasta deveria exibir tambem os descendentes conhecidos sem delete explicito.");
+    Assert(display.Any(item => item.Path == @"C:\Corporativo\Example folder\Example txt file.txt" && item.Action == "deleted"), "Delete sintetico do primeiro arquivo deveria aparecer.");
+    Assert(display.Any(item => item.Path == @"C:\Corporativo\Example folder\Another example txt file.txt" && item.Action == "deleted"), "Delete sintetico do segundo arquivo deveria aparecer.");
+}
+
+static void TimelineSuppressesDeleteEchoAroundRename()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "deleted", @"C:\Corporativo\codex-client-check-02.md", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(300), "renamed", @"C:\Corporativo\codex-client-check-02 - rename.md", previousPath: @"C:\Corporativo\codex-client-check-02.md", source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+
+    Assert(display.Length == 1, "Delete usado como eco de rename nao deveria aparecer na timeline final.");
+    Assert(display[0].Action == "renamed", "O rename deveria ser preservado.");
+    Assert(display[0].PreviousPath == @"C:\Corporativo\codex-client-check-02.md", "Caminho anterior do rename deveria ser preservado.");
+}
+
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)
 {
     return Enumerable.Range(1, count)
@@ -477,6 +550,36 @@ static FileAuditEvent BuildEvent(string action, string path, string extension)
         Result: "success",
         Severity: "info",
         Source: "test");
+}
+
+static FileAuditEvent BuildTimelineEvent(
+    DateTimeOffset timestampUtc,
+    string action,
+    string path,
+    string? previousPath = null,
+    string objectType = "file",
+    string source = "usn-journal+security-log",
+    string user = @"FILESERVER\AnphibiO")
+{
+    return new FileAuditEvent(
+        Id: Guid.NewGuid(),
+        TimestampUtc: timestampUtc,
+        Server: "FileServer",
+        Share: "Corporativo",
+        Path: path,
+        PreviousPath: previousPath,
+        ObjectType: objectType,
+        Action: action,
+        User: user,
+        Sid: null,
+        SourceHost: null,
+        SourceIp: null,
+        ProcessName: "explorer.exe",
+        FileSizeBytes: null,
+        Extension: Path.GetExtension(path),
+        Result: "success",
+        Severity: "info",
+        Source: source);
 }
 
 static CollectedFileEvent BuildCollectedEvent(

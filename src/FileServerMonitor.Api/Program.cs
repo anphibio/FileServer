@@ -161,8 +161,8 @@ app.MapGet("/api/events", async (
 {
     var query = new EventQuery(
         Server: server,
-        User: user,
-        Action: action,
+        User: null,
+        Action: null,
         Path: path,
         FromUtc: fromUtc,
         ToUtc: toUtc,
@@ -171,6 +171,40 @@ app.MapGet("/api/events", async (
     var events = await repository.QueryAsync(query, cancellationToken);
 
     return Results.Ok(events);
+});
+
+app.MapGet("/api/events/timeline", async (
+    string? server,
+    string? user,
+    string? action,
+    string? path,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc,
+    int? take,
+    IEventRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    var query = new EventQuery(
+        Server: server,
+        User: user,
+        Action: action,
+        Path: path,
+        FromUtc: fromUtc,
+        ToUtc: toUtc,
+        Take: take is > 0 and <= 5_000 ? take.Value : 100);
+
+    var events = await repository.QueryAsync(query, cancellationToken);
+    var timeline = new FileServerMonitor.Core.EventTimelineProjector()
+        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
+        .Select(ToApiDisplayEvent)
+        .Where(item => string.IsNullOrWhiteSpace(user)
+            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
+        .Where(item => string.IsNullOrWhiteSpace(action)
+            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
+            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+
+    return Results.Ok(timeline);
 });
 
 app.MapGet("/api/events/export.csv", async (
@@ -602,6 +636,54 @@ static string? TryGetWindowsVolume(string path)
     }
 
     return null;
+}
+
+static FileServerMonitor.Core.FileAuditEvent ToCoreAuditEvent(FileAuditEvent auditEvent)
+{
+    return new FileServerMonitor.Core.FileAuditEvent(
+        auditEvent.Id,
+        auditEvent.TimestampUtc,
+        auditEvent.Server,
+        auditEvent.Share,
+        auditEvent.Path,
+        auditEvent.PreviousPath,
+        auditEvent.ObjectType,
+        auditEvent.Action,
+        auditEvent.User,
+        auditEvent.Sid,
+        auditEvent.SourceHost,
+        auditEvent.SourceIp,
+        auditEvent.ProcessName,
+        auditEvent.FileSizeBytes,
+        auditEvent.Extension,
+        auditEvent.Result,
+        auditEvent.Severity,
+        auditEvent.Source);
+}
+
+static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditDisplayEvent auditEvent)
+{
+    return new FileAuditDisplayEvent(
+        auditEvent.Id,
+        auditEvent.TimestampUtc,
+        auditEvent.Server,
+        auditEvent.Share,
+        auditEvent.Path,
+        auditEvent.PreviousPath,
+        auditEvent.ObjectType,
+        auditEvent.Action,
+        auditEvent.User,
+        auditEvent.Sid,
+        auditEvent.SourceHost,
+        auditEvent.SourceIp,
+        auditEvent.ProcessName,
+        auditEvent.FileSizeBytes,
+        auditEvent.Extension,
+        auditEvent.Result,
+        auditEvent.Severity,
+        auditEvent.Source,
+        auditEvent.DisplayAction,
+        auditEvent.DisplayTarget);
 }
 
 internal interface IEventRepository
@@ -4145,6 +4227,28 @@ internal sealed record FileAuditEvent(
     string Result,
     string Severity,
     string Source);
+
+internal sealed record FileAuditDisplayEvent(
+    Guid Id,
+    DateTimeOffset TimestampUtc,
+    string Server,
+    string Share,
+    string Path,
+    string? PreviousPath,
+    string ObjectType,
+    string Action,
+    string User,
+    string? Sid,
+    string? SourceHost,
+    string? SourceIp,
+    string? ProcessName,
+    long? FileSizeBytes,
+    string? Extension,
+    string Result,
+    string Severity,
+    string Source,
+    string DisplayAction,
+    string DisplayTarget);
 
 internal sealed record FileAuditEventRequest(
     DateTimeOffset? TimestampUtc,

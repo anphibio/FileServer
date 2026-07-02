@@ -284,7 +284,7 @@ function App() {
     try {
       const [healthResult, eventsResult, alertsResult, alertRulesResult, agentsResult, pathsResult, summaryResult, anomaliesResult, auditResult] = await Promise.all([
         fetchJson<HealthResponse>("/health"),
-        fetchJson<FileAuditEvent[]>("/api/events?take=5000"),
+        fetchJson<DisplayEvent[]>("/api/events/timeline?take=5000"),
         fetchJson<FileServerAlert[]>("/api/alerts?take=100"),
         fetchJson<AlertRuleConfig[]>("/api/alert-rules"),
         fetchJson<AgentHealth[]>("/api/agents/health"),
@@ -342,7 +342,7 @@ function App() {
         .some((value) => value.toLowerCase().includes(filter))
     );
   }, [eventFilter, events]);
-  const displayedEvents = useMemo(() => buildTimelineDisplayEvents(filteredEvents as TimelineFileAuditEvent[]) as DisplayEvent[], [filteredEvents]);
+  const displayedEvents = useMemo(() => filteredEvents as DisplayEvent[], [filteredEvents]);
   const totalDisplayedEventCount = displayedEvents.length;
   const totalEventPages = Math.max(1, Math.ceil(totalDisplayedEventCount / EVENTS_PAGE_SIZE));
   const safeEventsPage = Math.min(eventsPage, totalEventPages);
@@ -709,7 +709,7 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
   const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const displayEvents = useMemo(() => buildTimelineDisplayEvents(events as TimelineFileAuditEvent[]) as DisplayEvent[], [events]);
+  const displayEvents = useMemo(() => events as DisplayEvent[], [events]);
   const [page, setPage] = useState(1);
   const uniqueUsers = useMemo(() => new Set(displayEvents.map((event) => event.user).filter(Boolean)).size, [displayEvents]);
   const dominantAction = useMemo(() => getTopEventAction(displayEvents), [displayEvents]);
@@ -744,8 +744,8 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
     setError(null);
 
     try {
-      const result = await fetchJson<FileAuditEvent[]>(buildInvestigationUrl(filters));
-      const displayResult = buildTimelineDisplayEvents(result as TimelineFileAuditEvent[]) as DisplayEvent[];
+      const result = await fetchJson<DisplayEvent[]>(buildInvestigationUrl(filters));
+      const displayResult = result as DisplayEvent[];
       setEvents(result);
       setPage(1);
       setSearched(true);
@@ -1995,7 +1995,7 @@ function buildInvestigationUrl(filters: InvestigationFilters) {
     params.set("action", filters.action.trim());
   }
 
-  return `/api/events?${params.toString()}`;
+  return `/api/events/timeline?${params.toString()}`;
 }
 
 function buildAlertOperationsUrl(alert: FileServerAlert) {
