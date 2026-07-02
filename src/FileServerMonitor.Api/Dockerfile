@@ -19,12 +19,13 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libldap2 \
+    && apt-get install -y --no-install-recommends libldap2 ldap-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/publish .
 
 ENV ASPNETCORE_URLS=http://+:8080
+ENV LDAPTLS_REQCERT=never
 EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "FileServerMonitor.Api.dll"]
