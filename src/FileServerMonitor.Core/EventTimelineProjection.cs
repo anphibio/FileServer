@@ -111,7 +111,7 @@ public sealed class EventTimelineProjector
         var syntheticDeletes = SynthesizeLikelyDescendantDeletions(syntheticCreations).ToArray();
         var promotedCreations = PromoteLikelyInitialCreations(syntheticDeletes).ToArray();
 
-        return promotedCreations
+        var filtered = promotedCreations
             .Where(item =>
                 !IsTransientDisplayNoise(item)
                 && !IsRedundantDisplayPermissionEcho(item, promotedCreations)
@@ -125,9 +125,21 @@ public sealed class EventTimelineProjector
                 && !IsRedundantDisplayCreateEcho(item, promotedCreations)
                 && !IsRedundantDisplayCreatedDuplicate(item, promotedCreations)
                 && !IsRedundantDisplayAccessedEcho(item, promotedCreations)
-                && !IsRedundantDisplayChangedEcho(item, promotedCreations))
+                && !IsRedundantDisplayChangedEcho(item, promotedCreations));
+
+        return CollapseSemanticDisplayDuplicates(filtered)
             .OrderByDescending(item => item.TimestampUtc)
             .ToArray();
+    }
+
+    private static IEnumerable<FileAuditDisplayEvent> CollapseSemanticDisplayDuplicates(IEnumerable<FileAuditDisplayEvent> events)
+    {
+        return events
+            .GroupBy(GetSemanticEventKey, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group
+                .OrderByDescending(GetEventWeight)
+                .ThenByDescending(item => item.TimestampUtc)
+                .First());
     }
 
     private static IEnumerable<FileAuditDisplayEvent> SynthesizeLikelyCreations(

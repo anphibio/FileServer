@@ -30,6 +30,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva alteracao real antes de exclusao", TimelineKeepsRealModificationBeforeDelete),
     ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
     ("timeline trata append de texto do security log como alteracao", TimelineTreatsSecurityTextAppendCreateAsModification),
+    ("timeline colapsa append e modified do security log em uma alteracao", TimelineCollapsesSecurityTextAppendAndModifyDuplicate),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
@@ -672,6 +673,25 @@ static void TimelineTreatsSecurityTextAppendCreateAsModification()
     Assert(display.Length == 1, "Append de texto seguido de acesso deveria aparecer como uma unica alteracao.");
     Assert(display[0].Action == "modified", "Criacao/append do Security Log em arquivo texto existente deveria virar alteracao.");
     Assert(display[0].DisplayAction == "Alterado", "Evento final deveria aparecer como Alterado.");
+}
+
+static void TimelineCollapsesSecurityTextAppendAndModifyDuplicate()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-03T01:26:01Z");
+    var path = @"C:\Corporativo\DTI\Novo(a) Documento de Texto - Copia (0).txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddMilliseconds(440), "created_or_appended", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(443), "modified", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(9), "accessed", path, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    Assert(display.Length == 1, "Append e modified do Security Log no mesmo arquivo deveriam virar uma unica alteracao.");
+    Assert(display[0].Action == "modified", "Evento restante deveria ser alteracao.");
+    Assert(display[0].DisplayAction == "Alterado", "Evento restante deveria aparecer como Alterado.");
 }
 
 static void TimelineCollapsesRenameDuplicateAfterUserResolution()
