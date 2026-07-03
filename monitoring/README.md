@@ -9,7 +9,19 @@ A API expõe:
 - `GET /health`: checagem simples de disponibilidade.
 - `GET /metrics`: retrato completo do ambiente em JSON para Zabbix/Grafana.
 
-O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado e contadores do último ciclo de coleta.
+O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, capacidade das tabelas principais, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado e contadores do último ciclo de coleta.
+
+Principais sinais de banco e capacidade:
+
+- `database.status`: saúde da consulta básica do banco.
+- `database.queryDurationMs`: tempo da consulta básica de saúde.
+- `capacity.status`: saúde da coleta de capacidade.
+- `capacity.totalRows`: total de linhas nas tabelas principais.
+- `capacity.totalReservedMb`: espaço reservado pelas tabelas principais.
+- `capacity.rawEventRows`: linhas de eventos brutos.
+- `capacity.timelineRows`: linhas da timeline correlacionada.
+- `capacity.alertRows`: linhas de alertas.
+- `capacity.timelineNewestAgeSeconds`: idade do evento mais novo da timeline.
 
 Principais sinais de agente:
 
@@ -35,6 +47,7 @@ Macros principais:
 - `{$FILESERVER_MONITOR_URL}`: URL base da API. Exemplo: `http://192.168.2.170:8180`
 - `{$FILESERVER_MONITOR_QUEUE_WARN}`: alerta quando a fila local de algum agente chegar nesse valor.
 - `{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}`: alerta quando nenhum evento novo chegar por esse tempo, em segundos.
+- `{$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}`: alerta quando as tabelas principais reservarem mais espaço que esse limite, em MB.
 
 O template usa item HTTP agent no endpoint `/metrics` e cria itens dependentes com JSONPath.
 

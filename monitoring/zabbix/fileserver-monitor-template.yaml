@@ -19,6 +19,9 @@ zabbix_export:
         - macro: '{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
           value: '1800'
           description: 'Tempo maximo sem eventos novos, em segundos.'
+        - macro: '{$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}'
+          value: '51200'
+          description: 'Espaco reservado maximo esperado para as tabelas principais, em MB.'
       items:
         - uuid: 0d0fdcc35bd047e592adcb65fd1c39e8
           name: 'FileServer Monitor: metrics raw'
@@ -131,6 +134,144 @@ zabbix_export:
             - type: JSONPATH
               parameters:
                 - $.database.lastEventAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: c18ed6aba3c44dfebb7d3898dffdaa27
+          name: 'FileServer Monitor: capacity status'
+          type: DEPENDENT
+          key: fileserver.capacity.status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.status
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 4003e6ca0ed945cfacb9c4f1f49517f5
+          name: 'FileServer Monitor: capacity total rows'
+          type: DEPENDENT
+          key: fileserver.capacity.total_rows
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.totalRows
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 1bed548a1db14ff3a311891cd89645de
+          name: 'FileServer Monitor: capacity reserved'
+          type: DEPENDENT
+          key: fileserver.capacity.reserved_mb
+          delay: '0'
+          history: 30d
+          value_type: FLOAT
+          units: MB
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.totalReservedMb
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 6c61f4e1a3ce40f3b9261380741ce70e
+          name: 'FileServer Monitor: raw event rows'
+          type: DEPENDENT
+          key: fileserver.capacity.raw_event_rows
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.rawEventRows
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 6759b8a8840f46ee893acd78b3d152f6
+          name: 'FileServer Monitor: timeline rows'
+          type: DEPENDENT
+          key: fileserver.capacity.timeline_rows
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.timelineRows
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 4e25cd30e923406c9583fc3008dd8bdd
+          name: 'FileServer Monitor: alert rows'
+          type: DEPENDENT
+          key: fileserver.capacity.alert_rows
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.alertRows
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 3477ec09a14b4bac9877b8cec4d61a83
+          name: 'FileServer Monitor: timeline newest age'
+          type: DEPENDENT
+          key: fileserver.capacity.timeline_newest_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.timelineNewestAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 08a10df22288454c8c07a12a23e92ff3
+          name: 'FileServer Monitor: timeline oldest age'
+          type: DEPENDENT
+          key: fileserver.capacity.timeline_oldest_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.capacity.timelineOldestAgeSeconds
             - type: JAVASCRIPT
               parameters:
                 - 'return value === null || value === "" ? 0 : value;'
@@ -395,6 +536,14 @@ zabbix_export:
       expression: 'last(/Template App FileServer Monitor/fileserver.db.status)<>"healthy"'
       name: 'FileServer Monitor: banco indisponivel ou degradado'
       priority: HIGH
+    - uuid: 2223ebcadca04c208f4141483fa200a9
+      expression: 'last(/Template App FileServer Monitor/fileserver.capacity.status)="critical"'
+      name: 'FileServer Monitor: falha ao medir capacidade do banco'
+      priority: WARNING
+    - uuid: 48d26932366245d3b20a8c6448029774
+      expression: 'last(/Template App FileServer Monitor/fileserver.capacity.reserved_mb)>={$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}'
+      name: 'FileServer Monitor: capacidade reservada do banco acima do limite'
+      priority: WARNING
     - uuid: b80b97d6edbd4400801359435c3b7d93
       expression: 'last(/Template App FileServer Monitor/fileserver.agents.total)=0'
       name: 'FileServer Monitor: nenhum agente registrado'

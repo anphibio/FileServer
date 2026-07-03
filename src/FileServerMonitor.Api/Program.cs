@@ -144,6 +144,7 @@ app.MapGet("/metrics", async (
 {
     var now = DateTimeOffset.UtcNow;
     var database = await BuildDatabaseMetricsAsync(repository, now, cancellationToken);
+    var capacity = await BuildDatabaseCapacityMetricsAsync(configuration, repository, now, cancellationToken);
     var agentSummary = await BuildAgentMetricsAsync(agents, now, cancellationToken);
     var thresholds = new MetricsThresholds(
         AgentStaleMinutes: configuration.GetValue("Agents:StaleMinutes", 10),
@@ -165,6 +166,7 @@ app.MapGet("/metrics", async (
         TimestampUtc: now,
         Api: api,
         Database: database,
+        Capacity: capacity,
         Agents: agentSummary,
         Retention: retention,
         Thresholds: thresholds));
@@ -1441,6 +1443,69 @@ static async Task<DatabaseCapacityResponse> BuildDatabaseCapacityAsync(
         Windows: Array.Empty<DatabaseCapacityWindow>(),
         DailyCounts: Array.Empty<DatabaseCapacityDailyCount>(),
         Message: "Capacidade detalhada disponivel apenas com SQL Server.");
+}
+
+static async Task<DatabaseCapacityMetrics> BuildDatabaseCapacityMetricsAsync(
+    IConfiguration configuration,
+    IEventRepository repository,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+#if SQLSERVER
+        if (repository.ProviderName.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
+        {
+            var connectionString = configuration.GetConnectionString("SqlServer")
+                ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+
+            await using var connection = new SqlConnection(connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            var tables = await QueryCapacityTablesAsync(connection, cancellationToken);
+            var windows = await QueryCapacityWindowsAsync(connection, cancellationToken);
+            var timelineWindow = windows.FirstOrDefault(item => item.Name.Equals("Linha do tempo", StringComparison.OrdinalIgnoreCase));
+            var rawWindow = windows.FirstOrDefault(item => item.Name.Equals("Eventos brutos", StringComparison.OrdinalIgnoreCase));
+            var alertWindow = windows.FirstOrDefault(item => item.Name.Equals("Alertas", StringComparison.OrdinalIgnoreCase));
+
+            return new DatabaseCapacityMetrics(
+                Status: "healthy",
+                TotalRows: tables.Sum(item => item.RowCount),
+                TotalReservedMb: Math.Round(tables.Sum(item => item.ReservedMb), 2),
+                RawEventRows: rawWindow?.RowCount ?? 0,
+                TimelineRows: timelineWindow?.RowCount ?? 0,
+                AlertRows: alertWindow?.RowCount ?? 0,
+                TimelineOldestAgeSeconds: GetAgeSeconds(now, timelineWindow?.FromUtc),
+                TimelineNewestAgeSeconds: GetAgeSeconds(now, timelineWindow?.ToUtc),
+                Error: null);
+        }
+#endif
+
+        var stats = await repository.GetStatsAsync(cancellationToken);
+        return new DatabaseCapacityMetrics(
+            Status: "limited",
+            TotalRows: stats.StoredEvents,
+            TotalReservedMb: 0,
+            RawEventRows: stats.StoredEvents,
+            TimelineRows: 0,
+            AlertRows: 0,
+            TimelineOldestAgeSeconds: null,
+            TimelineNewestAgeSeconds: null,
+            Error: null);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        return new DatabaseCapacityMetrics(
+            Status: "critical",
+            TotalRows: 0,
+            TotalReservedMb: 0,
+            RawEventRows: 0,
+            TimelineRows: 0,
+            AlertRows: 0,
+            TimelineOldestAgeSeconds: null,
+            TimelineNewestAgeSeconds: null,
+            Error: ex.Message);
+    }
 }
 
 #if SQLSERVER
@@ -8148,6 +8213,7 @@ internal sealed record MetricsResponse(
     DateTimeOffset TimestampUtc,
     ApiMetrics Api,
     DatabaseMetrics Database,
+    DatabaseCapacityMetrics Capacity,
     AgentMetricsSummary Agents,
     RetentionMetrics Retention,
     MetricsThresholds Thresholds);
@@ -8167,6 +8233,17 @@ internal sealed record DatabaseMetrics(
     DateTimeOffset? LastEventUtc,
     long? LastEventAgeSeconds,
     long QueryDurationMs,
+    string? Error);
+
+internal sealed record DatabaseCapacityMetrics(
+    string Status,
+    long TotalRows,
+    double TotalReservedMb,
+    long RawEventRows,
+    long TimelineRows,
+    long AlertRows,
+    long? TimelineOldestAgeSeconds,
+    long? TimelineNewestAgeSeconds,
     string? Error);
 
 internal sealed record DatabaseCapacityResponse(
