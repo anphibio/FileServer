@@ -191,7 +191,7 @@ internal sealed class FileServerAgent
         {
             var scriptPath = Path.GetFullPath(_options.SecurityLogScriptPath);
             var arguments = BuildSecurityLogArguments(scriptPath);
-            var securityEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+            var securityEvents = await RunCollectorScriptAsync("Security Log", arguments, _options.SecurityLogTimeoutSeconds, cancellationToken);
             securityEventsRead = securityEvents.Count;
             Console.WriteLine($"Coleta Security: lastRecordId={_state.LastRecordId}; recebidos={securityEvents.Count}");
             collected.AddRange(securityEvents);
@@ -207,7 +207,7 @@ internal sealed class FileServerAgent
                     : 0;
                 var basePath = GetEffectiveUsnBasePath(volume);
                 var arguments = BuildUsnJournalArguments(scriptPath, volume, startUsn, basePath);
-                var usnEvents = await RunCollectorScriptAsync(arguments, cancellationToken);
+                var usnEvents = await RunCollectorScriptAsync($"USN {volume}", arguments, _options.UsnJournalTimeoutSeconds, cancellationToken);
                 usnEventsRead += usnEvents.Count;
                 Console.WriteLine($"Coleta USN: volume={volume}; startUsn={startUsn}; basePath={basePath}; recebidos={usnEvents.Count}");
                 collected.AddRange(usnEvents);
@@ -234,7 +234,9 @@ internal sealed class FileServerAgent
     }
 
     private async Task<IReadOnlyCollection<CollectedFileEvent>> RunCollectorScriptAsync(
+        string collectorName,
         string arguments,
+        int timeoutSeconds,
         CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo
@@ -255,7 +257,18 @@ internal sealed class FileServerAgent
         var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
 
-        await process.WaitForExitAsync(cancellationToken);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && timeoutCts.IsCancellationRequested)
+        {
+            TryKillProcessTree(process);
+            throw new TimeoutException($"Coletor {collectorName} excedeu o limite de {timeoutSeconds} segundo(s).");
+        }
 
         var output = await outputTask;
         var error = await errorTask;
@@ -272,6 +285,21 @@ internal sealed class FileServerAgent
 
         return JsonSerializer.Deserialize<CollectedFileEvent[]>(output, JsonOptions)
             ?? Array.Empty<CollectedFileEvent>();
+    }
+
+    private static void TryKillProcessTree(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+            // O timeout ja sera reportado no heartbeat; falha ao encerrar o filho nao deve esconder a causa.
+        }
     }
 
     private string BuildSecurityLogArguments(string scriptPath)
@@ -479,11 +507,16 @@ internal sealed class FileServerAgent
 
         try
         {
-            await _httpClient.PostAsJsonAsync("/api/agents/heartbeat", heartbeat, JsonOptions, cancellationToken);
+            using var response = await _httpClient.PostAsJsonAsync("/api/agents/heartbeat", heartbeat, JsonOptions, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                Console.Error.WriteLine($"API rejeitou heartbeat: {(int)response.StatusCode} {body}");
+            }
         }
-        catch
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
-            // Heartbeat nao pode interromper a coleta.
+            Console.Error.WriteLine($"API indisponivel para heartbeat: {ex.Message}");
         }
     }
 
@@ -873,6 +906,8 @@ internal sealed record AgentOptions(
     string PowerShellPath,
     string SecurityLogScriptPath,
     string UsnJournalScriptPath,
+    int SecurityLogTimeoutSeconds,
+    int UsnJournalTimeoutSeconds,
     string DefaultShare,
     int[] EventIds)
 {
@@ -899,7 +934,9 @@ internal sealed record AgentOptions(
             StateFile = ResolvePath(baseDirectory, options.StateFile),
             QueueFile = ResolvePath(baseDirectory, options.QueueFile),
             SecurityLogScriptPath = ResolvePath(baseDirectory, options.SecurityLogScriptPath),
-            UsnJournalScriptPath = ResolvePath(baseDirectory, options.UsnJournalScriptPath)
+            UsnJournalScriptPath = ResolvePath(baseDirectory, options.UsnJournalScriptPath),
+            SecurityLogTimeoutSeconds = options.SecurityLogTimeoutSeconds is >= 10 and <= 600 ? options.SecurityLogTimeoutSeconds : 60,
+            UsnJournalTimeoutSeconds = options.UsnJournalTimeoutSeconds is >= 10 and <= 600 ? options.UsnJournalTimeoutSeconds : 120
         };
     }
 
