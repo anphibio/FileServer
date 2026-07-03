@@ -144,6 +144,38 @@ BEGIN
 END;
 GO
 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Action_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_Action_Time
+        ON dbo.FileAuditTimelineEvents (ActionName, TimestampUtc DESC)
+        INCLUDE (ServerName, ShareName, UserName, DisplayAction, DisplayTarget);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_DisplayAction_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_DisplayAction_Time
+        ON dbo.FileAuditTimelineEvents (DisplayAction, TimestampUtc DESC)
+        INCLUDE (ServerName, ShareName, UserName, DisplayTarget);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_User_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_User_Time
+        ON dbo.FileAuditTimelineEvents (UserName, TimestampUtc DESC)
+        INCLUDE (ServerName, ShareName, ActionName, DisplayAction, DisplayTarget);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Extension_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+BEGIN
+    CREATE INDEX IX_FileAuditTimelineEvents_Extension_Time
+        ON dbo.FileAuditTimelineEvents (Extension, TimestampUtc DESC)
+        INCLUDE (ServerName, ShareName, UserName, ActionName, DisplayAction, DisplayTarget);
+END;
+GO
+
 IF OBJECT_ID(N'dbo.AgentHeartbeats', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AgentHeartbeats

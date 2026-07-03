@@ -1564,6 +1564,7 @@ internal interface ITimelineRepository
 internal sealed class SqlServerTimelineRepository : ITimelineRepository
 {
     private readonly string _connectionString;
+    private int _schemaEnsured;
 
     public SqlServerTimelineRepository(IConfiguration configuration)
     {
@@ -1580,6 +1581,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
         try
@@ -1669,6 +1671,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = BuildTimelineQuerySql(query, command);
 
@@ -1688,6 +1691,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
 
         var total = await CountTimelineEventsAsync(connection, query, cancellationToken);
         var byAction = await QueryTimelineDimensionAsync(connection, query, "DisplayAction", cancellationToken);
@@ -1709,6 +1713,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
 
         var byAction = await BuildTimelineAnomaliesAsync(connection, query, "DisplayAction", cancellationToken);
         var byShare = await BuildTimelineAnomaliesAsync(connection, query, "ShareName", cancellationToken);
@@ -1727,6 +1732,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = """
             SELECT
@@ -1762,6 +1768,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -1786,6 +1793,60 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
         }
 
         return totalDeleted;
+    }
+
+    private async Task EnsureOperationalIndexesAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) != 0)
+        {
+            return;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 300;
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.FileAuditTimelineEvents', N'U') IS NOT NULL
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Action_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+                BEGIN
+                    CREATE INDEX IX_FileAuditTimelineEvents_Action_Time
+                        ON dbo.FileAuditTimelineEvents (ActionName, TimestampUtc DESC)
+                        INCLUDE (ServerName, ShareName, UserName, DisplayAction, DisplayTarget);
+                END;
+
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_DisplayAction_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+                BEGIN
+                    CREATE INDEX IX_FileAuditTimelineEvents_DisplayAction_Time
+                        ON dbo.FileAuditTimelineEvents (DisplayAction, TimestampUtc DESC)
+                        INCLUDE (ServerName, ShareName, UserName, DisplayTarget);
+                END;
+
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_User_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+                BEGIN
+                    CREATE INDEX IX_FileAuditTimelineEvents_User_Time
+                        ON dbo.FileAuditTimelineEvents (UserName, TimestampUtc DESC)
+                        INCLUDE (ServerName, ShareName, ActionName, DisplayAction, DisplayTarget);
+                END;
+
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileAuditTimelineEvents_Extension_Time' AND object_id = OBJECT_ID(N'dbo.FileAuditTimelineEvents'))
+                BEGIN
+                    CREATE INDEX IX_FileAuditTimelineEvents_Extension_Time
+                        ON dbo.FileAuditTimelineEvents (Extension, TimestampUtc DESC)
+                        INCLUDE (ServerName, ShareName, UserName, ActionName, DisplayAction, DisplayTarget);
+                END;
+
+            END;
+            """;
+
+        try
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _schemaEnsured, 0);
+            throw;
+        }
     }
 
     private static string BuildTimelineQuerySql(TimelineQuery query, SqlCommand command)
