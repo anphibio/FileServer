@@ -415,7 +415,7 @@ public sealed class EventTimelineProjector
                 || !item.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
                 || GetProvisionalDocumentKind(item.Path) != "text"
                 || HasNearbyUsnCreation(item, all)
-                || !HasLaterDisplayAccessEcho(item, all))
+                || (!HasLaterDisplayAccessEcho(item, all) && !HasNearbyDisplayModification(item, all)))
             {
                 return item;
             }
@@ -427,6 +427,15 @@ public sealed class EventTimelineProjector
                 DisplayTarget = GetLeafName(item.Path)
             };
         });
+    }
+
+    private static bool HasNearbyDisplayModification(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
+    {
+        return all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Action is "changed" or "modified"
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(10)
+            && PathsReferToSameItem(candidate.Path, item.Path));
     }
 
     private static bool HasNearbyUsnCreation(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
@@ -1262,10 +1271,14 @@ public sealed class EventTimelineProjector
 
             if (candidate.Action is "changed" or "modified")
             {
-                return IsFileLikePath(item.Path)
-                    && PathsReferToSameItem(candidate.Path, item.Path)
-                    && candidate.TimestampUtc < item.TimestampUtc
-                    && item.TimestampUtc - candidate.TimestampUtc <= TimeSpan.FromSeconds(15);
+                if (!IsFileLikePath(item.Path) || !PathsReferToSameItem(candidate.Path, item.Path))
+                {
+                    return false;
+                }
+
+                var delta = item.TimestampUtc - candidate.TimestampUtc;
+                return (delta >= TimeSpan.Zero && delta <= TimeSpan.FromSeconds(15))
+                    || delta.Duration() <= TimeSpan.FromSeconds(2);
             }
 
             if (candidate.Action is not ("created" or "created_or_appended" or "renamed" or "moved" or "deleted"))

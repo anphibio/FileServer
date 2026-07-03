@@ -31,6 +31,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
     ("timeline trata append de texto do security log como alteracao", TimelineTreatsSecurityTextAppendCreateAsModification),
     ("timeline colapsa append e modified do security log em uma alteracao", TimelineCollapsesSecurityTextAppendAndModifyDuplicate),
+    ("timeline trata append de texto com modified vizinho como alteracao", TimelineTreatsSecurityTextAppendWithNearbyModifyAsModification),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
@@ -692,6 +693,28 @@ static void TimelineCollapsesSecurityTextAppendAndModifyDuplicate()
     Assert(display.Length == 1, "Append e modified do Security Log no mesmo arquivo deveriam virar uma unica alteracao.");
     Assert(display[0].Action == "modified", "Evento restante deveria ser alteracao.");
     Assert(display[0].DisplayAction == "Alterado", "Evento restante deveria aparecer como Alterado.");
+}
+
+static void TimelineTreatsSecurityTextAppendWithNearbyModifyAsModification()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-03T01:41:18Z");
+    var path = @"C:\Corporativo\DTI\Novo(a) Documento de Texto - Copia (3).txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddMilliseconds(943), "created_or_appended", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(947), "modified", path, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp, "accessed", path, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(8), "modified", path, source: "usn-journal", user: "UNKNOWN")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    var targetEvents = display.Where(item => item.Path == path).ToArray();
+
+    Assert(targetEvents.Length == 1, "Append de texto com modified vizinho deveria aparecer como uma unica alteracao, sem acesso eco.");
+    Assert(targetEvents[0].Action == "modified", "Evento final deveria ser alteracao.");
+    Assert(targetEvents[0].DisplayAction == "Alterado", "Evento final deveria aparecer como Alterado.");
 }
 
 static void TimelineCollapsesRenameDuplicateAfterUserResolution()
