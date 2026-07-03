@@ -772,6 +772,15 @@ app.MapGet("/api/agents/config", async (
         MonitoredPaths: activePaths));
 });
 
+app.MapGet("/api/database/capacity", async (
+    IConfiguration configuration,
+    IEventRepository repository,
+    CancellationToken cancellationToken) =>
+{
+    var capacity = await BuildDatabaseCapacityAsync(configuration, repository, cancellationToken);
+    return Results.Ok(capacity);
+});
+
 app.MapGet("/api/reports/activity-summary", async (
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
@@ -1378,6 +1387,221 @@ static async Task<DatabaseMetrics> BuildDatabaseMetricsAsync(
             Error: ex.Message);
     }
 }
+
+static async Task<DatabaseCapacityResponse> BuildDatabaseCapacityAsync(
+    IConfiguration configuration,
+    IEventRepository repository,
+    CancellationToken cancellationToken)
+{
+    var generatedUtc = DateTimeOffset.UtcNow;
+
+#if SQLSERVER
+    if (repository.ProviderName.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
+    {
+        var connectionString = configuration.GetConnectionString("SqlServer")
+            ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var tables = await QueryCapacityTablesAsync(connection, cancellationToken);
+        var windows = await QueryCapacityWindowsAsync(connection, cancellationToken);
+        var daily = await QueryCapacityDailyCountsAsync(connection, generatedUtc.AddDays(-30), generatedUtc, cancellationToken);
+        var totalRows = tables.Sum(item => item.RowCount);
+        var totalMb = tables.Sum(item => item.ReservedMb);
+        var timelineWindow = windows.FirstOrDefault(item => item.Name.Equals("Linha do tempo", StringComparison.OrdinalIgnoreCase));
+
+        return new DatabaseCapacityResponse(
+            GeneratedUtc: generatedUtc,
+            Provider: repository.ProviderName,
+            Status: "healthy",
+            TotalRows: totalRows,
+            TotalReservedMb: Math.Round(totalMb, 2),
+            TimelineRows: timelineWindow?.RowCount ?? 0,
+            TimelineFromUtc: timelineWindow?.FromUtc,
+            TimelineToUtc: timelineWindow?.ToUtc,
+            Tables: tables,
+            Windows: windows,
+            DailyCounts: daily,
+            Message: null);
+    }
+#endif
+
+    var stats = await repository.GetStatsAsync(cancellationToken);
+    return new DatabaseCapacityResponse(
+        GeneratedUtc: generatedUtc,
+        Provider: repository.ProviderName,
+        Status: "limited",
+        TotalRows: stats.StoredEvents,
+        TotalReservedMb: 0,
+        TimelineRows: 0,
+        TimelineFromUtc: null,
+        TimelineToUtc: stats.LastEventUtc,
+        Tables: Array.Empty<DatabaseCapacityTable>(),
+        Windows: Array.Empty<DatabaseCapacityWindow>(),
+        DailyCounts: Array.Empty<DatabaseCapacityDailyCount>(),
+        Message: "Capacidade detalhada disponivel apenas com SQL Server.");
+}
+
+#if SQLSERVER
+static async Task<IReadOnlyCollection<DatabaseCapacityTable>> QueryCapacityTablesAsync(
+    SqlConnection connection,
+    CancellationToken cancellationToken)
+{
+    await using var command = connection.CreateCommand();
+    command.CommandText = """
+        SELECT
+            t.name AS TableName,
+            SUM(p.row_count) AS [RowCount],
+            SUM(p.reserved_page_count) * 8.0 / 1024.0 AS ReservedMb,
+            SUM(p.used_page_count) * 8.0 / 1024.0 AS UsedMb
+        FROM sys.dm_db_partition_stats p
+        INNER JOIN sys.tables t ON p.object_id = t.object_id
+        WHERE t.name IN
+        (
+            N'FileAuditEvents',
+            N'FileAuditTimelineEvents',
+            N'FileServerAlerts',
+            N'AgentHeartbeats',
+            N'MonitoredPaths',
+            N'AdminAuditLog'
+        )
+            AND p.index_id IN (0, 1)
+        GROUP BY t.name
+        ORDER BY ReservedMb DESC, [RowCount] DESC;
+        """;
+
+    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+    var result = new List<DatabaseCapacityTable>();
+
+    while (await reader.ReadAsync(cancellationToken))
+    {
+        result.Add(new DatabaseCapacityTable(
+            Name: LabelForCapacityTable(reader.GetString(reader.GetOrdinal("TableName"))),
+            PhysicalName: reader.GetString(reader.GetOrdinal("TableName")),
+            RowCount: Convert.ToInt64(reader["RowCount"]),
+            ReservedMb: Math.Round(Convert.ToDouble(reader["ReservedMb"]), 2),
+            UsedMb: Math.Round(Convert.ToDouble(reader["UsedMb"]), 2)));
+    }
+
+    return result;
+}
+
+static async Task<IReadOnlyCollection<DatabaseCapacityWindow>> QueryCapacityWindowsAsync(
+    SqlConnection connection,
+    CancellationToken cancellationToken)
+{
+    await using var command = connection.CreateCommand();
+    command.CommandText = """
+        SELECT
+            N'Eventos brutos' AS Name,
+            COUNT_BIG(1) AS [RowCount],
+            MIN(TimestampUtc) AS FromUtc,
+            MAX(TimestampUtc) AS ToUtc
+        FROM dbo.FileAuditEvents
+        UNION ALL
+        SELECT
+            N'Linha do tempo' AS Name,
+            COUNT_BIG(1) AS [RowCount],
+            MIN(TimestampUtc) AS FromUtc,
+            MAX(TimestampUtc) AS ToUtc
+        FROM dbo.FileAuditTimelineEvents
+        UNION ALL
+        SELECT
+            N'Alertas' AS Name,
+            COUNT_BIG(1) AS [RowCount],
+            MIN(CreatedUtc) AS FromUtc,
+            MAX(CreatedUtc) AS ToUtc
+        FROM dbo.FileServerAlerts;
+        """;
+
+    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+    var result = new List<DatabaseCapacityWindow>();
+
+    while (await reader.ReadAsync(cancellationToken))
+    {
+        result.Add(new DatabaseCapacityWindow(
+            Name: reader.GetString(reader.GetOrdinal("Name")),
+            RowCount: Convert.ToInt64(reader["RowCount"]),
+            FromUtc: ReadNullableUtc(reader["FromUtc"]),
+            ToUtc: ReadNullableUtc(reader["ToUtc"])));
+    }
+
+    return result;
+}
+
+static async Task<IReadOnlyCollection<DatabaseCapacityDailyCount>> QueryCapacityDailyCountsAsync(
+    SqlConnection connection,
+    DateTimeOffset fromUtc,
+    DateTimeOffset toUtc,
+    CancellationToken cancellationToken)
+{
+    await using var command = connection.CreateCommand();
+    command.Parameters.AddWithValue("@FromUtc", fromUtc.UtcDateTime);
+    command.Parameters.AddWithValue("@ToUtc", toUtc.UtcDateTime);
+    command.CommandText = """
+        SELECT
+            CAST(TimestampUtc AS date) AS BucketDate,
+            N'Eventos brutos' AS SeriesName,
+            COUNT_BIG(1) AS EventCount
+        FROM dbo.FileAuditEvents
+        WHERE TimestampUtc >= @FromUtc AND TimestampUtc <= @ToUtc
+        GROUP BY CAST(TimestampUtc AS date)
+        UNION ALL
+        SELECT
+            CAST(TimestampUtc AS date) AS BucketDate,
+            N'Linha do tempo' AS SeriesName,
+            COUNT_BIG(1) AS EventCount
+        FROM dbo.FileAuditTimelineEvents
+        WHERE TimestampUtc >= @FromUtc AND TimestampUtc <= @ToUtc
+        GROUP BY CAST(TimestampUtc AS date)
+        UNION ALL
+        SELECT
+            CAST(CreatedUtc AS date) AS BucketDate,
+            N'Alertas' AS SeriesName,
+            COUNT_BIG(1) AS EventCount
+        FROM dbo.FileServerAlerts
+        WHERE CreatedUtc >= @FromUtc AND CreatedUtc <= @ToUtc
+        GROUP BY CAST(CreatedUtc AS date)
+        ORDER BY BucketDate DESC, SeriesName ASC;
+        """;
+
+    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+    var result = new List<DatabaseCapacityDailyCount>();
+
+    while (await reader.ReadAsync(cancellationToken))
+    {
+        var date = ((DateTime)reader["BucketDate"]).ToString("yyyy-MM-dd");
+        result.Add(new DatabaseCapacityDailyCount(
+            Date: date,
+            Series: reader.GetString(reader.GetOrdinal("SeriesName")),
+            Count: Convert.ToInt64(reader["EventCount"])));
+    }
+
+    return result;
+}
+
+static string LabelForCapacityTable(string physicalName)
+{
+    return physicalName switch
+    {
+        "FileAuditEvents" => "Eventos brutos",
+        "FileAuditTimelineEvents" => "Linha do tempo",
+        "FileServerAlerts" => "Alertas",
+        "AgentHeartbeats" => "Agentes",
+        "MonitoredPaths" => "Caminhos",
+        "AdminAuditLog" => "Auditoria administrativa",
+        _ => physicalName
+    };
+}
+
+static DateTimeOffset? ReadNullableUtc(object value)
+{
+    return value == DBNull.Value
+        ? null
+        : new DateTimeOffset(DateTime.SpecifyKind((DateTime)value, DateTimeKind.Utc));
+}
+#endif
 
 static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
     AgentHealthStore store,
@@ -7241,6 +7465,11 @@ internal static class AuthHelpers
             return AuthRole.Operator;
         }
 
+        if (request.Path.StartsWithSegments("/api/database/capacity"))
+        {
+            return AuthRole.Operator;
+        }
+
         return null;
     }
 
@@ -7939,6 +8168,38 @@ internal sealed record DatabaseMetrics(
     long? LastEventAgeSeconds,
     long QueryDurationMs,
     string? Error);
+
+internal sealed record DatabaseCapacityResponse(
+    DateTimeOffset GeneratedUtc,
+    string Provider,
+    string Status,
+    long TotalRows,
+    double TotalReservedMb,
+    long TimelineRows,
+    DateTimeOffset? TimelineFromUtc,
+    DateTimeOffset? TimelineToUtc,
+    IReadOnlyCollection<DatabaseCapacityTable> Tables,
+    IReadOnlyCollection<DatabaseCapacityWindow> Windows,
+    IReadOnlyCollection<DatabaseCapacityDailyCount> DailyCounts,
+    string? Message);
+
+internal sealed record DatabaseCapacityTable(
+    string Name,
+    string PhysicalName,
+    long RowCount,
+    double ReservedMb,
+    double UsedMb);
+
+internal sealed record DatabaseCapacityWindow(
+    string Name,
+    long RowCount,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc);
+
+internal sealed record DatabaseCapacityDailyCount(
+    string Date,
+    string Series,
+    long Count);
 
 internal sealed record AgentMetricsSummary(
     string Status,

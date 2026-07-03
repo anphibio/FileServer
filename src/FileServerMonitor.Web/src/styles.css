@@ -338,6 +338,37 @@ select {
   gap: 18px;
 }
 
+.capacity-window-list,
+.capacity-daily-list {
+  display: grid;
+  gap: 10px;
+}
+
+.capacity-window-list article,
+.capacity-daily-list div {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid #dce5ef;
+  border-radius: 8px;
+  background: #f8fbfe;
+}
+
+.capacity-window-list strong,
+.capacity-daily-list strong {
+  color: #1f2a37;
+}
+
+.capacity-window-list span,
+.capacity-daily-list span {
+  color: #34475d;
+  font-weight: 700;
+}
+
+.capacity-window-list small {
+  color: #637083;
+}
+
 .analytics-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

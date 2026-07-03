@@ -311,6 +311,42 @@ type AdminAuditEntry = {
   detailsJson?: string | null;
 };
 
+type DatabaseCapacityResponse = {
+  generatedUtc: string;
+  provider: string;
+  status: string;
+  totalRows: number;
+  totalReservedMb: number;
+  timelineRows: number;
+  timelineFromUtc?: string | null;
+  timelineToUtc?: string | null;
+  tables: DatabaseCapacityTable[];
+  windows: DatabaseCapacityWindow[];
+  dailyCounts: DatabaseCapacityDailyCount[];
+  message?: string | null;
+};
+
+type DatabaseCapacityTable = {
+  name: string;
+  physicalName: string;
+  rowCount: number;
+  reservedMb: number;
+  usedMb: number;
+};
+
+type DatabaseCapacityWindow = {
+  name: string;
+  rowCount: number;
+  fromUtc?: string | null;
+  toUtc?: string | null;
+};
+
+type DatabaseCapacityDailyCount = {
+  date: string;
+  series: string;
+  count: number;
+};
+
 type Notice = {
   tone: "success" | "warning" | "danger";
   message: string;
@@ -323,7 +359,7 @@ type GeneratedReport = {
   events: DisplayEvent[];
 };
 
-type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "audit" | "auth";
+type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
 type AccessRole = "admin" | "operator" | "reader";
 
 type AccessPolicy = {
@@ -331,6 +367,7 @@ type AccessPolicy = {
   canManageAlerts: boolean;
   canManagePaths: boolean;
   canViewAgents: boolean;
+  canViewCapacity: boolean;
   canViewAdminAudit: boolean;
   canManageAuth: boolean;
 };
@@ -565,6 +602,11 @@ function App() {
               Caminhos
             </TabButton>
           )}
+          {visibleTabs.includes("capacity") && (
+            <TabButton icon={<Database size={18} />} active={activeTab === "capacity"} onClick={() => setActiveTab("capacity")} meta="SQL">
+              Banco
+            </TabButton>
+          )}
           {visibleTabs.includes("audit") && (
             <TabButton icon={<ClipboardList size={18} />} active={activeTab === "audit"} onClick={() => setActiveTab("audit")} meta={adminAudit.length.toLocaleString("pt-BR")}>
               Auditoria
@@ -649,6 +691,8 @@ function App() {
         {activeTab === "agents" && <AgentsView agents={agents} />}
 
         {activeTab === "paths" && <MonitoredPathsView paths={monitoredPaths} canManagePaths={accessPolicy.canManagePaths} onChanged={loadData} onNotify={setNotice} />}
+
+        {activeTab === "capacity" && <DatabaseCapacityView onNotify={setNotice} />}
 
         {activeTab === "audit" && <AdminAuditView entries={adminAudit} />}
 
@@ -2413,6 +2457,154 @@ function MonitoredPathsView({
   );
 }
 
+function DatabaseCapacityView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [capacity, setCapacity] = useState<DatabaseCapacityResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const timelineWindow = capacity?.windows.find((item) => item.name === "Linha do tempo");
+  const rawWindow = capacity?.windows.find((item) => item.name === "Eventos brutos");
+  const recentDaily = useMemo(() => {
+    if (!capacity) {
+      return [];
+    }
+
+    const grouped = new Map<string, Record<string, number>>();
+    for (const item of capacity.dailyCounts) {
+      const bucket = grouped.get(item.date) ?? {};
+      bucket[item.series] = item.count;
+      grouped.set(item.date, bucket);
+    }
+
+    return Array.from(grouped.entries())
+      .map(([date, values]) => ({
+        date,
+        raw: values["Eventos brutos"] ?? 0,
+        timeline: values["Linha do tempo"] ?? 0,
+        alerts: values["Alertas"] ?? 0
+      }))
+      .slice(0, 10);
+  }, [capacity]);
+
+  async function loadCapacity() {
+    setLoading(true);
+    try {
+      setCapacity(await fetchJson<DatabaseCapacityResponse>("/api/database/capacity"));
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar capacidade do banco." });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadCapacity();
+  }, []);
+
+  if (!capacity) {
+    return (
+      <Panel title="Capacidade do Banco" subtitle={loading ? "Carregando capacidade..." : "Sem dados carregados."}>
+        <EmptyState text={loading ? "Consultando SQL Server..." : "Clique em atualizar para carregar a capacidade."} />
+      </Panel>
+    );
+  }
+
+  return (
+    <div className="view-stack">
+      <section className="executive-grid">
+        <ExecutiveCard
+          title="Linhas Totais"
+          value={capacity.totalRows.toLocaleString("pt-BR")}
+          detail={`Provider ${capacity.provider}. Atualizado em ${formatDate(capacity.generatedUtc)}.`}
+          tone="neutral"
+        />
+        <ExecutiveCard
+          title="Espaço Reservado"
+          value={formatMegabytes(capacity.totalReservedMb)}
+          detail="Soma das tabelas principais da aplicação."
+          tone={capacity.totalReservedMb > 102400 ? "warning" : "neutral"}
+        />
+        <ExecutiveCard
+          title="Timeline Correlacionada"
+          value={capacity.timelineRows.toLocaleString("pt-BR")}
+          detail={timelineWindow?.fromUtc ? `${formatDate(timelineWindow.fromUtc)} até ${formatDate(timelineWindow.toUtc ?? timelineWindow.fromUtc)}` : "Sem janela registrada."}
+          tone="neutral"
+        />
+      </section>
+
+      {capacity.message && <div className="sync-banner">{capacity.message}</div>}
+
+      <div className="toolbar">
+        <button className="text-button" type="button" onClick={loadCapacity} disabled={loading}>
+          <RefreshCcw size={16} />
+          {loading ? "Atualizando..." : "Atualizar capacidade"}
+        </button>
+      </div>
+
+      <Panel title="Tabelas principais" subtitle="Volume e espaço reservado para os dados que mais crescem em produção.">
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Tabela</th>
+                <th>Linhas</th>
+                <th>Reservado</th>
+                <th>Usado</th>
+                <th>Nome físico</th>
+              </tr>
+            </thead>
+            <tbody>
+              {capacity.tables.map((table) => (
+                <tr key={table.physicalName}>
+                  <td>{table.name}</td>
+                  <td>{table.rowCount.toLocaleString("pt-BR")}</td>
+                  <td>{formatMegabytes(table.reservedMb)}</td>
+                  <td>{formatMegabytes(table.usedMb)}</td>
+                  <td className="details-cell">{table.physicalName}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {capacity.tables.length === 0 && <EmptyState text="Sem tabelas detalhadas para este provider." />}
+        </div>
+      </Panel>
+
+      <div className="split-grid">
+        <Panel title="Janelas de retenção" subtitle="Menor e maior data encontrada nas tabelas de auditoria.">
+          <div className="capacity-window-list">
+            {capacity.windows.map((item) => (
+              <article key={item.name}>
+                <strong>{item.name}</strong>
+                <span>{item.rowCount.toLocaleString("pt-BR")} registro(s)</span>
+                <small>{item.fromUtc ? `${formatDate(item.fromUtc)} até ${formatDate(item.toUtc ?? item.fromUtc)}` : "Sem registros"}</small>
+              </article>
+            ))}
+            {rawWindow && timelineWindow && rawWindow.rowCount > 0 && (
+              <article>
+                <strong>Taxa de consolidação</strong>
+                <span>{Math.round((timelineWindow.rowCount / rawWindow.rowCount) * 100).toLocaleString("pt-BR")}%</span>
+                <small>Relação entre timeline correlacionada e eventos brutos.</small>
+              </article>
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Crescimento recente" subtitle="Contagem diária dos últimos 30 dias, com foco nos 10 dias mais recentes.">
+          <div className="capacity-daily-list">
+            {recentDaily.map((item) => (
+              <div key={item.date}>
+                <strong>{item.date}</strong>
+                <span>Brutos {item.raw.toLocaleString("pt-BR")}</span>
+                <span>Timeline {item.timeline.toLocaleString("pt-BR")}</span>
+                <span>Alertas {item.alerts.toLocaleString("pt-BR")}</span>
+              </div>
+            ))}
+            {recentDaily.length === 0 && <EmptyState text="Sem crescimento recente no recorte." />}
+          </div>
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
 function AdminAuditView({ entries }: { entries: AdminAuditEntry[] }) {
   const [filter, setFilter] = useState("");
   const filteredEntries = useMemo(() => {
@@ -3210,6 +3402,7 @@ function buildAccessPolicy(authStatus: AuthStatusResponse | null, authUser: Auth
     canManageAlerts: canOperate,
     canManagePaths: canOperate,
     canViewAgents: canOperate,
+    canViewCapacity: canOperate,
     canViewAdminAudit: role === "admin",
     canManageAuth: role === "admin"
   };
@@ -3244,6 +3437,10 @@ function getVisibleTabs(policy: AccessPolicy): Tab[] {
     tabs.push("paths");
   }
 
+  if (policy.canViewCapacity) {
+    tabs.push("capacity");
+  }
+
   if (policy.canViewAdminAudit) {
     tabs.push("audit");
   }
@@ -3274,6 +3471,7 @@ function titleForTab(tab: Tab) {
     alerts: "Alertas",
     agents: "Agentes",
     paths: "Caminhos Monitorados",
+    capacity: "Capacidade do Banco",
     audit: "Auditoria Administrativa",
     auth: "Configuração"
   };
@@ -3336,6 +3534,14 @@ function getHighestAnomaly(response: BaselineAnomalyResponse | null) {
 
   return [...response.byAction, ...response.byShare, ...response.byUser]
     .sort((left, right) => right.deltaPercent - left.deltaPercent)[0] ?? null;
+}
+
+function formatMegabytes(value: number) {
+  if (value >= 1024) {
+    return `${(value / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} GB`;
+  }
+
+  return `${value.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`;
 }
 
 function getOperationalPosture(
