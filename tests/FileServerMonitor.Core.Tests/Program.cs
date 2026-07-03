@@ -34,7 +34,9 @@ var tests = new (string Name, Action Test)[]
     ("timeline trata append de texto com modified vizinho como alteracao", TimelineTreatsSecurityTextAppendWithNearbyModifyAsModification),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
-    ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth)
+    ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth),
+    ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
+    ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary)
 };
 
 var failures = new List<string>();
@@ -94,6 +96,94 @@ static void NormalizesRequiredFieldsAndDefaults()
     Assert(normalized.Result == "success", "Resultado default deveria ser success.");
     Assert(normalized.Severity == "info", "Severidade default deveria ser info.");
     Assert(normalized.Source == "manual-ingest", "Origem default deveria ser manual-ingest.");
+}
+
+static void InventoryNormalizesFileAndFolderItems()
+{
+    var scannedAt = DateTimeOffset.Parse("2026-07-02T03:00:00Z");
+    var snapshotId = Guid.NewGuid();
+
+    var file = FileInventoryNormalizer.Normalize(new FileInventoryItemInput(
+        SnapshotId: snapshotId,
+        ScannedAtUtc: scannedAt,
+        Server: " FileServer ",
+        Share: " Corporativo ",
+        RootPath: @"C:/Corporativo",
+        Path: @"C:/Corporativo/RH/Relatorio.XLSX",
+        RelativePath: null,
+        Name: null,
+        ItemType: "file",
+        SizeBytes: 2048,
+        CreatedUtc: null,
+        ModifiedUtc: null,
+        AccessedUtc: null,
+        Error: null));
+
+    var folder = FileInventoryNormalizer.Normalize(new FileInventoryItemInput(
+        SnapshotId: snapshotId,
+        ScannedAtUtc: scannedAt,
+        Server: "FileServer",
+        Share: "Corporativo",
+        RootPath: @"C:\Corporativo",
+        Path: @"C:\Corporativo\RH",
+        RelativePath: null,
+        Name: null,
+        ItemType: "directory",
+        SizeBytes: 999,
+        CreatedUtc: null,
+        ModifiedUtc: null,
+        AccessedUtc: null,
+        Error: null));
+
+    Assert(file.Server == "FileServer", "Servidor do inventario deveria ser aparado.");
+    Assert(file.Path == @"C:\Corporativo\RH\Relatorio.XLSX", "Caminho deveria usar separador Windows.");
+    Assert(file.RelativePath == @"RH\Relatorio.XLSX", "Caminho relativo deveria ser derivado do root.");
+    Assert(file.Name == "Relatorio.XLSX", "Nome deveria ser derivado do caminho.");
+    Assert(file.Extension == ".xlsx", "Extensao deveria ser normalizada em minusculo.");
+    Assert(file.SizeBytes == 2048, "Tamanho de arquivo deveria ser preservado.");
+    Assert(file.Depth == 2, "Profundidade deveria contar partes do caminho relativo.");
+    Assert(folder.ItemType == "folder", "Directory deveria virar folder.");
+    Assert(folder.SizeBytes == 0, "Pasta nao deveria carregar tamanho proprio.");
+    Assert(folder.Extension is null, "Pasta nao deveria ter extensao.");
+}
+
+static void InventoryBuildsGovernanceSummary()
+{
+    var snapshotId = Guid.NewGuid();
+    var now = DateTimeOffset.Parse("2026-07-02T03:00:00Z");
+    var snapshot = new FileInventorySnapshot(
+        Id: snapshotId,
+        Server: "FileServer",
+        Share: "Corporativo",
+        RootPath: @"C:\Corporativo",
+        StartedUtc: now.AddMinutes(-5),
+        FinishedUtc: now,
+        Status: "completed",
+        FileCount: 3,
+        FolderCount: 2,
+        TotalBytes: 6144,
+        ErrorCount: 0,
+        Error: null);
+    var items = new[]
+    {
+        BuildInventoryItem(snapshotId, now, @"C:\Corporativo\RH", "folder", 0, modifiedUtc: now.AddDays(-10)),
+        BuildInventoryItem(snapshotId, now, @"C:\Corporativo\DTI", "folder", 0, modifiedUtc: now.AddDays(-10)),
+        BuildInventoryItem(snapshotId, now, @"C:\Corporativo\RH\a.xlsx", "file", 4096, modifiedUtc: now.AddDays(-10)),
+        BuildInventoryItem(snapshotId, now, @"C:\Corporativo\RH\b.txt", "file", 1024, modifiedUtc: now.AddDays(-45)),
+        BuildInventoryItem(snapshotId, now, @"C:\Corporativo\DTI\c.txt", "file", 1024, modifiedUtc: now.AddDays(-400))
+    };
+
+    var summary = FileInventoryAnalyzer.BuildSummary(snapshot, items, top: 5, nowUtc: now);
+
+    Assert(summary.Status == "completed", "Resumo deveria preservar status do snapshot.");
+    Assert(summary.FileCount == 3, "Resumo deveria contar arquivos.");
+    Assert(summary.FolderCount == 2, "Resumo deveria contar pastas.");
+    Assert(summary.TotalBytes == 6144, "Resumo deveria somar bytes.");
+    Assert(summary.TopFolders.First().Path == @"C:\Corporativo\RH", "Pasta RH deveria liderar por tamanho.");
+    Assert(summary.TopFolders.First().TotalBytes == 5120, "Pasta RH deveria somar arquivos filhos diretos.");
+    Assert(summary.TopExtensions.First().Extension == ".xlsx", "Extensao xlsx deveria liderar por tamanho.");
+    Assert(summary.AgeBuckets.Single(item => item.Label == "31-90 dias").FileCount == 1, "Um arquivo deveria estar no bucket 31-90 dias.");
+    Assert(summary.AgeBuckets.Single(item => item.Label == "+365 dias").FileCount == 1, "Um arquivo deveria estar no bucket acima de 365 dias.");
 }
 
 static void AgentClassifiesOperationalHealth()
@@ -857,6 +947,31 @@ static CollectedFileEvent BuildCollectedEvent(
         Result: "success",
         Severity: "info",
         Source: source);
+}
+
+static FileInventoryItem BuildInventoryItem(
+    Guid snapshotId,
+    DateTimeOffset scannedAtUtc,
+    string path,
+    string itemType,
+    long sizeBytes,
+    DateTimeOffset? modifiedUtc = null)
+{
+    return FileInventoryNormalizer.Normalize(new FileInventoryItemInput(
+        SnapshotId: snapshotId,
+        ScannedAtUtc: scannedAtUtc,
+        Server: "FileServer",
+        Share: "Corporativo",
+        RootPath: @"C:\Corporativo",
+        Path: path,
+        RelativePath: null,
+        Name: null,
+        ItemType: itemType,
+        SizeBytes: sizeBytes,
+        CreatedUtc: modifiedUtc,
+        ModifiedUtc: modifiedUtc,
+        AccessedUtc: null,
+        Error: null));
 }
 
 static void Assert(bool condition, string message)

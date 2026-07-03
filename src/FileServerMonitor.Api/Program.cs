@@ -7,6 +7,7 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using FileServerMonitor.Core;
 #if SQLSERVER
 using Microsoft.Data.SqlClient;
 #endif
@@ -63,16 +64,19 @@ if (storageProvider.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
 #if SQLSERVER
     builder.Services.AddSingleton<IEventRepository, SqlServerEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, SqlServerTimelineRepository>();
+    builder.Services.AddSingleton<IInventoryRepository, SqlServerInventoryRepository>();
 #else
     Console.Error.WriteLine("SQL Server desativado neste build. Usando armazenamento em memoria.");
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
+    builder.Services.AddSingleton<IInventoryRepository, InMemoryInventoryRepository>();
 #endif
 }
 else
 {
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
+    builder.Services.AddSingleton<IInventoryRepository, InMemoryInventoryRepository>();
 }
 
 var app = builder.Build();
@@ -559,6 +563,79 @@ app.MapPost("/api/events/timeline/rebuild", async (
         FromUtc: rawEvents.Count == 0 ? fromUtc : rawEvents.Min(item => item.TimestampUtc),
         ToUtc: rawEvents.Count == 0 ? toUtc : rawEvents.Max(item => item.TimestampUtc),
         CorrelationVersion: TimelineCorrelationVersion));
+});
+
+app.MapPost("/api/inventory/snapshots/start", async (
+    InventorySnapshotStartRequest request,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    var snapshot = await inventory.StartSnapshotAsync(request.ToSnapshot(), cancellationToken);
+    return Results.Created($"/api/inventory/snapshots/{snapshot.Id}", snapshot);
+});
+
+app.MapPost("/api/inventory/snapshots/{id:guid}/items", async (
+    Guid id,
+    InventoryItemBatchRequest request,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    if (request.Items.Length == 0)
+    {
+        return Results.BadRequest(new ErrorResponse("A lista de itens nao pode estar vazia."));
+    }
+
+    if (request.Items.Length > 2_000)
+    {
+        return Results.BadRequest(new ErrorResponse("Envie no maximo 2000 itens por lote."));
+    }
+
+    var items = request.Items
+        .Select(item => item.ToInventoryItem(id))
+        .ToArray();
+    await inventory.AddBatchAsync(id, items, cancellationToken);
+
+    return Results.Accepted(value: new InventoryBatchIngestResponse(SnapshotId: id, AcceptedItems: items.Length));
+});
+
+app.MapPost("/api/inventory/snapshots/{id:guid}/complete", async (
+    Guid id,
+    InventorySnapshotCompleteRequest request,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    var snapshot = await inventory.CompleteSnapshotAsync(
+        id,
+        request.Status ?? "completed",
+        request.Error,
+        cancellationToken);
+
+    return snapshot is null
+        ? Results.NotFound(new ErrorResponse("Snapshot de inventario nao encontrado."))
+        : Results.Ok(snapshot);
+});
+
+app.MapGet("/api/inventory/summary", async (
+    string? server,
+    string? share,
+    string? rootPath,
+    int? top,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    var summary = await inventory.GetLatestSummaryAsync(server, share, rootPath, top is > 0 and <= 50 ? top.Value : 10, cancellationToken);
+    return Results.Ok(summary);
+});
+
+app.MapGet("/api/inventory/snapshots", async (
+    string? server,
+    string? share,
+    int? take,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    var snapshots = await inventory.GetSnapshotsAsync(server, share, take is > 0 and <= 200 ? take.Value : 20, cancellationToken);
+    return Results.Ok(snapshots);
 });
 
 app.MapGet("/api/alerts", async (
@@ -1849,6 +1926,19 @@ internal interface ITimelineRepository
     Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
 }
 
+internal interface IInventoryRepository
+{
+    Task<FileInventorySnapshot> StartSnapshotAsync(FileInventorySnapshot snapshot, CancellationToken cancellationToken);
+
+    Task AddBatchAsync(Guid snapshotId, IReadOnlyCollection<FileInventoryItem> items, CancellationToken cancellationToken);
+
+    Task<FileInventorySnapshot?> CompleteSnapshotAsync(Guid snapshotId, string status, string? error, CancellationToken cancellationToken);
+
+    Task<FileInventorySummary> GetLatestSummaryAsync(string? server, string? share, string? rootPath, int top, CancellationToken cancellationToken);
+
+    Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(string? server, string? share, int take, CancellationToken cancellationToken);
+}
+
 #if SQLSERVER
 internal sealed class SqlServerTimelineRepository : ITimelineRepository
 {
@@ -2536,6 +2626,522 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
             _ => Array.Empty<string>()
         };
     }
+}
+
+internal sealed class SqlServerInventoryRepository : IInventoryRepository
+{
+    private readonly string _connectionString;
+    private int _schemaEnsured;
+
+    public SqlServerInventoryRepository(IConfiguration configuration)
+    {
+        _connectionString = configuration.GetConnectionString("SqlServer")
+            ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+    }
+
+    public async Task<FileInventorySnapshot> StartSnapshotAsync(FileInventorySnapshot snapshot, CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO dbo.FileInventorySnapshots
+            (
+                Id,
+                ServerName,
+                ShareName,
+                RootPath,
+                StartedUtc,
+                FinishedUtc,
+                StatusName,
+                FileCount,
+                FolderCount,
+                TotalBytes,
+                ErrorCount,
+                ErrorText
+            )
+            VALUES
+            (
+                @Id,
+                @ServerName,
+                @ShareName,
+                @RootPath,
+                @StartedUtc,
+                NULL,
+                @StatusName,
+                0,
+                0,
+                0,
+                0,
+                NULL
+            );
+            """;
+        command.Parameters.AddWithValue("@Id", snapshot.Id);
+        command.Parameters.AddWithValue("@ServerName", snapshot.Server);
+        command.Parameters.AddWithValue("@ShareName", snapshot.Share);
+        command.Parameters.AddWithValue("@RootPath", snapshot.RootPath);
+        command.Parameters.AddWithValue("@StartedUtc", snapshot.StartedUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@StatusName", snapshot.Status);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+
+        return snapshot;
+    }
+
+    public async Task AddBatchAsync(Guid snapshotId, IReadOnlyCollection<FileInventoryItem> items, CancellationToken cancellationToken)
+    {
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            foreach (var item in items)
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = """
+                    INSERT INTO dbo.FileInventoryItems
+                    (
+                        Id,
+                        SnapshotId,
+                        ScannedAtUtc,
+                        ServerName,
+                        ShareName,
+                        RootPath,
+                        FullPath,
+                        RelativePath,
+                        ItemName,
+                        ItemType,
+                        Extension,
+                        SizeBytes,
+                        Depth,
+                        CreatedUtc,
+                        ModifiedUtc,
+                        AccessedUtc,
+                        StatusName,
+                        ErrorText
+                    )
+                    VALUES
+                    (
+                        @Id,
+                        @SnapshotId,
+                        @ScannedAtUtc,
+                        @ServerName,
+                        @ShareName,
+                        @RootPath,
+                        @FullPath,
+                        @RelativePath,
+                        @ItemName,
+                        @ItemType,
+                        @Extension,
+                        @SizeBytes,
+                        @Depth,
+                        @CreatedUtc,
+                        @ModifiedUtc,
+                        @AccessedUtc,
+                        @StatusName,
+                        @ErrorText
+                    );
+                    """;
+                AddItemParameters(command, item with { SnapshotId = snapshotId });
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task<FileInventorySnapshot?> CompleteSnapshotAsync(
+        Guid snapshotId,
+        string status,
+        string? error,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                UPDATE dbo.FileInventorySnapshots
+                SET
+                    FinishedUtc = SYSUTCDATETIME(),
+                    StatusName = @StatusName,
+                    FileCount = (
+                        SELECT COUNT_BIG(1)
+                        FROM dbo.FileInventoryItems
+                        WHERE SnapshotId = @Id AND ItemType = N'file' AND StatusName = N'active'
+                    ),
+                    FolderCount = (
+                        SELECT COUNT_BIG(1)
+                        FROM dbo.FileInventoryItems
+                        WHERE SnapshotId = @Id AND ItemType = N'folder' AND StatusName = N'active'
+                    ),
+                    TotalBytes = (
+                        SELECT COALESCE(SUM(SizeBytes), 0)
+                        FROM dbo.FileInventoryItems
+                        WHERE SnapshotId = @Id AND ItemType = N'file' AND StatusName = N'active'
+                    ),
+                    ErrorCount = (
+                        SELECT COUNT_BIG(1)
+                        FROM dbo.FileInventoryItems
+                        WHERE SnapshotId = @Id AND StatusName = N'error'
+                    ),
+                    ErrorText = @ErrorText
+                WHERE Id = @Id;
+
+                SELECT @@ROWCOUNT;
+                """;
+            command.Parameters.AddWithValue("@Id", snapshotId);
+            command.Parameters.AddWithValue("@StatusName", string.IsNullOrWhiteSpace(status) ? "completed" : status.Trim());
+            command.Parameters.AddWithValue("@ErrorText", DbValue(error));
+
+            if (Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken)) == 0)
+            {
+                return null;
+            }
+        }
+
+        return await FindSnapshotAsync(connection, snapshotId, cancellationToken);
+    }
+
+    public async Task<FileInventorySummary> GetLatestSummaryAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        var snapshot = await FindLatestSnapshotAsync(connection, server, share, rootPath, cancellationToken);
+        if (snapshot is null)
+        {
+            return FileInventoryAnalyzer.BuildSummary(null, Array.Empty<FileInventoryItem>(), top);
+        }
+
+        var items = await QuerySnapshotItemsAsync(connection, snapshot.Id, cancellationToken);
+        return FileInventoryAnalyzer.BuildSummary(snapshot, items, top);
+    }
+
+    public async Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(
+        string? server,
+        string? share,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = BuildSnapshotsSql(command, server, share, take);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var snapshots = new List<FileInventorySnapshot>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            snapshots.Add(ReadSnapshot(reader));
+        }
+
+        return snapshots;
+    }
+
+    private async Task EnsureSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref _schemaEnsured, 1, 0) != 0)
+        {
+            return;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 300;
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.FileInventorySnapshots', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.FileInventorySnapshots
+                (
+                    Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_FileInventorySnapshots PRIMARY KEY,
+                    ServerName NVARCHAR(128) NOT NULL,
+                    ShareName NVARCHAR(128) NOT NULL,
+                    RootPath NVARCHAR(1024) NOT NULL,
+                    StartedUtc DATETIME2 NOT NULL,
+                    FinishedUtc DATETIME2 NULL,
+                    StatusName NVARCHAR(32) NOT NULL,
+                    FileCount BIGINT NOT NULL CONSTRAINT DF_FileInventorySnapshots_FileCount DEFAULT 0,
+                    FolderCount BIGINT NOT NULL CONSTRAINT DF_FileInventorySnapshots_FolderCount DEFAULT 0,
+                    TotalBytes BIGINT NOT NULL CONSTRAINT DF_FileInventorySnapshots_TotalBytes DEFAULT 0,
+                    ErrorCount BIGINT NOT NULL CONSTRAINT DF_FileInventorySnapshots_ErrorCount DEFAULT 0,
+                    ErrorText NVARCHAR(2048) NULL
+                );
+            END;
+
+            IF OBJECT_ID(N'dbo.FileInventoryItems', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.FileInventoryItems
+                (
+                    Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_FileInventoryItems PRIMARY KEY,
+                    SnapshotId UNIQUEIDENTIFIER NOT NULL,
+                    ScannedAtUtc DATETIME2 NOT NULL,
+                    ServerName NVARCHAR(128) NOT NULL,
+                    ShareName NVARCHAR(128) NOT NULL,
+                    RootPath NVARCHAR(1024) NOT NULL,
+                    FullPath NVARCHAR(2048) NOT NULL,
+                    RelativePath NVARCHAR(2048) NOT NULL,
+                    ItemName NVARCHAR(512) NOT NULL,
+                    ItemType NVARCHAR(16) NOT NULL,
+                    Extension NVARCHAR(64) NULL,
+                    SizeBytes BIGINT NOT NULL,
+                    Depth INT NOT NULL,
+                    CreatedUtc DATETIME2 NULL,
+                    ModifiedUtc DATETIME2 NULL,
+                    AccessedUtc DATETIME2 NULL,
+                    StatusName NVARCHAR(32) NOT NULL,
+                    ErrorText NVARCHAR(2048) NULL,
+                    CONSTRAINT FK_FileInventoryItems_Snapshot
+                        FOREIGN KEY (SnapshotId) REFERENCES dbo.FileInventorySnapshots(Id)
+                        ON DELETE CASCADE
+                );
+            END;
+
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileInventorySnapshots_Latest' AND object_id = OBJECT_ID(N'dbo.FileInventorySnapshots'))
+            BEGIN
+                CREATE INDEX IX_FileInventorySnapshots_Latest
+                    ON dbo.FileInventorySnapshots (ServerName, ShareName, RootPath, StartedUtc DESC)
+                    INCLUDE (FinishedUtc, StatusName, FileCount, FolderCount, TotalBytes, ErrorCount);
+            END;
+
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileInventoryItems_Snapshot_Path' AND object_id = OBJECT_ID(N'dbo.FileInventoryItems'))
+            BEGIN
+                CREATE INDEX IX_FileInventoryItems_Snapshot_Path
+                    ON dbo.FileInventoryItems (SnapshotId, FullPath)
+                    INCLUDE (ItemType, Extension, SizeBytes, ModifiedUtc, AccessedUtc, StatusName);
+            END;
+
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileInventoryItems_Snapshot_Extension' AND object_id = OBJECT_ID(N'dbo.FileInventoryItems'))
+            BEGIN
+                CREATE INDEX IX_FileInventoryItems_Snapshot_Extension
+                    ON dbo.FileInventoryItems (SnapshotId, Extension)
+                    INCLUDE (ItemType, SizeBytes, StatusName);
+            END;
+            """;
+
+        try
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch
+        {
+            Interlocked.Exchange(ref _schemaEnsured, 0);
+            throw;
+        }
+    }
+
+    private static async Task<FileInventorySnapshot?> FindSnapshotAsync(
+        SqlConnection connection,
+        Guid id,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1)
+                Id, ServerName, ShareName, RootPath, StartedUtc, FinishedUtc, StatusName,
+                FileCount, FolderCount, TotalBytes, ErrorCount, ErrorText
+            FROM dbo.FileInventorySnapshots
+            WHERE Id = @Id;
+            """;
+        command.Parameters.AddWithValue("@Id", id);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSnapshot(reader) : null;
+    }
+
+    private static async Task<FileInventorySnapshot?> FindLatestSnapshotAsync(
+        SqlConnection connection,
+        string? server,
+        string? share,
+        string? rootPath,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        var predicates = new List<string> { "StatusName IN (N'completed', N'completed_with_errors')" };
+        if (!string.IsNullOrWhiteSpace(server))
+        {
+            predicates.Add("ServerName LIKE @ServerName");
+            command.Parameters.AddWithValue("@ServerName", $"%{server}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(share))
+        {
+            predicates.Add("ShareName LIKE @ShareName");
+            command.Parameters.AddWithValue("@ShareName", $"%{share}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(rootPath))
+        {
+            predicates.Add("RootPath LIKE @RootPath");
+            command.Parameters.AddWithValue("@RootPath", $"%{rootPath}%");
+        }
+
+        command.CommandText = $$"""
+            SELECT TOP (1)
+                Id, ServerName, ShareName, RootPath, StartedUtc, FinishedUtc, StatusName,
+                FileCount, FolderCount, TotalBytes, ErrorCount, ErrorText
+            FROM dbo.FileInventorySnapshots
+            WHERE {{string.Join(" AND ", predicates)}}
+            ORDER BY StartedUtc DESC;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSnapshot(reader) : null;
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryItem>> QuerySnapshotItemsAsync(
+        SqlConnection connection,
+        Guid snapshotId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                Id, SnapshotId, ScannedAtUtc, ServerName, ShareName, RootPath, FullPath,
+                RelativePath, ItemName, ItemType, Extension, SizeBytes, Depth,
+                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId;
+            """;
+        command.Parameters.AddWithValue("@SnapshotId", snapshotId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var items = new List<FileInventoryItem>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(ReadItem(reader));
+        }
+
+        return items;
+    }
+
+    private static string BuildSnapshotsSql(SqlCommand command, string? server, string? share, int take)
+    {
+        command.Parameters.AddWithValue("@Take", take);
+        var predicates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(server))
+        {
+            predicates.Add("ServerName LIKE @ServerName");
+            command.Parameters.AddWithValue("@ServerName", $"%{server}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(share))
+        {
+            predicates.Add("ShareName LIKE @ShareName");
+            command.Parameters.AddWithValue("@ShareName", $"%{share}%");
+        }
+
+        var where = predicates.Count == 0 ? "" : $"WHERE {string.Join(" AND ", predicates)}";
+        return $$"""
+            SELECT TOP (@Take)
+                Id, ServerName, ShareName, RootPath, StartedUtc, FinishedUtc, StatusName,
+                FileCount, FolderCount, TotalBytes, ErrorCount, ErrorText
+            FROM dbo.FileInventorySnapshots
+            {{where}}
+            ORDER BY StartedUtc DESC;
+            """;
+    }
+
+    private static void AddItemParameters(SqlCommand command, FileInventoryItem item)
+    {
+        command.Parameters.AddWithValue("@Id", item.Id);
+        command.Parameters.AddWithValue("@SnapshotId", item.SnapshotId);
+        command.Parameters.AddWithValue("@ScannedAtUtc", item.ScannedAtUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@ServerName", item.Server);
+        command.Parameters.AddWithValue("@ShareName", item.Share);
+        command.Parameters.AddWithValue("@RootPath", item.RootPath);
+        command.Parameters.AddWithValue("@FullPath", item.Path);
+        command.Parameters.AddWithValue("@RelativePath", item.RelativePath);
+        command.Parameters.AddWithValue("@ItemName", item.Name);
+        command.Parameters.AddWithValue("@ItemType", item.ItemType);
+        command.Parameters.AddWithValue("@Extension", DbValue(item.Extension));
+        command.Parameters.AddWithValue("@SizeBytes", item.SizeBytes);
+        command.Parameters.AddWithValue("@Depth", item.Depth);
+        command.Parameters.AddWithValue("@CreatedUtc", DbValue(item.CreatedUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@ModifiedUtc", DbValue(item.ModifiedUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@AccessedUtc", DbValue(item.AccessedUtc?.UtcDateTime));
+        command.Parameters.AddWithValue("@StatusName", item.Status);
+        command.Parameters.AddWithValue("@ErrorText", DbValue(item.Error));
+    }
+
+    private static FileInventorySnapshot ReadSnapshot(SqlDataReader reader)
+    {
+        return new FileInventorySnapshot(
+            Id: reader.GetGuid(reader.GetOrdinal("Id")),
+            Server: reader.GetString(reader.GetOrdinal("ServerName")),
+            Share: reader.GetString(reader.GetOrdinal("ShareName")),
+            RootPath: reader.GetString(reader.GetOrdinal("RootPath")),
+            StartedUtc: ReadDateTimeOffset(reader, "StartedUtc")!.Value,
+            FinishedUtc: ReadDateTimeOffset(reader, "FinishedUtc"),
+            Status: reader.GetString(reader.GetOrdinal("StatusName")),
+            FileCount: Convert.ToInt64(reader["FileCount"]),
+            FolderCount: Convert.ToInt64(reader["FolderCount"]),
+            TotalBytes: Convert.ToInt64(reader["TotalBytes"]),
+            ErrorCount: Convert.ToInt64(reader["ErrorCount"]),
+            Error: ReadNullableString(reader, "ErrorText"));
+    }
+
+    private static FileInventoryItem ReadItem(SqlDataReader reader)
+    {
+        return new FileInventoryItem(
+            Id: reader.GetGuid(reader.GetOrdinal("Id")),
+            SnapshotId: reader.GetGuid(reader.GetOrdinal("SnapshotId")),
+            ScannedAtUtc: ReadDateTimeOffset(reader, "ScannedAtUtc")!.Value,
+            Server: reader.GetString(reader.GetOrdinal("ServerName")),
+            Share: reader.GetString(reader.GetOrdinal("ShareName")),
+            RootPath: reader.GetString(reader.GetOrdinal("RootPath")),
+            Path: reader.GetString(reader.GetOrdinal("FullPath")),
+            RelativePath: reader.GetString(reader.GetOrdinal("RelativePath")),
+            Name: reader.GetString(reader.GetOrdinal("ItemName")),
+            ItemType: reader.GetString(reader.GetOrdinal("ItemType")),
+            Extension: ReadNullableString(reader, "Extension"),
+            SizeBytes: Convert.ToInt64(reader["SizeBytes"]),
+            Depth: Convert.ToInt32(reader["Depth"]),
+            CreatedUtc: ReadDateTimeOffset(reader, "CreatedUtc"),
+            ModifiedUtc: ReadDateTimeOffset(reader, "ModifiedUtc"),
+            AccessedUtc: ReadDateTimeOffset(reader, "AccessedUtc"),
+            Status: reader.GetString(reader.GetOrdinal("StatusName")),
+            Error: ReadNullableString(reader, "ErrorText"));
+    }
+
+    private static DateTimeOffset? ReadDateTimeOffset(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal)
+            ? null
+            : new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(ordinal), DateTimeKind.Utc));
+    }
+
+    private static string? ReadNullableString(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static object DbValue(object? value) => value ?? DBNull.Value;
 }
 
 internal sealed class SqlServerEventRepository : IEventRepository
@@ -3485,6 +4091,109 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
         return events
             .GroupBy(selector, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.LongCount(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool MatchesText(string value, string? filter)
+    {
+        return string.IsNullOrWhiteSpace(filter)
+            || value.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+internal sealed class InMemoryInventoryRepository : IInventoryRepository
+{
+    private readonly ConcurrentDictionary<Guid, FileInventorySnapshot> _snapshots = new();
+    private readonly ConcurrentDictionary<Guid, ConcurrentDictionary<Guid, FileInventoryItem>> _items = new();
+
+    public Task<FileInventorySnapshot> StartSnapshotAsync(FileInventorySnapshot snapshot, CancellationToken cancellationToken)
+    {
+        _snapshots[snapshot.Id] = snapshot;
+        _items[snapshot.Id] = new ConcurrentDictionary<Guid, FileInventoryItem>();
+        return Task.FromResult(snapshot);
+    }
+
+    public Task AddBatchAsync(Guid snapshotId, IReadOnlyCollection<FileInventoryItem> items, CancellationToken cancellationToken)
+    {
+        var bucket = _items.GetOrAdd(snapshotId, _ => new ConcurrentDictionary<Guid, FileInventoryItem>());
+        foreach (var item in items)
+        {
+            bucket[item.Id] = item with { SnapshotId = snapshotId };
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<FileInventorySnapshot?> CompleteSnapshotAsync(
+        Guid snapshotId,
+        string status,
+        string? error,
+        CancellationToken cancellationToken)
+    {
+        if (!_snapshots.TryGetValue(snapshotId, out var snapshot))
+        {
+            return Task.FromResult<FileInventorySnapshot?>(null);
+        }
+
+        var items = _items.TryGetValue(snapshotId, out var bucket)
+            ? bucket.Values.ToArray()
+            : Array.Empty<FileInventoryItem>();
+        var files = items.Where(item => item.ItemType == "file" && item.Status == "active").ToArray();
+        var folders = items.Where(item => item.ItemType == "folder" && item.Status == "active").ToArray();
+        var completed = snapshot with
+        {
+            FinishedUtc = DateTimeOffset.UtcNow,
+            Status = string.IsNullOrWhiteSpace(status) ? "completed" : status.Trim(),
+            FileCount = files.LongLength,
+            FolderCount = folders.LongLength,
+            TotalBytes = files.Sum(item => item.SizeBytes),
+            ErrorCount = items.LongCount(item => item.Status == "error"),
+            Error = string.IsNullOrWhiteSpace(error) ? null : error.Trim()
+        };
+        _snapshots[snapshotId] = completed;
+
+        return Task.FromResult<FileInventorySnapshot?>(completed);
+    }
+
+    public Task<FileInventorySummary> GetLatestSummaryAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = _snapshots.Values
+            .Where(item => item.Status is "completed" or "completed_with_errors")
+            .Where(item => MatchesText(item.Server, server))
+            .Where(item => MatchesText(item.Share, share))
+            .Where(item => MatchesText(item.RootPath, rootPath))
+            .OrderByDescending(item => item.StartedUtc)
+            .FirstOrDefault();
+        if (snapshot is null)
+        {
+            return Task.FromResult(FileInventoryAnalyzer.BuildSummary(null, Array.Empty<FileInventoryItem>(), top));
+        }
+
+        var items = _items.TryGetValue(snapshot.Id, out var bucket)
+            ? bucket.Values.ToArray()
+            : Array.Empty<FileInventoryItem>();
+
+        return Task.FromResult(FileInventoryAnalyzer.BuildSummary(snapshot, items, top));
+    }
+
+    public Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(
+        string? server,
+        string? share,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyCollection<FileInventorySnapshot> snapshots = _snapshots.Values
+            .Where(item => MatchesText(item.Server, server))
+            .Where(item => MatchesText(item.Share, share))
+            .OrderByDescending(item => item.StartedUtc)
+            .Take(take)
+            .ToArray();
+
+        return Task.FromResult(snapshots);
     }
 
     private static bool MatchesText(string value, string? filter)
@@ -7716,6 +8425,70 @@ internal sealed record TimelineCoverage(
     long Count,
     DateTimeOffset? FromUtc,
     DateTimeOffset? ToUtc);
+
+internal sealed record InventorySnapshotStartRequest(
+    string Server,
+    string Share,
+    string RootPath)
+{
+    public FileInventorySnapshot ToSnapshot()
+    {
+        return new FileInventorySnapshot(
+            Id: Guid.NewGuid(),
+            Server: string.IsNullOrWhiteSpace(Server) ? "UNKNOWN" : Server.Trim(),
+            Share: string.IsNullOrWhiteSpace(Share) ? "UNKNOWN" : Share.Trim(),
+            RootPath: FileInventoryNormalizer.NormalizePath(RootPath),
+            StartedUtc: DateTimeOffset.UtcNow,
+            FinishedUtc: null,
+            Status: "running",
+            FileCount: 0,
+            FolderCount: 0,
+            TotalBytes: 0,
+            ErrorCount: 0,
+            Error: null);
+    }
+}
+
+internal sealed record InventoryItemBatchRequest(InventoryItemRequest[] Items);
+
+internal sealed record InventoryItemRequest(
+    DateTimeOffset? ScannedAtUtc,
+    string Server,
+    string Share,
+    string RootPath,
+    string Path,
+    string? RelativePath,
+    string? Name,
+    string ItemType,
+    long? SizeBytes,
+    DateTimeOffset? CreatedUtc,
+    DateTimeOffset? ModifiedUtc,
+    DateTimeOffset? AccessedUtc,
+    string? Error)
+{
+    public FileInventoryItem ToInventoryItem(Guid snapshotId)
+    {
+        return FileInventoryNormalizer.Normalize(new FileInventoryItemInput(
+            SnapshotId: snapshotId,
+            ScannedAtUtc: ScannedAtUtc,
+            Server: Server,
+            Share: Share,
+            RootPath: RootPath,
+            Path: Path,
+            RelativePath: RelativePath,
+            Name: Name,
+            ItemType: ItemType,
+            SizeBytes: SizeBytes,
+            CreatedUtc: CreatedUtc,
+            ModifiedUtc: ModifiedUtc,
+            AccessedUtc: AccessedUtc,
+            Error: Error));
+    }
+}
+
+internal sealed record InventorySnapshotCompleteRequest(string? Status, string? Error);
+
+internal sealed record InventoryBatchIngestResponse(Guid SnapshotId, int AcceptedItems);
 
 internal sealed record FileAuditEventRequest(
     DateTimeOffset? TimestampUtc,

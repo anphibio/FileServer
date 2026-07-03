@@ -347,6 +347,42 @@ type DatabaseCapacityDailyCount = {
   count: number;
 };
 
+type InventorySummary = {
+  snapshotId?: string | null;
+  server?: string | null;
+  share?: string | null;
+  rootPath?: string | null;
+  startedUtc?: string | null;
+  finishedUtc?: string | null;
+  status: string;
+  fileCount: number;
+  folderCount: number;
+  totalBytes: number;
+  errorCount: number;
+  topFolders: InventoryTopFolder[];
+  topExtensions: InventoryTopExtension[];
+  ageBuckets: InventoryAgeBucket[];
+};
+
+type InventoryTopFolder = {
+  path: string;
+  fileCount: number;
+  folderCount: number;
+  totalBytes: number;
+};
+
+type InventoryTopExtension = {
+  extension: string;
+  fileCount: number;
+  totalBytes: number;
+};
+
+type InventoryAgeBucket = {
+  label: string;
+  fileCount: number;
+  totalBytes: number;
+};
+
 type Notice = {
   tone: "success" | "warning" | "danger";
   message: string;
@@ -359,7 +395,7 @@ type GeneratedReport = {
   events: DisplayEvent[];
 };
 
-type Tab = "dashboard" | "events" | "investigation" | "reports" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
+type Tab = "dashboard" | "events" | "investigation" | "reports" | "inventory" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
 type AccessRole = "admin" | "operator" | "reader";
 
 type AccessPolicy = {
@@ -587,6 +623,9 @@ function App() {
           <TabButton icon={<BarChart3 size={18} />} active={activeTab === "reports"} onClick={() => setActiveTab("reports")} meta="guiados">
             Relatórios
           </TabButton>
+          <TabButton icon={<FolderTree size={18} />} active={activeTab === "inventory"} onClick={() => setActiveTab("inventory")} meta="scan">
+            Inventário
+          </TabButton>
           {visibleTabs.includes("alerts") && (
             <TabButton icon={<Bell size={18} />} active={activeTab === "alerts"} onClick={() => setActiveTab("alerts")} meta={openAlerts.length.toLocaleString("pt-BR")}>
               Alertas
@@ -676,6 +715,8 @@ function App() {
         {activeTab === "investigation" && <InvestigationView onNotify={setNotice} />}
 
         {activeTab === "reports" && <ReportsView onNotify={setNotice} />}
+
+        {activeTab === "inventory" && <InventoryGovernanceView onNotify={setNotice} />}
 
         {activeTab === "alerts" && (
           <AlertsView
@@ -2457,6 +2498,143 @@ function MonitoredPathsView({
   );
 }
 
+function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [summary, setSummary] = useState<InventorySummary | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  async function loadInventory() {
+    setLoading(true);
+    try {
+      setSummary(await fetchJson<InventorySummary>("/api/inventory/summary"));
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar inventario." });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadInventory();
+  }, []);
+
+  if (!summary || summary.status === "empty") {
+    return (
+      <Panel title="Inventário Gerencial" subtitle={loading ? "Carregando inventário..." : "Nenhum snapshot de inventário encontrado."}>
+        <EmptyState text="Ative o scan de inventário no agente para gerar a primeira visão gerencial do compartilhamento." />
+      </Panel>
+    );
+  }
+
+  return (
+    <div className="view-stack">
+      <section className="executive-grid">
+        <ExecutiveCard
+          title="Armazenamento"
+          value={formatBytes(summary.totalBytes)}
+          detail={`${summary.fileCount.toLocaleString("pt-BR")} arquivo(s) em ${summary.folderCount.toLocaleString("pt-BR")} pasta(s).`}
+          tone="neutral"
+        />
+        <ExecutiveCard
+          title="Último scan"
+          value={summary.finishedUtc ? formatDate(summary.finishedUtc) : "Em andamento"}
+          detail={`${summary.server ?? "Servidor"} · ${summary.share ?? "Compartilhamento"}`}
+          tone={summary.status === "completed_with_errors" ? "warning" : "neutral"}
+        />
+        <ExecutiveCard
+          title="Erros de leitura"
+          value={summary.errorCount.toLocaleString("pt-BR")}
+          detail={summary.rootPath ?? "Raiz não informada"}
+          tone={summary.errorCount > 0 ? "warning" : "neutral"}
+        />
+      </section>
+
+      <div className="toolbar">
+        <button className="text-button" type="button" onClick={loadInventory} disabled={loading}>
+          <RefreshCcw size={16} />
+          {loading ? "Atualizando..." : "Atualizar inventário"}
+        </button>
+      </div>
+
+      <div className="split-grid">
+        <Panel title="Top pastas por tamanho" subtitle="Primeira visão de consumo para decisão de limpeza e arquivamento.">
+          <InventoryRanking
+            items={summary.topFolders}
+            getKey={(item) => item.path}
+            renderLabel={(item) => item.path}
+            renderValue={(item) => formatBytes(item.totalBytes)}
+            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s) · ${item.folderCount.toLocaleString("pt-BR")} pasta(s)`}
+            maxValue={Math.max(...summary.topFolders.map((item) => item.totalBytes), 1)}
+          />
+        </Panel>
+
+        <Panel title="Top extensões por tamanho" subtitle="Ajuda a encontrar arquivos de mídia, backup, PST, ISO e outros consumidores.">
+          <InventoryRanking
+            items={summary.topExtensions}
+            getKey={(item) => item.extension}
+            renderLabel={(item) => item.extension}
+            renderValue={(item) => formatBytes(item.totalBytes)}
+            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s)`}
+            maxValue={Math.max(...summary.topExtensions.map((item) => item.totalBytes), 1)}
+          />
+        </Panel>
+      </div>
+
+      <Panel title="Idade dos arquivos" subtitle="Distribuição por última data conhecida no filesystem.">
+        <div className="inventory-age-grid">
+          {summary.ageBuckets.map((bucket) => (
+            <article key={bucket.label}>
+              <span>{bucket.label}</span>
+              <strong>{bucket.fileCount.toLocaleString("pt-BR")}</strong>
+              <small>{formatBytes(bucket.totalBytes)}</small>
+            </article>
+          ))}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function InventoryRanking<T>({
+  items,
+  getKey,
+  renderLabel,
+  renderValue,
+  renderDetail,
+  maxValue
+}: {
+  items: T[];
+  getKey: (item: T) => string;
+  renderLabel: (item: T) => string;
+  renderValue: (item: T) => string;
+  renderDetail: (item: T) => string;
+  maxValue: number;
+}) {
+  if (items.length === 0) {
+    return <EmptyState text="Sem dados para exibir." />;
+  }
+
+  return (
+    <div className="inventory-ranking">
+      {items.map((item) => {
+        const value = Number((item as { totalBytes?: number }).totalBytes ?? 0);
+        const width = Math.max(3, Math.round((value / maxValue) * 100));
+        return (
+          <article key={getKey(item)}>
+            <div>
+              <strong title={renderLabel(item)}>{renderLabel(item)}</strong>
+              <span>{renderValue(item)}</span>
+            </div>
+            <div className="inventory-bar" aria-hidden="true">
+              <i style={{ width: `${width}%` }} />
+            </div>
+            <small>{renderDetail(item)}</small>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
 function DatabaseCapacityView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
   const [capacity, setCapacity] = useState<DatabaseCapacityResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -3423,7 +3601,7 @@ function resolveAccessRole(authStatus: AuthStatusResponse | null, authUser: Auth
 }
 
 function getVisibleTabs(policy: AccessPolicy): Tab[] {
-  const tabs: Tab[] = ["dashboard", "events", "investigation", "reports"];
+  const tabs: Tab[] = ["dashboard", "events", "investigation", "reports", "inventory"];
 
   if (policy.canManageAlerts) {
     tabs.push("alerts");
@@ -3468,6 +3646,7 @@ function titleForTab(tab: Tab) {
     events: "Eventos",
     investigation: "Investigação",
     reports: "Relatórios",
+    inventory: "Inventário Gerencial",
     alerts: "Alertas",
     agents: "Agentes",
     paths: "Caminhos Monitorados",
@@ -3542,6 +3721,19 @@ function formatMegabytes(value: number) {
   }
 
   return `${value.toLocaleString("pt-BR", { maximumFractionDigits: 1 })} MB`;
+}
+
+function formatBytes(value: number) {
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let current = Math.max(0, value);
+  let unitIndex = 0;
+
+  while (current >= 1024 && unitIndex < units.length - 1) {
+    current /= 1024;
+    unitIndex++;
+  }
+
+  return `${current.toLocaleString("pt-BR", { maximumFractionDigits: unitIndex === 0 ? 0 : 1 })} ${units[unitIndex]}`;
 }
 
 function getOperationalPosture(

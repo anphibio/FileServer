@@ -35,6 +35,7 @@ internal sealed class FileServerAgent
     private AgentConfigResponse? _remoteConfig;
     private DateTimeOffset? _lastRemoteConfigFetchUtc;
     private FileServerMonitor.Core.AgentCycleMetrics? _lastCycle;
+    private DateTimeOffset? _lastInventoryScanStartedUtc;
 
     public FileServerAgent(AgentOptions options, AgentState state)
     {
@@ -83,6 +84,7 @@ internal sealed class FileServerAgent
                     await RefreshRemoteConfigAsync(cts.Token);
                     await FlushQueueAsync(cts.Token);
                     await CollectAndSendAsync(cts.Token);
+                    await TryRunInventoryScanAsync(cts.Token);
                     await SendHeartbeatAsync("running", null, cts.Token);
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested)
@@ -179,6 +181,263 @@ internal sealed class FileServerAgent
                 _lastCycle = BuildCycleMetrics(cycleStartedUtc, stopwatch.ElapsedMilliseconds, result, sentEvents, queuedEvents, cycleError);
             }
         }
+    }
+
+    private async Task TryRunInventoryScanAsync(CancellationToken cancellationToken)
+    {
+        var settings = _options.InventoryScan;
+        if (settings?.Enabled != true || settings.Roots.Length == 0)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_lastInventoryScanStartedUtc is not null
+            && now - _lastInventoryScanStartedUtc.Value < TimeSpan.FromHours(Math.Max(1, settings.IntervalHours)))
+        {
+            return;
+        }
+
+        if (!IsInsideInventoryWindow(now, settings))
+        {
+            return;
+        }
+
+        _lastInventoryScanStartedUtc = now;
+
+        foreach (var root in settings.Roots.Where(item => !string.IsNullOrWhiteSpace(item.Path)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await RunInventoryScanAsync(root, settings, cancellationToken);
+        }
+    }
+
+    private async Task RunInventoryScanAsync(
+        InventoryScanRoot root,
+        InventoryScanOptions settings,
+        CancellationToken cancellationToken)
+    {
+        var rootPath = Path.GetFullPath(root.Path);
+        Console.WriteLine($"Inventario: iniciando scan em {rootPath}");
+        InventorySnapshotStartResponse? snapshot = null;
+        var sentItems = 0;
+        var errors = 0;
+
+        try
+        {
+            snapshot = await StartInventorySnapshotAsync(root, rootPath, cancellationToken);
+            var batch = new List<InventoryItemRequest>(Math.Clamp(settings.BatchSize, 100, 2000));
+            foreach (var item in EnumerateInventoryItems(root, rootPath, settings, cancellationToken))
+            {
+                if (item.Error is not null)
+                {
+                    errors++;
+                }
+
+                batch.Add(item);
+                if (batch.Count >= Math.Clamp(settings.BatchSize, 100, 2000))
+                {
+                    await SendInventoryBatchAsync(snapshot.Id, batch, cancellationToken);
+                    sentItems += batch.Count;
+                    batch.Clear();
+                }
+
+                if (settings.MaxItemsPerScan > 0 && sentItems + batch.Count >= settings.MaxItemsPerScan)
+                {
+                    break;
+                }
+            }
+
+            if (batch.Count > 0)
+            {
+                await SendInventoryBatchAsync(snapshot.Id, batch, cancellationToken);
+                sentItems += batch.Count;
+            }
+
+            var status = errors > 0 ? "completed_with_errors" : "completed";
+            await CompleteInventorySnapshotAsync(snapshot.Id, status, errors > 0 ? $"{errors} erro(s) durante o scan." : null, cancellationToken);
+            Console.WriteLine($"Inventario: scan concluido em {rootPath}; itens={sentItems}; erros={errors}");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.Error.WriteLine($"Inventario: falha no scan de {rootPath}: {ex.Message}");
+            if (snapshot is not null)
+            {
+                await CompleteInventorySnapshotAsync(snapshot.Id, "failed", ex.Message, CancellationToken.None);
+            }
+        }
+    }
+
+    private IReadOnlyCollection<InventoryItemRequest> EnumerateInventoryItems(
+        InventoryScanRoot root,
+        string rootPath,
+        InventoryScanOptions settings,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<InventoryItemRequest>();
+        var stack = new Stack<string>();
+        stack.Push(rootPath);
+
+        while (stack.Count > 0)
+        {
+            if (settings.MaxItemsPerScan > 0 && result.Count >= settings.MaxItemsPerScan)
+            {
+                break;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var current = stack.Pop();
+
+            DirectoryInfo directoryInfo;
+            try
+            {
+                directoryInfo = new DirectoryInfo(current);
+                result.Add(BuildInventoryItem(root, rootPath, directoryInfo, "folder", settings.IncludeLastAccessTime, error: null));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                result.Add(BuildInventoryError(root, rootPath, current, "folder", ex.Message));
+                continue;
+            }
+
+            IEnumerable<string> children;
+            try
+            {
+                children = Directory.EnumerateFileSystemEntries(directoryInfo.FullName).ToArray();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                result.Add(BuildInventoryError(root, rootPath, directoryInfo.FullName, "folder", ex.Message));
+                continue;
+            }
+
+            foreach (var child in children)
+            {
+                if (settings.MaxItemsPerScan > 0 && result.Count >= settings.MaxItemsPerScan)
+                {
+                    break;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                if (Directory.Exists(child))
+                {
+                    stack.Push(child);
+                    continue;
+                }
+
+                FileInfo fileInfo;
+                try
+                {
+                    fileInfo = new FileInfo(child);
+                    result.Add(BuildInventoryItem(root, rootPath, fileInfo, "file", settings.IncludeLastAccessTime, error: null));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+                {
+                    result.Add(BuildInventoryError(root, rootPath, child, "file", ex.Message));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private InventoryItemRequest BuildInventoryItem(
+        InventoryScanRoot root,
+        string rootPath,
+        FileSystemInfo info,
+        string itemType,
+        bool includeLastAccessTime,
+        string? error)
+    {
+        var sizeBytes = info is FileInfo fileInfo ? fileInfo.Length : 0;
+        return new InventoryItemRequest(
+            ScannedAtUtc: DateTimeOffset.UtcNow,
+            Server: string.IsNullOrWhiteSpace(root.Server) ? _options.Server : root.Server,
+            Share: string.IsNullOrWhiteSpace(root.Share) ? _options.DefaultShare : root.Share,
+            RootPath: rootPath,
+            Path: info.FullName,
+            RelativePath: Path.GetRelativePath(rootPath, info.FullName),
+            Name: info.Name,
+            ItemType: itemType,
+            SizeBytes: sizeBytes,
+            CreatedUtc: ToUtc(info.CreationTimeUtc),
+            ModifiedUtc: ToUtc(info.LastWriteTimeUtc),
+            AccessedUtc: includeLastAccessTime ? ToUtc(info.LastAccessTimeUtc) : null,
+            Error: error);
+    }
+
+    private InventoryItemRequest BuildInventoryError(
+        InventoryScanRoot root,
+        string rootPath,
+        string path,
+        string itemType,
+        string error)
+    {
+        return new InventoryItemRequest(
+            ScannedAtUtc: DateTimeOffset.UtcNow,
+            Server: string.IsNullOrWhiteSpace(root.Server) ? _options.Server : root.Server,
+            Share: string.IsNullOrWhiteSpace(root.Share) ? _options.DefaultShare : root.Share,
+            RootPath: rootPath,
+            Path: path,
+            RelativePath: Path.GetRelativePath(rootPath, path),
+            Name: Path.GetFileName(path),
+            ItemType: itemType,
+            SizeBytes: 0,
+            CreatedUtc: null,
+            ModifiedUtc: null,
+            AccessedUtc: null,
+            Error: error);
+    }
+
+    private async Task<InventorySnapshotStartResponse> StartInventorySnapshotAsync(
+        InventoryScanRoot root,
+        string rootPath,
+        CancellationToken cancellationToken)
+    {
+        var request = new InventorySnapshotStartRequest(
+            Server: string.IsNullOrWhiteSpace(root.Server) ? _options.Server : root.Server,
+            Share: string.IsNullOrWhiteSpace(root.Share) ? _options.DefaultShare : root.Share,
+            RootPath: rootPath);
+        using var response = await _httpClient.PostAsJsonAsync("/api/inventory/snapshots/start", request, JsonOptions, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadFromJsonAsync<InventorySnapshotStartResponse>(JsonOptions, cancellationToken)
+            ?? throw new InvalidOperationException("API nao retornou o snapshot de inventario.");
+    }
+
+    private async Task SendInventoryBatchAsync(Guid snapshotId, IReadOnlyCollection<InventoryItemRequest> items, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.PostAsJsonAsync($"/api/inventory/snapshots/{snapshotId}/items", new InventoryItemBatchRequest(items.ToArray()), JsonOptions, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    private async Task CompleteInventorySnapshotAsync(Guid snapshotId, string status, string? error, CancellationToken cancellationToken)
+    {
+        using var response = await _httpClient.PostAsJsonAsync($"/api/inventory/snapshots/{snapshotId}/complete", new InventorySnapshotCompleteRequest(status, error), JsonOptions, cancellationToken);
+        response.EnsureSuccessStatusCode();
+    }
+
+    private static bool IsInsideInventoryWindow(DateTimeOffset now, InventoryScanOptions settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.WindowStartLocal) || string.IsNullOrWhiteSpace(settings.WindowEndLocal))
+        {
+            return true;
+        }
+
+        if (!TimeOnly.TryParse(settings.WindowStartLocal, out var start)
+            || !TimeOnly.TryParse(settings.WindowEndLocal, out var end))
+        {
+            return true;
+        }
+
+        var current = TimeOnly.FromDateTime(now.LocalDateTime);
+        return start <= end
+            ? current >= start && current <= end
+            : current >= start || current <= end;
+    }
+
+    private static DateTimeOffset? ToUtc(DateTime value)
+    {
+        return value == default ? null : new DateTimeOffset(DateTime.SpecifyKind(value, DateTimeKind.Utc));
     }
 
     private async Task<CollectionResult> CollectEventsAsync(CancellationToken cancellationToken)
@@ -909,7 +1168,8 @@ internal sealed record AgentOptions(
     int SecurityLogTimeoutSeconds,
     int UsnJournalTimeoutSeconds,
     string DefaultShare,
-    int[] EventIds)
+    int[] EventIds,
+    InventoryScanOptions? InventoryScan)
 {
     public static AgentOptions Load(string path)
     {
@@ -936,7 +1196,31 @@ internal sealed record AgentOptions(
             SecurityLogScriptPath = ResolvePath(baseDirectory, options.SecurityLogScriptPath),
             UsnJournalScriptPath = ResolvePath(baseDirectory, options.UsnJournalScriptPath),
             SecurityLogTimeoutSeconds = options.SecurityLogTimeoutSeconds is >= 10 and <= 600 ? options.SecurityLogTimeoutSeconds : 60,
-            UsnJournalTimeoutSeconds = options.UsnJournalTimeoutSeconds is >= 10 and <= 600 ? options.UsnJournalTimeoutSeconds : 120
+            UsnJournalTimeoutSeconds = options.UsnJournalTimeoutSeconds is >= 10 and <= 600 ? options.UsnJournalTimeoutSeconds : 120,
+            InventoryScan = NormalizeInventoryScan(options.InventoryScan)
+        };
+    }
+
+    private static InventoryScanOptions NormalizeInventoryScan(InventoryScanOptions? options)
+    {
+        if (options is null)
+        {
+            return new InventoryScanOptions(
+                Enabled: false,
+                IntervalHours: 24,
+                BatchSize: 500,
+                MaxItemsPerScan: 0,
+                IncludeLastAccessTime: false,
+                WindowStartLocal: "01:00",
+                WindowEndLocal: "05:00",
+                Roots: Array.Empty<InventoryScanRoot>());
+        }
+
+        return options with
+        {
+            IntervalHours = options.IntervalHours <= 0 ? 24 : options.IntervalHours,
+            BatchSize = options.BatchSize is >= 100 and <= 2000 ? options.BatchSize : 500,
+            Roots = options.Roots ?? Array.Empty<InventoryScanRoot>()
         };
     }
 
@@ -952,6 +1236,21 @@ internal sealed record AgentOptions(
             : Path.GetFullPath(Path.Combine(baseDirectory, path));
     }
 }
+
+internal sealed record InventoryScanOptions(
+    bool Enabled,
+    int IntervalHours,
+    int BatchSize,
+    int MaxItemsPerScan,
+    bool IncludeLastAccessTime,
+    string? WindowStartLocal,
+    string? WindowEndLocal,
+    InventoryScanRoot[] Roots);
+
+internal sealed record InventoryScanRoot(
+    string Path,
+    string? Server,
+    string? Share);
 
 internal sealed record AgentConfigResponse(
     string Server,
@@ -1097,6 +1396,44 @@ internal sealed record FileAuditEventRequest(
     string Result,
     string Severity,
     string Source);
+
+internal sealed record InventorySnapshotStartRequest(
+    string Server,
+    string Share,
+    string RootPath);
+
+internal sealed record InventorySnapshotStartResponse(
+    Guid Id,
+    string Server,
+    string Share,
+    string RootPath,
+    DateTimeOffset StartedUtc,
+    DateTimeOffset? FinishedUtc,
+    string Status,
+    long FileCount,
+    long FolderCount,
+    long TotalBytes,
+    long ErrorCount,
+    string? Error);
+
+internal sealed record InventoryItemBatchRequest(InventoryItemRequest[] Items);
+
+internal sealed record InventoryItemRequest(
+    DateTimeOffset? ScannedAtUtc,
+    string Server,
+    string Share,
+    string RootPath,
+    string Path,
+    string? RelativePath,
+    string? Name,
+    string ItemType,
+    long? SizeBytes,
+    DateTimeOffset? CreatedUtc,
+    DateTimeOffset? ModifiedUtc,
+    DateTimeOffset? AccessedUtc,
+    string? Error);
+
+internal sealed record InventorySnapshotCompleteRequest(string Status, string? Error);
 
 internal sealed record AgentHeartbeatRequest(
     string AgentId,
