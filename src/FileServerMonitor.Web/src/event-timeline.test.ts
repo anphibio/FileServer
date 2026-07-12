@@ -1857,3 +1857,30 @@ test("correlates the real exported scenario without surfacing provisional office
   assert.ok(display.every((event) => event.path !== "E:\\Corporativo\\teste-pptx-01.pptx" || event.displayAction !== "Alterado"));
   assert.ok(display.every((event) => event.path !== "E:\\Corporativo\\teste-xlsx-01.xlsx" || event.displayAction !== "Alterado"));
 });
+
+test("suppresses technical folder access emitted alongside permission changes", () => {
+  const path = "C:\\Corporativo\\codex-mixed-live-01\\Acl";
+  const display = buildDisplayEvents([
+    buildEvent({
+      id: "permission-folder",
+      timestampUtc: "2026-07-12T04:32:12.000Z",
+      path,
+      objectType: "folder",
+      action: "permission_changed",
+      user: "FILESERVER\\Administrator",
+      source: "usn-journal+security-log"
+    }),
+    buildEvent({
+      id: "access-folder",
+      timestampUtc: "2026-07-12T04:32:12.867Z",
+      path,
+      objectType: "folder",
+      action: "accessed",
+      user: "FILESERVER\\Administrator",
+      source: "windows-security-log"
+    })
+  ]);
+
+  assert.equal(display.length, 1);
+  assert.equal(display[0]?.action, "permission_changed");
+});

@@ -320,6 +320,11 @@ Sem filtros, a API resume as ultimas 24 horas e retorna:
 - Ranking por compartilhamento.
 - Ranking por usuario.
 
+Para evoluir a camada gerencial do produto, consulte tambem:
+
+- [Blueprint inspirado no Varonis](./docs/varonis-file-server-monitor-blueprint.md)
+- [Modelo de relatorio QBR](./docs/modelo-relatorio-qbr-file-server-monitor.md)
+
 ## Autenticacao Inicial
 
 A API suporta uma protecao inicial por API key. Em desenvolvimento ela vem desligada.
@@ -415,6 +420,7 @@ Campos importantes:
 - `apiBaseUrl`: URL da API central.
 - `pollIntervalSeconds`: intervalo de coleta.
 - `batchSize`: quantidade maxima de eventos por lote.
+- `queueFlushMaxEventsPerCycle`: teto de eventos pendentes enviados em cada ciclo. O agente usa fila em streaming para não carregar a fila inteira na memória durante picos.
 - `enableSecurityLogCollector`: ativa coleta do Windows Security Log.
 - `enableUsnJournalCollector`: ativa coleta do USN Journal.
 - `enableCorrelation`: ativa enriquecimento de eventos USN com dados do Security Log.
@@ -632,6 +638,8 @@ Publicar o agente:
 ```bash
 dotnet publish src/FileServerMonitor.Agent/FileServerMonitor.Agent.csproj -c Release -r win-x64 --self-contained false
 ```
+
+O pacote publica `appsettings.agent.template.json`. O arquivo real `appsettings.agent.json` deve permanecer no servidor e nao deve ser sobrescrito durante atualizacoes do agente.
 
 Instalar no Windows Server como servico:
 

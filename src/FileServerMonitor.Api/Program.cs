@@ -27,6 +27,7 @@ builder.Services.AddSingleton<MonitoredPathStore>();
 builder.Services.AddSingleton<AdminAuditStore>();
 builder.Services.AddSingleton<LdapAuthSettingsStore>();
 builder.Services.AddSingleton<RetentionSettingsStore>();
+builder.Services.AddSingleton<InventoryScanSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
 builder.Services.AddHostedService<RetentionWorker>();
 builder.Services.AddCors(options =>
@@ -141,6 +142,7 @@ app.MapGet("/health", async (IEventRepository repository, CancellationToken canc
 
 app.MapGet("/metrics", async (
     IEventRepository repository,
+    IInventoryRepository inventory,
     AgentHealthStore agents,
     RetentionSettingsStore retentionStore,
     IConfiguration configuration,
@@ -149,6 +151,7 @@ app.MapGet("/metrics", async (
     var now = DateTimeOffset.UtcNow;
     var database = await BuildDatabaseMetricsAsync(repository, now, cancellationToken);
     var capacity = await BuildDatabaseCapacityMetricsAsync(configuration, repository, now, cancellationToken);
+    var inventoryMetrics = await BuildInventoryMetricsAsync(inventory, now, cancellationToken);
     var agentSummary = await BuildAgentMetricsAsync(agents, now, cancellationToken);
     var thresholds = new MetricsThresholds(
         AgentStaleMinutes: configuration.GetValue("Agents:StaleMinutes", 10),
@@ -162,7 +165,7 @@ app.MapGet("/metrics", async (
         StartedUtc: apiStartedUtc,
         MachineName: Environment.MachineName,
         ProcessId: Environment.ProcessId);
-    var status = ResolveMetricsStatus(database, agentSummary);
+    var status = ResolveMetricsStatus(database, agentSummary, inventoryMetrics);
 
     return Results.Ok(new MetricsResponse(
         Service: "FileServerMonitor.Api",
@@ -171,6 +174,7 @@ app.MapGet("/metrics", async (
         Api: api,
         Database: database,
         Capacity: capacity,
+        Inventory: inventoryMetrics,
         Agents: agentSummary,
         Retention: retention,
         Thresholds: thresholds));
@@ -295,7 +299,9 @@ app.MapGet("/api/events/timeline", async (
     var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(timelineQuery, timelineRepository, cancellationToken);
     if (persistedTimeline is not null)
     {
-        return Results.Ok(persistedTimeline);
+        return Results.Ok(persistedTimeline
+            .Where(item => MatchesTimelineQuery(item, timelineQuery))
+            .ToArray());
     }
 
     var events = await QueryTimelineSourceEventsAsync(
@@ -315,7 +321,9 @@ app.MapGet("/api/events/timeline", async (
         timelineQuery.Take,
         repository,
         cancellationToken);
-    var timeline = ProjectTimeline(events, user, action);
+    var timeline = ProjectTimeline(events, user, action)
+        .Where(item => MatchesTimelineQuery(item, timelineQuery))
+        .ToArray();
 
     return Results.Ok(timeline);
 });
@@ -357,7 +365,9 @@ app.MapGet("/api/events/timeline/export.csv", async (
     var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(timelineQuery, timelineRepository, cancellationToken);
     if (persistedTimeline is not null)
     {
-        var persistedCsv = TimelineCsvExporter.Export(persistedTimeline);
+        var persistedCsv = TimelineCsvExporter.Export(persistedTimeline
+            .Where(item => MatchesTimelineQuery(item, timelineQuery))
+            .ToArray());
         return Results.Text(persistedCsv, "text/csv; charset=utf-8");
     }
 
@@ -378,7 +388,9 @@ app.MapGet("/api/events/timeline/export.csv", async (
         timelineQuery.Take,
         repository,
         cancellationToken);
-    var timeline = ProjectTimeline(events, user, action);
+    var timeline = ProjectTimeline(events, user, action)
+        .Where(item => MatchesTimelineQuery(item, timelineQuery))
+        .ToArray();
     var csv = TimelineCsvExporter.Export(timeline);
 
     return Results.Text(csv, "text/csv; charset=utf-8");
@@ -428,6 +440,7 @@ app.MapGet("/api/events/timeline/page", async (
     var persistedTimeline = await QueryPersistedTimelineIfCoveredAsync(pageQuery, timelineRepository, cancellationToken);
     var windowEvents = persistedTimeline?.Count ?? 0;
     var filteredTimeline = (persistedTimeline ?? Array.Empty<FileAuditDisplayEvent>())
+        .Where(item => MatchesTimelineQuery(item, pageQuery))
         .Where(item => MatchesTimelineSearch(item, search))
         .ToArray();
     if (persistedTimeline is null)
@@ -451,6 +464,7 @@ app.MapGet("/api/events/timeline/page", async (
             cancellationToken);
         windowEvents = events.Count;
         filteredTimeline = ProjectTimeline(events, user, action)
+            .Where(item => MatchesTimelineQuery(item, pageQuery))
             .Where(item => MatchesTimelineSearch(item, search))
             .ToArray();
     }
@@ -621,10 +635,49 @@ app.MapGet("/api/inventory/summary", async (
     string? rootPath,
     int? top,
     IInventoryRepository inventory,
+    ITimelineRepository timeline,
     CancellationToken cancellationToken) =>
 {
-    var summary = await inventory.GetLatestSummaryAsync(server, share, rootPath, top is > 0 and <= 50 ? top.Value : 10, cancellationToken);
-    return Results.Ok(summary);
+    var safeTop = top is > 0 and <= 50 ? top.Value : 10;
+    var summary = await inventory.GetLatestSummaryAsync(server, share, rootPath, safeTop, cancellationToken);
+    var now = DateTimeOffset.UtcNow;
+    var observedActivity = summary.SnapshotId is null
+        ? FileInventoryAnalyzer.BuildObservedActivitySummary(Array.Empty<FileInventoryObservedActivityInput>(), safeTop)
+        : await timeline.GetObservedActivitySummaryAsync(
+            server: summary.Server ?? server,
+            share: summary.Share ?? share,
+            rootPath: summary.RootPath ?? rootPath,
+            fromUtc: now.AddDays(-30),
+            toUtc: now,
+            top: safeTop,
+            cancellationToken);
+
+    return Results.Ok(summary with { ObservedActivity = observedActivity });
+});
+
+app.MapGet("/api/inventory/items", async (
+    string? server,
+    string? share,
+    string? rootPath,
+    string? kind,
+    string? path,
+    string? extension,
+    int? take,
+    IInventoryRepository inventory,
+    CancellationToken cancellationToken) =>
+{
+    var safeTake = Math.Clamp(take ?? 100, 1, 500);
+    var items = await inventory.QueryLatestItemsAsync(
+        server,
+        share,
+        rootPath,
+        kind,
+        path,
+        extension,
+        safeTake,
+        cancellationToken);
+
+    return Results.Ok(items);
 });
 
 app.MapGet("/api/inventory/snapshots", async (
@@ -824,6 +877,7 @@ app.MapGet("/api/agents/health", async (
 app.MapGet("/api/agents/config", async (
     string server,
     MonitoredPathStore paths,
+    InventoryScanSettingsStore inventoryScan,
     CancellationToken cancellationToken) =>
 {
     if (string.IsNullOrWhiteSpace(server))
@@ -842,13 +896,15 @@ app.MapGet("/api/agents/config", async (
         .Select(item => item.Share)
         .FirstOrDefault(item => !string.IsNullOrWhiteSpace(item))
         ?? "FileServer";
+    var inventorySettings = await inventoryScan.GetAsync(cancellationToken);
 
     return Results.Ok(new AgentConfigResponse(
         Server: server.Trim(),
         GeneratedUtc: DateTimeOffset.UtcNow,
         DefaultShare: defaultShare,
         UsnVolumes: usnVolumes,
-        MonitoredPaths: activePaths));
+        MonitoredPaths: activePaths,
+        InventoryScan: InventoryScanSettingsResponse.FromSettings(inventorySettings)));
 });
 
 app.MapGet("/api/database/capacity", async (
@@ -1090,6 +1146,53 @@ app.MapPut("/api/retention/config", async (
     return Results.Ok(RetentionSettingsResponse.FromSettings(settings));
 });
 
+app.MapGet("/api/inventory/config", async (
+    InventoryScanSettingsStore store,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+    return Results.Ok(InventoryScanSettingsResponse.FromSettings(settings));
+});
+
+app.MapPut("/api/inventory/config", async (
+    InventoryScanSettingsRequest request,
+    InventoryScanSettingsStore store,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.SaveAsync(request, cancellationToken);
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "inventory.scan.update",
+        EntityType: "inventory_scan_settings",
+        EntityId: "default",
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: InventoryScanSettingsResponse.FromSettings(settings)), cancellationToken);
+
+    return Results.Ok(InventoryScanSettingsResponse.FromSettings(settings));
+});
+
+app.MapPost("/api/inventory/scan-now", async (
+    InventoryScanSettingsStore store,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.RequestRunNowAsync(cancellationToken);
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "inventory.scan.request",
+        EntityType: "inventory_scan_settings",
+        EntityId: "default",
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: InventoryScanSettingsResponse.FromSettings(settings)), cancellationToken);
+
+    return Results.Ok(InventoryScanSettingsResponse.FromSettings(settings));
+});
+
 app.MapPost("/api/monitored-paths", async (
     MonitoredPathRequest request,
     MonitoredPathStore store,
@@ -1279,7 +1382,80 @@ static async Task<IReadOnlyCollection<FileAuditEvent>> QueryTimelineSourceEvents
         }
     }
 
+    if (!string.IsNullOrWhiteSpace(path))
+    {
+        var seen = events.Select(item => item.Id).ToHashSet();
+        foreach (var ancestorPath in EnumerateAncestorPaths(path))
+        {
+            var ancestorQuery = baseQuery with
+            {
+                Path = ancestorPath,
+                Action = "renamed,moved,deleted,created,created_or_appended",
+                User = null,
+                Take = Math.Min(Math.Max(take, 200), 5_000)
+            };
+
+            var ancestorEvents = await repository.QueryAsync(ancestorQuery, cancellationToken);
+            foreach (var item in ancestorEvents)
+            {
+                if (seen.Add(item.Id))
+                {
+                    events.Add(item);
+                }
+            }
+        }
+    }
+
     return events;
+}
+
+static IReadOnlyCollection<string> EnumerateAncestorPaths(string path)
+{
+    var normalized = (path ?? string.Empty).Trim().Replace('/', '\\').TrimEnd('\\');
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return Array.Empty<string>();
+    }
+
+    var values = new List<string>();
+    var current = normalized;
+    for (var depth = 0; depth < 8; depth++)
+    {
+        var parent = GetParentPathForQuery(current);
+        if (string.IsNullOrWhiteSpace(parent))
+        {
+            break;
+        }
+
+        values.Add(parent);
+        current = parent;
+    }
+
+    return values
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+}
+
+static string GetParentPathForQuery(string path)
+{
+    var normalized = (path ?? string.Empty).Trim().Replace('/', '\\').TrimEnd('\\');
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return string.Empty;
+    }
+
+    var lastSeparator = normalized.LastIndexOf('\\');
+    if (lastSeparator <= 0)
+    {
+        return string.Empty;
+    }
+
+    if (lastSeparator == 2 && normalized.Length >= 2 && normalized[1] == ':')
+    {
+        return normalized[..3];
+    }
+
+    return normalized[..lastSeparator];
 }
 
 static string? BuildTimelineSourceActionFilter(string? action)
@@ -1348,7 +1524,7 @@ static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTim
     }
 
     var coverage = await timelineRepository.GetCoverageAsync(cancellationToken);
-    if (coverage.Count == 0 || (query.FromUtc is not null && coverage.FromUtc is not null && coverage.FromUtc > query.FromUtc))
+    if (!HasTimelineCoverage(coverage, query.FromUtc, query.ToUtc))
     {
         return null;
     }
@@ -1387,12 +1563,32 @@ static async Task<bool> IsTimelineCoveredAsync(
 {
     var coverage = await timelineRepository.GetCoverageAsync(cancellationToken);
 
-    return coverage.Count > 0
-        && coverage.FromUtc is not null
-        && coverage.ToUtc is not null
-        && coverage.FromUtc <= fromUtc
-        && coverage.ToUtc >= fromUtc
-        && toUtc >= fromUtc;
+    return HasTimelineCoverage(coverage, fromUtc, toUtc);
+}
+
+static bool HasTimelineCoverage(
+    TimelineCoverage coverage,
+    DateTimeOffset? fromUtc,
+    DateTimeOffset? toUtc)
+{
+    if (coverage.Count <= 0 || coverage.FromUtc is null || coverage.ToUtc is null)
+    {
+        return false;
+    }
+
+    var effectiveFromUtc = fromUtc ?? coverage.FromUtc;
+    if (coverage.FromUtc > effectiveFromUtc)
+    {
+        return false;
+    }
+
+    var effectiveToUtc = toUtc ?? DateTimeOffset.UtcNow.AddSeconds(-TimelineRebuildPaddingSeconds);
+    if (effectiveToUtc < effectiveFromUtc)
+    {
+        return false;
+    }
+
+    return coverage.ToUtc >= effectiveToUtc;
 }
 
 static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
@@ -1429,6 +1625,139 @@ static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? sear
         || auditEvent.Action.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.DisplayAction.Contains(needle, StringComparison.OrdinalIgnoreCase)
         || auditEvent.Source.Contains(needle, StringComparison.OrdinalIgnoreCase);
+}
+
+static bool MatchesTimelineQuery(FileAuditDisplayEvent auditEvent, TimelineQuery query)
+{
+    if (!string.IsNullOrWhiteSpace(query.Server)
+        && !auditEvent.Server.Contains(query.Server, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.Share)
+        && !auditEvent.Share.Contains(query.Share, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.User)
+        && !auditEvent.User.Contains(query.User, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    var actions = ParseTimelineActionFilter(query.Action);
+    if (actions.Length > 0
+        && !actions.Contains(auditEvent.Action, StringComparer.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.Path)
+        && !auditEvent.Path.Contains(query.Path, StringComparison.OrdinalIgnoreCase)
+        && !(auditEvent.PreviousPath?.Contains(query.Path, StringComparison.OrdinalIgnoreCase) ?? false))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.SourceHost)
+        && !(auditEvent.SourceHost?.Contains(query.SourceHost, StringComparison.OrdinalIgnoreCase) ?? false))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.SourceIp)
+        && !(auditEvent.SourceIp?.Contains(query.SourceIp, StringComparison.OrdinalIgnoreCase) ?? false))
+    {
+        return false;
+    }
+
+    var extensions = SplitCsvFilter(query.Extension)
+        .Select(NormalizeTimelineFilterExtension)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    if (extensions.Length > 0
+        && (auditEvent.Extension is null
+            || !extensions.Contains(auditEvent.Extension, StringComparer.OrdinalIgnoreCase)))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.Result)
+        && !auditEvent.Result.Contains(query.Result, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.Severity)
+        && !auditEvent.Severity.Equals(query.Severity, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (!string.IsNullOrWhiteSpace(query.Source)
+        && !auditEvent.Source.Contains(query.Source, StringComparison.OrdinalIgnoreCase))
+    {
+        return false;
+    }
+
+    if (query.FromUtc.HasValue && auditEvent.TimestampUtc < query.FromUtc.Value)
+    {
+        return false;
+    }
+
+    if (query.ToUtc.HasValue && auditEvent.TimestampUtc > query.ToUtc.Value)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static string[] ParseTimelineActionFilter(string? action)
+{
+    if (string.IsNullOrWhiteSpace(action))
+    {
+        return Array.Empty<string>();
+    }
+
+    var normalized = action.Trim().ToLowerInvariant();
+    if (normalized is "read" or "opened" or "access" or "accessed")
+    {
+        return ["accessed"];
+    }
+
+    if (normalized is "created_or_appended" or "append" or "appended")
+    {
+        return ["created_or_appended"];
+    }
+
+    return SplitCsvFilter(action)
+        .Select(item => item.Trim().ToLowerInvariant())
+        .Where(item => item.Length > 0)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+}
+
+static IEnumerable<string> SplitCsvFilter(string? value)
+{
+    return string.IsNullOrWhiteSpace(value)
+        ? Array.Empty<string>()
+        : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}
+
+static string NormalizeTimelineFilterExtension(string value)
+{
+    var normalized = value.Trim();
+    if (string.IsNullOrWhiteSpace(normalized))
+    {
+        return string.Empty;
+    }
+
+    return normalized.StartsWith('.')
+        ? normalized.ToLowerInvariant()
+        : $".{normalized.ToLowerInvariant()}";
 }
 
 static async Task<DatabaseMetrics> BuildDatabaseMetricsAsync(
@@ -1846,6 +2175,100 @@ static async Task<AgentMetricsSummary> BuildAgentMetricsAsync(
     }
 }
 
+static async Task<InventoryMetrics> BuildInventoryMetricsAsync(
+    IInventoryRepository inventory,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var latest = (await inventory.GetSnapshotsAsync(server: null, share: null, take: 1, cancellationToken))
+            .FirstOrDefault();
+
+        if (latest is null)
+        {
+            return new InventoryMetrics(
+                Status: "empty",
+                LastSnapshotId: null,
+                LastSnapshotStatus: null,
+                LastScanStartedUtc: null,
+                LastScanFinishedUtc: null,
+                LastScanAgeSeconds: null,
+                FileCount: 0,
+                FolderCount: 0,
+                TotalBytes: 0,
+                ErrorCount: 0,
+                Inactive365DaysFileCount: 0,
+                Inactive365DaysBytes: 0,
+                LargeFileCount: 0,
+                LargeFileBytes: 0,
+                ExecutableFileCount: 0,
+                ExecutableFileBytes: 0,
+                Server: null,
+                Share: null,
+                RootPath: null,
+                Error: null);
+        }
+
+        var status = latest.Status.Equals("failed", StringComparison.OrdinalIgnoreCase)
+            ? "critical"
+            : latest.ErrorCount > 0 || latest.Status.Equals("completed_with_errors", StringComparison.OrdinalIgnoreCase)
+                ? "degraded"
+                : latest.Status.Equals("running", StringComparison.OrdinalIgnoreCase)
+                    ? "running"
+                    : "healthy";
+        var summary = latest.Status is "completed" or "completed_with_errors"
+            ? await inventory.GetLatestSummaryAsync(latest.Server, latest.Share, latest.RootPath, top: 1, cancellationToken)
+            : null;
+
+        return new InventoryMetrics(
+            Status: status,
+            LastSnapshotId: latest.Id,
+            LastSnapshotStatus: latest.Status,
+            LastScanStartedUtc: latest.StartedUtc,
+            LastScanFinishedUtc: latest.FinishedUtc,
+            LastScanAgeSeconds: GetAgeSeconds(now, latest.FinishedUtc ?? latest.StartedUtc),
+            FileCount: latest.FileCount,
+            FolderCount: latest.FolderCount,
+            TotalBytes: latest.TotalBytes,
+            ErrorCount: latest.ErrorCount,
+            Inactive365DaysFileCount: summary?.Governance.Inactive365DaysFileCount ?? 0,
+            Inactive365DaysBytes: summary?.Governance.Inactive365DaysBytes ?? 0,
+            LargeFileCount: summary?.Governance.LargeFileCount ?? 0,
+            LargeFileBytes: summary?.Governance.LargeFileBytes ?? 0,
+            ExecutableFileCount: summary?.Governance.ExecutableFileCount ?? 0,
+            ExecutableFileBytes: summary?.Governance.ExecutableFileBytes ?? 0,
+            Server: latest.Server,
+            Share: latest.Share,
+            RootPath: latest.RootPath,
+            Error: latest.Error);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        return new InventoryMetrics(
+            Status: "critical",
+            LastSnapshotId: null,
+            LastSnapshotStatus: null,
+            LastScanStartedUtc: null,
+            LastScanFinishedUtc: null,
+            LastScanAgeSeconds: null,
+            FileCount: 0,
+            FolderCount: 0,
+            TotalBytes: 0,
+            ErrorCount: 0,
+            Inactive365DaysFileCount: 0,
+            Inactive365DaysBytes: 0,
+            LargeFileCount: 0,
+            LargeFileBytes: 0,
+            ExecutableFileCount: 0,
+            ExecutableFileBytes: 0,
+            Server: null,
+            Share: null,
+            RootPath: null,
+            Error: ex.Message);
+    }
+}
+
 static long? GetAgeSeconds(DateTimeOffset now, DateTimeOffset? value)
 {
     return value is null
@@ -1868,16 +2291,18 @@ static string ResolveAgentStatus(int total, int stale, int unhealthy, int backlo
     return "healthy";
 }
 
-static string ResolveMetricsStatus(DatabaseMetrics database, AgentMetricsSummary agents)
+static string ResolveMetricsStatus(DatabaseMetrics database, AgentMetricsSummary agents, InventoryMetrics inventory)
 {
     if (database.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
-        || agents.Status.Equals("critical", StringComparison.OrdinalIgnoreCase))
+        || agents.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
+        || inventory.Status.Equals("critical", StringComparison.OrdinalIgnoreCase))
     {
         return "critical";
     }
 
     if (!database.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase)
-        || !agents.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase))
+        || !agents.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase)
+        || inventory.Status.Equals("degraded", StringComparison.OrdinalIgnoreCase))
     {
         return "degraded";
     }
@@ -1919,6 +2344,15 @@ internal interface ITimelineRepository
 
     Task<ActivitySummaryResponse> GetActivitySummaryAsync(ActivitySummaryQuery query, CancellationToken cancellationToken);
 
+    Task<FileInventoryObservedActivitySummary> GetObservedActivitySummaryAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int top,
+        CancellationToken cancellationToken);
+
     Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(BaselineAnomalyQuery query, CancellationToken cancellationToken);
 
     Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken);
@@ -1935,6 +2369,16 @@ internal interface IInventoryRepository
     Task<FileInventorySnapshot?> CompleteSnapshotAsync(Guid snapshotId, string status, string? error, CancellationToken cancellationToken);
 
     Task<FileInventorySummary> GetLatestSummaryAsync(string? server, string? share, string? rootPath, int top, CancellationToken cancellationToken);
+
+    Task<IReadOnlyCollection<FileInventoryItem>> QueryLatestItemsAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        string? kind,
+        string? path,
+        string? extension,
+        int take,
+        CancellationToken cancellationToken);
 
     Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(string? server, string? share, int take, CancellationToken cancellationToken);
 }
@@ -2084,6 +2528,131 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
             ByAction: byAction,
             ByShare: byShare,
             ByUser: byUser);
+    }
+
+    public async Task<FileInventoryObservedActivitySummary> GetObservedActivitySummaryAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 120;
+        var where = BuildObservedActivityWhereSql(command, server, share, rootPath, fromUtc, toUtc);
+        command.Parameters.AddWithValue("@Top", Math.Clamp(top, 1, 100));
+        command.CommandText = $$"""
+            WITH Filtered AS
+            (
+                SELECT
+                    TimestampUtc,
+                    UserName,
+                    DisplayAction,
+                    CASE
+                        WHEN ObjectType = N'folder' THEN FullPath
+                        WHEN CHARINDEX(N'\', REVERSE(FullPath)) > 0 THEN LEFT(FullPath, LEN(FullPath) - CHARINDEX(N'\', REVERSE(FullPath)))
+                        ELSE FullPath
+                    END AS FolderPath
+                FROM dbo.FileAuditTimelineEvents
+                {{where}}
+            ),
+            FolderTotals AS
+            (
+                SELECT FolderPath, COUNT_BIG(1) AS EventCount, MAX(TimestampUtc) AS LastActivityUtc
+                FROM Filtered
+                GROUP BY FolderPath
+            ),
+            FolderActions AS
+            (
+                SELECT
+                    FolderPath,
+                    DisplayAction,
+                    ROW_NUMBER() OVER (PARTITION BY FolderPath ORDER BY COUNT_BIG(1) DESC, DisplayAction ASC) AS ActionRank
+                FROM Filtered
+                GROUP BY FolderPath, DisplayAction
+            )
+            SELECT TOP (@Top)
+                FolderTotals.FolderPath,
+                FolderTotals.EventCount,
+                FolderTotals.LastActivityUtc,
+                FolderActions.DisplayAction AS TopAction
+            FROM FolderTotals
+            INNER JOIN FolderActions
+                ON FolderActions.FolderPath = FolderTotals.FolderPath
+               AND FolderActions.ActionRank = 1
+            ORDER BY FolderTotals.EventCount DESC, FolderTotals.LastActivityUtc DESC, FolderTotals.FolderPath ASC;
+
+            WITH Filtered AS
+            (
+                SELECT TimestampUtc, UserName, DisplayAction
+                FROM dbo.FileAuditTimelineEvents
+                {{where}}
+            ),
+            UserTotals AS
+            (
+                SELECT UserName, COUNT_BIG(1) AS EventCount, MAX(TimestampUtc) AS LastActivityUtc
+                FROM Filtered
+                GROUP BY UserName
+            ),
+            UserActions AS
+            (
+                SELECT
+                    UserName,
+                    DisplayAction,
+                    ROW_NUMBER() OVER (PARTITION BY UserName ORDER BY COUNT_BIG(1) DESC, DisplayAction ASC) AS ActionRank
+                FROM Filtered
+                GROUP BY UserName, DisplayAction
+            )
+            SELECT TOP (@Top)
+                UserTotals.UserName,
+                UserTotals.EventCount,
+                UserTotals.LastActivityUtc,
+                UserActions.DisplayAction AS TopAction
+            FROM UserTotals
+            INNER JOIN UserActions
+                ON UserActions.UserName = UserTotals.UserName
+               AND UserActions.ActionRank = 1
+            ORDER BY UserTotals.EventCount DESC, UserTotals.LastActivityUtc DESC, UserTotals.UserName ASC;
+
+            SELECT COUNT_BIG(1) AS TotalEvents
+            FROM dbo.FileAuditTimelineEvents
+            {{where}};
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var topFolders = new List<FileInventoryTopActivityFolder>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            topFolders.Add(new FileInventoryTopActivityFolder(
+                Path: reader.GetString(reader.GetOrdinal("FolderPath")),
+                EventCount: Convert.ToInt64(reader["EventCount"]),
+                LastActivityUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("LastActivityUtc")), DateTimeKind.Utc)),
+                TopAction: reader.GetString(reader.GetOrdinal("TopAction"))));
+        }
+
+        await reader.NextResultAsync(cancellationToken);
+        var topUsers = new List<FileInventoryTopActivityUser>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            topUsers.Add(new FileInventoryTopActivityUser(
+                User: reader.GetString(reader.GetOrdinal("UserName")),
+                EventCount: Convert.ToInt64(reader["EventCount"]),
+                LastActivityUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("LastActivityUtc")), DateTimeKind.Utc)),
+                TopAction: reader.GetString(reader.GetOrdinal("TopAction"))));
+        }
+
+        await reader.NextResultAsync(cancellationToken);
+        var totalEvents = await reader.ReadAsync(cancellationToken)
+            ? Convert.ToInt64(reader["TotalEvents"])
+            : 0;
+
+        return new FileInventoryObservedActivitySummary(totalEvents, topFolders, topUsers);
     }
 
     public async Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(
@@ -2412,6 +2981,46 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
         }
 
         return items;
+    }
+
+    private static string BuildObservedActivityWhereSql(
+        SqlCommand command,
+        string? server,
+        string? share,
+        string? rootPath,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc)
+    {
+        var predicates = new List<string>
+        {
+            "TimestampUtc >= @ObservedFromUtc",
+            "TimestampUtc <= @ObservedToUtc",
+            "UserName NOT LIKE N'%$'"
+        };
+        command.Parameters.AddWithValue("@ObservedFromUtc", fromUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@ObservedToUtc", toUtc.UtcDateTime);
+
+        if (!string.IsNullOrWhiteSpace(server))
+        {
+            predicates.Add("ServerName LIKE @ObservedServer");
+            command.Parameters.AddWithValue("@ObservedServer", $"%{server.Trim()}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(share))
+        {
+            predicates.Add("ShareName LIKE @ObservedShare");
+            command.Parameters.AddWithValue("@ObservedShare", $"%{share.Trim()}%");
+        }
+
+        if (!string.IsNullOrWhiteSpace(rootPath))
+        {
+            var normalizedRoot = FileInventoryNormalizer.NormalizePath(rootPath);
+            predicates.Add("(FullPath = @ObservedRootPath OR FullPath LIKE @ObservedRootPathPrefix)");
+            command.Parameters.AddWithValue("@ObservedRootPath", normalizedRoot);
+            command.Parameters.AddWithValue("@ObservedRootPathPrefix", $"{normalizedRoot}\\%");
+        }
+
+        return $"WHERE {string.Join(" AND ", predicates)}";
     }
 
     private static async Task<IReadOnlyCollection<BaselineAnomalyItem>> BuildTimelineAnomaliesAsync(
@@ -2836,8 +3445,97 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             return FileInventoryAnalyzer.BuildSummary(null, Array.Empty<FileInventoryItem>(), top);
         }
 
-        var items = await QuerySnapshotItemsAsync(connection, snapshot.Id, cancellationToken);
-        return FileInventoryAnalyzer.BuildSummary(snapshot, items, top);
+        var previousSnapshot = await FindPreviousSnapshotAsync(connection, snapshot, cancellationToken);
+        return await BuildSqlSummaryAsync(connection, snapshot, previousSnapshot, top, cancellationToken);
+    }
+
+    public async Task<IReadOnlyCollection<FileInventoryItem>> QueryLatestItemsAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        string? kind,
+        string? path,
+        string? extension,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        var snapshot = await FindLatestSnapshotAsync(connection, server, share, rootPath, cancellationToken);
+        if (snapshot is null)
+        {
+            return Array.Empty<FileInventoryItem>();
+        }
+
+        await using var command = connection.CreateCommand();
+        var predicates = new List<string> { "SnapshotId = @SnapshotId" };
+        var normalizedKind = NormalizeInventoryItemKind(kind);
+        var orderBy = "FullPath ASC";
+
+        switch (normalizedKind)
+        {
+            case "large":
+                predicates.Add("ItemType = N'file'");
+                predicates.Add("StatusName = N'active'");
+                predicates.Add("SizeBytes >= 1073741824");
+                orderBy = "SizeBytes DESC, FullPath ASC";
+                break;
+            case "inactive365":
+                predicates.Add("ItemType = N'file'");
+                predicates.Add("StatusName = N'active'");
+                predicates.Add("COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) <= DATEADD(day, -365, SYSUTCDATETIME())");
+                orderBy = "COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) ASC, SizeBytes DESC, FullPath ASC";
+                break;
+            case "executable":
+                predicates.Add("ItemType = N'file'");
+                predicates.Add("StatusName = N'active'");
+                predicates.Add("Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com')");
+                orderBy = "SizeBytes DESC, FullPath ASC";
+                break;
+            case "errors":
+                predicates.Add("(StatusName <> N'active' OR ErrorText IS NOT NULL)");
+                orderBy = "FullPath ASC";
+                break;
+            default:
+                predicates.Add("StatusName = N'active'");
+                break;
+        }
+
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            predicates.Add("FullPath LIKE @Path");
+            command.Parameters.AddWithValue("@Path", $"%{path.Trim()}%");
+        }
+
+        var normalizedExtension = NormalizeInventoryExtension(extension);
+        if (!string.IsNullOrWhiteSpace(normalizedExtension))
+        {
+            predicates.Add("Extension = @Extension");
+            command.Parameters.AddWithValue("@Extension", normalizedExtension);
+        }
+
+        command.CommandText = $$"""
+            SELECT TOP (@Take)
+                Id, SnapshotId, ScannedAtUtc, ServerName, ShareName, RootPath, FullPath,
+                RelativePath, ItemName, ItemType, Extension, SizeBytes, Depth,
+                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText
+            FROM dbo.FileInventoryItems
+            WHERE {{string.Join(" AND ", predicates)}}
+            ORDER BY {{orderBy}};
+            """;
+        command.Parameters.AddWithValue("@SnapshotId", snapshot.Id);
+        command.Parameters.AddWithValue("@Take", Math.Clamp(take, 1, 500));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<FileInventoryItem>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(ReadItem(reader));
+        }
+
+        return result;
     }
 
     public async Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(
@@ -3012,6 +3710,33 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         return await reader.ReadAsync(cancellationToken) ? ReadSnapshot(reader) : null;
     }
 
+    private static async Task<FileInventorySnapshot?> FindPreviousSnapshotAsync(
+        SqlConnection connection,
+        FileInventorySnapshot snapshot,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1)
+                Id, ServerName, ShareName, RootPath, StartedUtc, FinishedUtc, StatusName,
+                FileCount, FolderCount, TotalBytes, ErrorCount, ErrorText
+            FROM dbo.FileInventorySnapshots
+            WHERE StatusName IN (N'completed', N'completed_with_errors')
+              AND ServerName = @ServerName
+              AND ShareName = @ShareName
+              AND RootPath = @RootPath
+              AND StartedUtc < @StartedUtc
+            ORDER BY StartedUtc DESC;
+            """;
+        command.Parameters.AddWithValue("@ServerName", snapshot.Server);
+        command.Parameters.AddWithValue("@ShareName", snapshot.Share);
+        command.Parameters.AddWithValue("@RootPath", snapshot.RootPath);
+        command.Parameters.AddWithValue("@StartedUtc", snapshot.StartedUtc.UtcDateTime);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSnapshot(reader) : null;
+    }
+
     private static async Task<IReadOnlyCollection<FileInventoryItem>> QuerySnapshotItemsAsync(
         SqlConnection connection,
         Guid snapshotId,
@@ -3036,6 +3761,554 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         }
 
         return items;
+    }
+
+    private static async Task<FileInventorySummary> BuildSqlSummaryAsync(
+        SqlConnection connection,
+        FileInventorySnapshot snapshot,
+        FileInventorySnapshot? previousSnapshot,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        var growth = previousSnapshot is null
+            ? FileInventoryAnalyzer.BuildEmptyGrowthSummary()
+            : await BuildSqlGrowthSummaryAsync(connection, snapshot, previousSnapshot, top, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 300;
+        command.CommandText = """
+            WITH ActiveFiles AS
+            (
+                SELECT SizeBytes, Extension, CreatedUtc, ModifiedUtc, AccessedUtc
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @SnapshotId
+                  AND ItemType = N'file'
+                  AND StatusName = N'active'
+            )
+            SELECT
+                SUM(CASE WHEN COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) <= DATEADD(day, -180, SYSUTCDATETIME()) THEN 1 ELSE 0 END) AS Inactive180DaysFileCount,
+                SUM(CASE WHEN COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) <= DATEADD(day, -180, SYSUTCDATETIME()) THEN SizeBytes ELSE 0 END) AS Inactive180DaysBytes,
+                SUM(CASE WHEN COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) <= DATEADD(day, -365, SYSUTCDATETIME()) THEN 1 ELSE 0 END) AS Inactive365DaysFileCount,
+                SUM(CASE WHEN COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) <= DATEADD(day, -365, SYSUTCDATETIME()) THEN SizeBytes ELSE 0 END) AS Inactive365DaysBytes,
+                SUM(CASE WHEN AccessedUtc IS NULL THEN 1 ELSE 0 END) AS NeverAccessedFileCount,
+                SUM(CASE WHEN AccessedUtc IS NULL THEN SizeBytes ELSE 0 END) AS NeverAccessedBytes,
+                SUM(CASE WHEN SizeBytes >= 1073741824 THEN 1 ELSE 0 END) AS LargeFileCount,
+                SUM(CASE WHEN SizeBytes >= 1073741824 THEN SizeBytes ELSE 0 END) AS LargeFileBytes,
+                SUM(CASE WHEN Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com') THEN 1 ELSE 0 END) AS ExecutableFileCount,
+                SUM(CASE WHEN Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com') THEN SizeBytes ELSE 0 END) AS ExecutableFileBytes
+            FROM ActiveFiles;
+
+            WITH ActiveItems AS
+            (
+                SELECT
+                    ItemType,
+                    SizeBytes,
+                    CASE
+                        WHEN ItemType = N'folder' THEN FullPath
+                        WHEN CHARINDEX(N'\', REVERSE(FullPath)) > 0 THEN LEFT(FullPath, LEN(FullPath) - CHARINDEX(N'\', REVERSE(FullPath)))
+                        ELSE FullPath
+                    END AS ParentPath
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @SnapshotId
+                  AND StatusName = N'active'
+            )
+            SELECT TOP (@Top)
+                ParentPath,
+                SUM(CASE WHEN ItemType = N'file' THEN 1 ELSE 0 END) AS FileCount,
+                SUM(CASE WHEN ItemType = N'folder' THEN 1 ELSE 0 END) AS FolderCount,
+                SUM(CASE WHEN ItemType = N'file' THEN SizeBytes ELSE 0 END) AS TotalBytes
+            FROM ActiveItems
+            GROUP BY ParentPath
+            HAVING SUM(CASE WHEN ItemType = N'file' THEN 1 ELSE 0 END) > 0
+                OR SUM(CASE WHEN ItemType = N'folder' THEN 1 ELSE 0 END) > 0
+            ORDER BY TotalBytes DESC, ParentPath ASC;
+
+            SELECT TOP (@Top)
+                COALESCE(Extension, N'(sem extensao)') AS Extension,
+                COUNT_BIG(*) AS FileCount,
+                SUM(SizeBytes) AS TotalBytes
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId
+              AND ItemType = N'file'
+              AND StatusName = N'active'
+            GROUP BY COALESCE(Extension, N'(sem extensao)')
+            ORDER BY TotalBytes DESC, Extension ASC;
+
+            WITH CategorizedFiles AS
+            (
+                SELECT
+                    SizeBytes,
+                    CASE
+                        WHEN Extension IN (N'.doc', N'.docx', N'.odt', N'.rtf', N'.txt', N'.pdf', N'.xls', N'.xlsx', N'.ods', N'.csv', N'.ppt', N'.pptx', N'.odp') THEN N'documentos'
+                        WHEN Extension IN (N'.jpg', N'.jpeg', N'.png', N'.gif', N'.bmp', N'.tif', N'.tiff', N'.webp', N'.svg') THEN N'imagens'
+                        WHEN Extension IN (N'.mp4', N'.mov', N'.avi', N'.mkv', N'.wmv', N'.mpg', N'.mpeg') THEN N'videos'
+                        WHEN Extension IN (N'.mp3', N'.wav', N'.wma', N'.aac', N'.flac', N'.ogg') THEN N'audio'
+                        WHEN Extension IN (N'.zip', N'.rar', N'.7z', N'.tar', N'.gz', N'.bz2') THEN N'compactados'
+                        WHEN Extension IN (N'.exe', N'.msi', N'.jar', N'.scr', N'.com', N'.rpm', N'.deb', N'.pkg', N'.plugin') THEN N'instaladores'
+                        WHEN Extension IN (N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js') THEN N'scripts'
+                        WHEN Extension IN (N'.dll', N'.sys') THEN N'binarios'
+                        WHEN Extension IN (N'.kdbx') THEN N'dados sensiveis'
+                        WHEN Extension IN (N'.dwg', N'.dxf') THEN N'projetos cad'
+                        WHEN Extension IN (N'.bak', N'.sql', N'.db', N'.mdb', N'.accdb', N'.sqlite', N'.log') THEN N'dados'
+                        WHEN Extension IN (N'.iso', N'.ova', N'.vhd', N'.vhdx', N'.vmdk') THEN N'imagens de disco'
+                        ELSE N'outros'
+                    END AS Category
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @SnapshotId
+                  AND ItemType = N'file'
+                  AND StatusName = N'active'
+            )
+            SELECT
+                Category,
+                COUNT_BIG(*) AS FileCount,
+                SUM(SizeBytes) AS TotalBytes
+            FROM CategorizedFiles
+            GROUP BY Category
+            ORDER BY TotalBytes DESC, Category ASC;
+
+            SELECT TOP (@Top)
+                FullPath,
+                ItemName,
+                Extension,
+                SizeBytes,
+                ModifiedUtc,
+                AccessedUtc,
+                DATEDIFF(day, COALESCE(ModifiedUtc, CreatedUtc, AccessedUtc), SYSUTCDATETIME()) AS AgeDays
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId
+              AND ItemType = N'file'
+              AND StatusName = N'active'
+            ORDER BY SizeBytes DESC, FullPath ASC;
+
+            SELECT TOP (@Top)
+                FullPath,
+                ItemName,
+                Extension,
+                SizeBytes,
+                ModifiedUtc,
+                AccessedUtc,
+                DATEDIFF(day, COALESCE(ModifiedUtc, CreatedUtc, AccessedUtc), SYSUTCDATETIME()) AS AgeDays
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId
+              AND ItemType = N'file'
+              AND StatusName = N'active'
+              AND COALESCE(ModifiedUtc, CreatedUtc, AccessedUtc) IS NOT NULL
+            ORDER BY COALESCE(ModifiedUtc, CreatedUtc, AccessedUtc) ASC, SizeBytes DESC, FullPath ASC;
+
+            SELECT TOP (@Top)
+                FullPath,
+                ItemName,
+                Extension,
+                SizeBytes,
+                ModifiedUtc,
+                AccessedUtc,
+                DATEDIFF(day, COALESCE(ModifiedUtc, CreatedUtc, AccessedUtc), SYSUTCDATETIME()) AS AgeDays
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId
+              AND ItemType = N'file'
+              AND StatusName = N'active'
+              AND Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com')
+            ORDER BY SizeBytes DESC, FullPath ASC;
+
+            WITH ActiveFiles AS
+            (
+                SELECT SizeBytes, COALESCE(AccessedUtc, ModifiedUtc, CreatedUtc) AS ReferenceUtc
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @SnapshotId
+                  AND ItemType = N'file'
+                  AND StatusName = N'active'
+            ),
+            Buckets AS
+            (
+                SELECT N'0-30 dias' AS Label, 0 AS SortOrder, 0 AS MinDays, 30 AS MaxDays
+                UNION ALL SELECT N'31-90 dias', 1, 31, 90
+                UNION ALL SELECT N'91-180 dias', 2, 91, 180
+                UNION ALL SELECT N'181-365 dias', 3, 181, 365
+                UNION ALL SELECT N'+365 dias', 4, 366, NULL
+            )
+            SELECT
+                Buckets.Label,
+                COUNT_BIG(ActiveFiles.ReferenceUtc) AS FileCount,
+                COALESCE(SUM(CASE WHEN ActiveFiles.ReferenceUtc IS NULL THEN 0 ELSE ActiveFiles.SizeBytes END), 0) AS TotalBytes
+            FROM Buckets
+            LEFT JOIN ActiveFiles
+                ON ActiveFiles.ReferenceUtc IS NOT NULL
+               AND DATEDIFF(day, ActiveFiles.ReferenceUtc, SYSUTCDATETIME()) >= Buckets.MinDays
+               AND (Buckets.MaxDays IS NULL OR DATEDIFF(day, ActiveFiles.ReferenceUtc, SYSUTCDATETIME()) <= Buckets.MaxDays)
+            GROUP BY Buckets.Label, Buckets.SortOrder
+            ORDER BY Buckets.SortOrder;
+            """;
+        command.Parameters.AddWithValue("@SnapshotId", snapshot.Id);
+        command.Parameters.AddWithValue("@Top", Math.Clamp(top, 1, 100));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var governance = await ReadInventoryGovernanceAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var topFolders = await ReadTopFoldersAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var topExtensions = await ReadTopExtensionsAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var contentCategories = await ReadContentCategoriesAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var topLargeFiles = await ReadFileCandidatesAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var topInactiveFiles = await ReadFileCandidatesAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var topExecutableFiles = await ReadFileCandidatesAsync(reader, cancellationToken);
+
+        await reader.NextResultAsync(cancellationToken);
+        var ageBuckets = await ReadAgeBucketsAsync(reader, cancellationToken);
+
+        return new FileInventorySummary(
+            SnapshotId: snapshot.Id,
+            Server: snapshot.Server,
+            Share: snapshot.Share,
+            RootPath: snapshot.RootPath,
+            StartedUtc: snapshot.StartedUtc,
+            FinishedUtc: snapshot.FinishedUtc,
+            Status: snapshot.Status,
+            FileCount: snapshot.FileCount,
+            FolderCount: snapshot.FolderCount,
+            TotalBytes: snapshot.TotalBytes,
+            ErrorCount: snapshot.ErrorCount,
+            Governance: governance,
+            TopFolders: topFolders,
+            TopExtensions: topExtensions,
+            ContentCategories: contentCategories,
+            TopLargeFiles: topLargeFiles,
+            TopInactiveFiles: topInactiveFiles,
+            TopExecutableFiles: topExecutableFiles,
+            AgeBuckets: ageBuckets,
+            ObservedActivity: FileInventoryAnalyzer.BuildObservedActivitySummary(Array.Empty<FileInventoryObservedActivityInput>(), top),
+            Growth: growth,
+            Recommendations: BuildInventoryRecommendations(snapshot, governance));
+    }
+
+    private static async Task<FileInventoryGrowthSummary> BuildSqlGrowthSummaryAsync(
+        SqlConnection connection,
+        FileInventorySnapshot currentSnapshot,
+        FileInventorySnapshot previousSnapshot,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 300;
+        command.CommandText = """
+            WITH CurrentFiles AS
+            (
+                SELECT SizeBytes
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @CurrentSnapshotId
+                  AND ItemType = N'file'
+                  AND StatusName = N'active'
+            ),
+            CurrentFolders AS
+            (
+                SELECT Id
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @CurrentSnapshotId
+                  AND ItemType = N'folder'
+                  AND StatusName = N'active'
+            ),
+            PreviousFiles AS
+            (
+                SELECT SizeBytes
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @PreviousSnapshotId
+                  AND ItemType = N'file'
+                  AND StatusName = N'active'
+            ),
+            PreviousFolders AS
+            (
+                SELECT Id
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @PreviousSnapshotId
+                  AND ItemType = N'folder'
+                  AND StatusName = N'active'
+            )
+            SELECT
+                (SELECT COUNT_BIG(*) FROM CurrentFiles) - (SELECT COUNT_BIG(*) FROM PreviousFiles) AS FileCountDelta,
+                (SELECT COUNT_BIG(*) FROM CurrentFolders) - (SELECT COUNT_BIG(*) FROM PreviousFolders) AS FolderCountDelta,
+                COALESCE((SELECT SUM(SizeBytes) FROM CurrentFiles), 0) - COALESCE((SELECT SUM(SizeBytes) FROM PreviousFiles), 0) AS TotalBytesDelta;
+
+            WITH CurrentItems AS
+            (
+                SELECT
+                    CASE
+                        WHEN ItemType = N'folder' THEN FullPath
+                        WHEN CHARINDEX(N'\', REVERSE(FullPath)) > 0 THEN LEFT(FullPath, LEN(FullPath) - CHARINDEX(N'\', REVERSE(FullPath)))
+                        ELSE FullPath
+                    END AS ParentPath,
+                    ItemType,
+                    SizeBytes
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @CurrentSnapshotId
+                  AND StatusName = N'active'
+            ),
+            PreviousItems AS
+            (
+                SELECT
+                    CASE
+                        WHEN ItemType = N'folder' THEN FullPath
+                        WHEN CHARINDEX(N'\', REVERSE(FullPath)) > 0 THEN LEFT(FullPath, LEN(FullPath) - CHARINDEX(N'\', REVERSE(FullPath)))
+                        ELSE FullPath
+                    END AS ParentPath,
+                    ItemType,
+                    SizeBytes
+                FROM dbo.FileInventoryItems
+                WHERE SnapshotId = @PreviousSnapshotId
+                  AND StatusName = N'active'
+            ),
+            CurrentFoldersAgg AS
+            (
+                SELECT
+                    ParentPath,
+                    SUM(CASE WHEN ItemType = N'file' THEN 1 ELSE 0 END) AS FileCount,
+                    SUM(CASE WHEN ItemType = N'folder' THEN 1 ELSE 0 END) AS FolderCount,
+                    SUM(CASE WHEN ItemType = N'file' THEN SizeBytes ELSE 0 END) AS TotalBytes
+                FROM CurrentItems
+                GROUP BY ParentPath
+            ),
+            PreviousFoldersAgg AS
+            (
+                SELECT
+                    ParentPath,
+                    SUM(CASE WHEN ItemType = N'file' THEN 1 ELSE 0 END) AS FileCount,
+                    SUM(CASE WHEN ItemType = N'folder' THEN 1 ELSE 0 END) AS FolderCount,
+                    SUM(CASE WHEN ItemType = N'file' THEN SizeBytes ELSE 0 END) AS TotalBytes
+                FROM PreviousItems
+                GROUP BY ParentPath
+            )
+            SELECT TOP (@Top)
+                COALESCE(CurrentFoldersAgg.ParentPath, PreviousFoldersAgg.ParentPath) AS ParentPath,
+                COALESCE(CurrentFoldersAgg.FileCount, 0) - COALESCE(PreviousFoldersAgg.FileCount, 0) AS FileCountDelta,
+                COALESCE(CurrentFoldersAgg.FolderCount, 0) - COALESCE(PreviousFoldersAgg.FolderCount, 0) AS FolderCountDelta,
+                COALESCE(CurrentFoldersAgg.TotalBytes, 0) - COALESCE(PreviousFoldersAgg.TotalBytes, 0) AS TotalBytesDelta
+            FROM CurrentFoldersAgg
+            FULL OUTER JOIN PreviousFoldersAgg
+                ON CurrentFoldersAgg.ParentPath = PreviousFoldersAgg.ParentPath
+            WHERE COALESCE(CurrentFoldersAgg.FileCount, 0) - COALESCE(PreviousFoldersAgg.FileCount, 0) > 0
+               OR COALESCE(CurrentFoldersAgg.FolderCount, 0) - COALESCE(PreviousFoldersAgg.FolderCount, 0) > 0
+               OR COALESCE(CurrentFoldersAgg.TotalBytes, 0) - COALESCE(PreviousFoldersAgg.TotalBytes, 0) > 0
+            ORDER BY TotalBytesDelta DESC, FileCountDelta DESC, ParentPath ASC;
+            """;
+        command.Parameters.AddWithValue("@CurrentSnapshotId", currentSnapshot.Id);
+        command.Parameters.AddWithValue("@PreviousSnapshotId", previousSnapshot.Id);
+        command.Parameters.AddWithValue("@Top", Math.Clamp(top, 1, 100));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var fileDelta = 0L;
+        var folderDelta = 0L;
+        var bytesDelta = 0L;
+        if (await reader.ReadAsync(cancellationToken))
+        {
+            fileDelta = ReadInt64(reader, "FileCountDelta");
+            folderDelta = ReadInt64(reader, "FolderCountDelta");
+            bytesDelta = ReadInt64(reader, "TotalBytesDelta");
+        }
+
+        await reader.NextResultAsync(cancellationToken);
+        var topGrowingFolders = new List<FileInventoryFolderGrowth>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            topGrowingFolders.Add(new FileInventoryFolderGrowth(
+                Path: reader.GetString(reader.GetOrdinal("ParentPath")),
+                FileCountDelta: ReadInt64(reader, "FileCountDelta"),
+                FolderCountDelta: ReadInt64(reader, "FolderCountDelta"),
+                TotalBytesDelta: ReadInt64(reader, "TotalBytesDelta")));
+        }
+
+        return new FileInventoryGrowthSummary(fileDelta, folderDelta, bytesDelta, topGrowingFolders);
+    }
+
+    private static async Task<FileInventoryGovernanceMetrics> ReadInventoryGovernanceAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return new FileInventoryGovernanceMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        return new FileInventoryGovernanceMetrics(
+            Inactive180DaysFileCount: ReadInt64(reader, "Inactive180DaysFileCount"),
+            Inactive180DaysBytes: ReadInt64(reader, "Inactive180DaysBytes"),
+            Inactive365DaysFileCount: ReadInt64(reader, "Inactive365DaysFileCount"),
+            Inactive365DaysBytes: ReadInt64(reader, "Inactive365DaysBytes"),
+            NeverAccessedFileCount: ReadInt64(reader, "NeverAccessedFileCount"),
+            NeverAccessedBytes: ReadInt64(reader, "NeverAccessedBytes"),
+            LargeFileCount: ReadInt64(reader, "LargeFileCount"),
+            LargeFileBytes: ReadInt64(reader, "LargeFileBytes"),
+            ExecutableFileCount: ReadInt64(reader, "ExecutableFileCount"),
+            ExecutableFileBytes: ReadInt64(reader, "ExecutableFileBytes"));
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryTopFolder>> ReadTopFoldersAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryTopFolder>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new FileInventoryTopFolder(
+                Path: reader.GetString(reader.GetOrdinal("ParentPath")),
+                FileCount: ReadInt64(reader, "FileCount"),
+                FolderCount: ReadInt64(reader, "FolderCount"),
+                TotalBytes: ReadInt64(reader, "TotalBytes")));
+        }
+
+        return result;
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryTopExtension>> ReadTopExtensionsAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryTopExtension>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new FileInventoryTopExtension(
+                Extension: reader.GetString(reader.GetOrdinal("Extension")),
+                FileCount: ReadInt64(reader, "FileCount"),
+                TotalBytes: ReadInt64(reader, "TotalBytes")));
+        }
+
+        return result;
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryContentCategory>> ReadContentCategoriesAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryContentCategory>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new FileInventoryContentCategory(
+                Category: reader.GetString(reader.GetOrdinal("Category")),
+                FileCount: ReadInt64(reader, "FileCount"),
+                TotalBytes: ReadInt64(reader, "TotalBytes")));
+        }
+
+        return result;
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryFileCandidate>> ReadFileCandidatesAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryFileCandidate>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var ageOrdinal = reader.GetOrdinal("AgeDays");
+            result.Add(new FileInventoryFileCandidate(
+                Path: reader.GetString(reader.GetOrdinal("FullPath")),
+                Name: reader.GetString(reader.GetOrdinal("ItemName")),
+                Extension: ReadNullableString(reader, "Extension"),
+                SizeBytes: ReadInt64(reader, "SizeBytes"),
+                ModifiedUtc: ReadDateTimeOffset(reader, "ModifiedUtc"),
+                AccessedUtc: ReadDateTimeOffset(reader, "AccessedUtc"),
+                AgeDays: reader.IsDBNull(ageOrdinal) ? null : Convert.ToInt32(reader.GetValue(ageOrdinal))));
+        }
+
+        return result;
+    }
+
+    private static async Task<IReadOnlyCollection<FileInventoryAgeBucket>> ReadAgeBucketsAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryAgeBucket>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new FileInventoryAgeBucket(
+                Label: reader.GetString(reader.GetOrdinal("Label")),
+                FileCount: ReadInt64(reader, "FileCount"),
+                TotalBytes: ReadInt64(reader, "TotalBytes")));
+        }
+
+        return result;
+    }
+
+    private static IReadOnlyCollection<FileInventoryRecommendation> BuildInventoryRecommendations(
+        FileInventorySnapshot snapshot,
+        FileInventoryGovernanceMetrics metrics)
+    {
+        var recommendations = new List<FileInventoryRecommendation>();
+        var totalBytes = snapshot.TotalBytes;
+        var inactive365Percent = totalBytes == 0 ? 0 : metrics.Inactive365DaysBytes * 100m / totalBytes;
+        var inactive180Percent = totalBytes == 0 ? 0 : metrics.Inactive180DaysBytes * 100m / totalBytes;
+
+        if (metrics.Inactive365DaysFileCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Arquivos sem uso ha mais de 1 ano",
+                Detail: $"{metrics.Inactive365DaysFileCount:N0} arquivo(s), {FormatInventoryBytes(metrics.Inactive365DaysBytes)} ({inactive365Percent:N1}% do volume) podem entrar em politica de arquivamento.",
+                Severity: inactive365Percent >= 25 ? "warning" : "info"));
+        }
+
+        if (metrics.Inactive365DaysFileCount == 0 && metrics.Inactive180DaysFileCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Arquivos frios acima de 180 dias",
+                Detail: $"{metrics.Inactive180DaysFileCount:N0} arquivo(s), {FormatInventoryBytes(metrics.Inactive180DaysBytes)} ({inactive180Percent:N1}% do volume) merecem revisao gerencial.",
+                Severity: inactive180Percent >= 25 ? "warning" : "info"));
+        }
+
+        if (metrics.LargeFileCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Arquivos grandes concentrando espaco",
+                Detail: $"{metrics.LargeFileCount:N0} arquivo(s) acima de 1 GB somam {FormatInventoryBytes(metrics.LargeFileBytes)}.",
+                Severity: "info"));
+        }
+
+        if (metrics.ExecutableFileCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Executaveis e scripts no compartilhamento",
+                Detail: $"{metrics.ExecutableFileCount:N0} arquivo(s) executavel(is) ou script(s) somam {FormatInventoryBytes(metrics.ExecutableFileBytes)}. Revise necessidade, localizacao e permissao.",
+                Severity: "warning"));
+        }
+
+        if (snapshot.ErrorCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Itens sem leitura no scan",
+                Detail: $"{snapshot.ErrorCount:N0} item(ns) nao puderam ser lidos. Revise permissao da conta de scan ou caminhos inacessiveis.",
+                Severity: "warning"));
+        }
+
+        return recommendations
+            .OrderByDescending(item => item.Severity == "warning")
+            .ThenBy(item => item.Title, StringComparer.OrdinalIgnoreCase)
+            .Take(6)
+            .ToArray();
+    }
+
+    private static string FormatInventoryBytes(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB", "TB", "PB" };
+        var value = Math.Max(0, bytes);
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return $"{value:N0} {units[unit]}";
+    }
+
+    private static long ReadInt64(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? 0 : Convert.ToInt64(reader.GetValue(ordinal));
     }
 
     private static string BuildSnapshotsSql(SqlCommand command, string? server, string? share, int take)
@@ -3063,6 +4336,30 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             {{where}}
             ORDER BY StartedUtc DESC;
             """;
+    }
+
+    private static string NormalizeInventoryItemKind(string? kind)
+    {
+        var normalized = string.IsNullOrWhiteSpace(kind) ? "all" : kind.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "large" or "grandes" => "large",
+            "inactive365" or "inactive" or "inativos" => "inactive365",
+            "executable" or "executables" or "scripts" or "executaveis" => "executable",
+            "errors" or "erros" => "errors",
+            _ => "all"
+        };
+    }
+
+    private static string? NormalizeInventoryExtension(string? extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return null;
+        }
+
+        var normalized = extension.Trim().ToLowerInvariant();
+        return normalized.StartsWith('.') ? normalized : $".{normalized}";
     }
 
     private static void AddItemParameters(SqlCommand command, FileInventoryItem item)
@@ -3446,7 +4743,7 @@ internal sealed class SqlServerEventRepository : IEventRepository
 
         if (!string.IsNullOrWhiteSpace(query.Path))
         {
-            predicates.Add("FullPath LIKE @Path");
+            predicates.Add("(FullPath LIKE @Path OR PreviousPath LIKE @Path)");
             command.Parameters.AddWithValue("@Path", $"%{query.Path}%");
         }
 
@@ -3944,6 +5241,35 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
             ByUser: SummarizeTimeline(events, item => item.User, query.Take)));
     }
 
+    public Task<FileInventoryObservedActivitySummary> GetObservedActivitySummaryAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        int top,
+        CancellationToken cancellationToken)
+    {
+        var normalizedRoot = string.IsNullOrWhiteSpace(rootPath)
+            ? null
+            : FileInventoryNormalizer.NormalizePath(rootPath);
+        var events = _events.Values
+            .Where(item => item.TimestampUtc >= fromUtc && item.TimestampUtc <= toUtc)
+            .Where(item => MatchesText(item.Server, server))
+            .Where(item => MatchesText(item.Share, share))
+            .Where(item => normalizedRoot is null
+                || item.Path.Equals(normalizedRoot, StringComparison.OrdinalIgnoreCase)
+                || item.Path.StartsWith($"{normalizedRoot}\\", StringComparison.OrdinalIgnoreCase))
+            .Select(item => new FileInventoryObservedActivityInput(
+                item.TimestampUtc,
+                item.Path,
+                item.User,
+                item.DisplayAction))
+            .ToArray();
+
+        return Task.FromResult(FileInventoryAnalyzer.BuildObservedActivitySummary(events, top));
+    }
+
     public Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(
         BaselineAnomalyQuery query,
         CancellationToken cancellationToken)
@@ -4176,8 +5502,84 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
         var items = _items.TryGetValue(snapshot.Id, out var bucket)
             ? bucket.Values.ToArray()
             : Array.Empty<FileInventoryItem>();
+        var previousSnapshot = _snapshots.Values
+            .Where(item => item.Status is "completed" or "completed_with_errors")
+            .Where(item => item.Server.Equals(snapshot.Server, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.Share.Equals(snapshot.Share, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.RootPath.Equals(snapshot.RootPath, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.StartedUtc < snapshot.StartedUtc)
+            .OrderByDescending(item => item.StartedUtc)
+            .FirstOrDefault();
+        var previousItems = previousSnapshot is not null && _items.TryGetValue(previousSnapshot.Id, out var previousBucket)
+            ? previousBucket.Values.ToArray()
+            : Array.Empty<FileInventoryItem>();
+        var growth = previousSnapshot is null
+            ? FileInventoryAnalyzer.BuildEmptyGrowthSummary()
+            : FileInventoryAnalyzer.BuildGrowthSummary(items, previousItems, top);
 
-        return Task.FromResult(FileInventoryAnalyzer.BuildSummary(snapshot, items, top));
+        return Task.FromResult(FileInventoryAnalyzer.BuildSummary(snapshot, items, top) with { Growth = growth });
+    }
+
+    public Task<IReadOnlyCollection<FileInventoryItem>> QueryLatestItemsAsync(
+        string? server,
+        string? share,
+        string? rootPath,
+        string? kind,
+        string? path,
+        string? extension,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = _snapshots.Values
+            .Where(item => item.Status is "completed" or "completed_with_errors")
+            .Where(item => MatchesText(item.Server, server))
+            .Where(item => MatchesText(item.Share, share))
+            .Where(item => MatchesText(item.RootPath, rootPath))
+            .OrderByDescending(item => item.StartedUtc)
+            .FirstOrDefault();
+        if (snapshot is null || !_items.TryGetValue(snapshot.Id, out var bucket))
+        {
+            return Task.FromResult<IReadOnlyCollection<FileInventoryItem>>(Array.Empty<FileInventoryItem>());
+        }
+
+        var normalizedKind = NormalizeInventoryItemKind(kind);
+        var normalizedExtension = NormalizeInventoryExtension(extension);
+        IEnumerable<FileInventoryItem> query = bucket.Values;
+
+        query = normalizedKind switch
+        {
+            "large" => query
+                .Where(item => item.ItemType == "file" && item.Status == "active" && item.SizeBytes >= 1024L * 1024L * 1024L)
+                .OrderByDescending(item => item.SizeBytes)
+                .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
+            "inactive365" => query
+                .Where(item => item.ItemType == "file" && item.Status == "active" && IsInactiveForDays(item, 365))
+                .OrderBy(item => item.AccessedUtc ?? item.ModifiedUtc ?? item.CreatedUtc)
+                .ThenByDescending(item => item.SizeBytes)
+                .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
+            "executable" => query
+                .Where(item => item.ItemType == "file" && item.Status == "active" && IsExecutableOrScriptExtension(item.Extension))
+                .OrderByDescending(item => item.SizeBytes)
+                .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
+            "errors" => query
+                .Where(item => item.Status != "active" || !string.IsNullOrWhiteSpace(item.Error))
+                .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
+            _ => query
+                .Where(item => item.Status == "active")
+                .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+        };
+
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            query = query.Where(item => item.Path.Contains(path.Trim(), StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (!string.IsNullOrWhiteSpace(normalizedExtension))
+        {
+            query = query.Where(item => string.Equals(item.Extension, normalizedExtension, StringComparison.OrdinalIgnoreCase));
+        }
+
+        return Task.FromResult<IReadOnlyCollection<FileInventoryItem>>(query.Take(Math.Clamp(take, 1, 500)).ToArray());
     }
 
     public Task<IReadOnlyCollection<FileInventorySnapshot>> GetSnapshotsAsync(
@@ -4200,6 +5602,41 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
     {
         return string.IsNullOrWhiteSpace(filter)
             || value.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeInventoryItemKind(string? kind)
+    {
+        var normalized = string.IsNullOrWhiteSpace(kind) ? "all" : kind.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "large" or "grandes" => "large",
+            "inactive365" or "inactive" or "inativos" => "inactive365",
+            "executable" or "executables" or "scripts" or "executaveis" => "executable",
+            "errors" or "erros" => "errors",
+            _ => "all"
+        };
+    }
+
+    private static string? NormalizeInventoryExtension(string? extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return null;
+        }
+
+        var normalized = extension.Trim().ToLowerInvariant();
+        return normalized.StartsWith('.') ? normalized : $".{normalized}";
+    }
+
+    private static bool IsInactiveForDays(FileInventoryItem item, int days)
+    {
+        var reference = item.AccessedUtc ?? item.ModifiedUtc ?? item.CreatedUtc;
+        return reference is not null && reference.Value <= DateTimeOffset.UtcNow.AddDays(-days);
+    }
+
+    private static bool IsExecutableOrScriptExtension(string? extension)
+    {
+        return extension is ".exe" or ".msi" or ".dll" or ".ps1" or ".bat" or ".cmd" or ".vbs" or ".js" or ".jar" or ".scr" or ".com";
     }
 }
 
@@ -4265,7 +5702,9 @@ internal sealed class InMemoryEventRepository : IEventRepository
 
         if (!string.IsNullOrWhiteSpace(query.Path))
         {
-            events = events.Where(item => item.Path.Contains(query.Path, StringComparison.OrdinalIgnoreCase));
+            events = events.Where(item =>
+                item.Path.Contains(query.Path, StringComparison.OrdinalIgnoreCase)
+                || (item.PreviousPath?.Contains(query.Path, StringComparison.OrdinalIgnoreCase) ?? false));
         }
 
         if (!string.IsNullOrWhiteSpace(query.SourceHost))
@@ -4778,8 +6217,16 @@ internal sealed class AgentHealthStore
         command.Parameters.AddWithValue("@LastCycleCorrelatedEvents", DbValue(heartbeat.LastCycle?.CorrelatedEvents));
         command.Parameters.AddWithValue("@LastCycleSentEvents", DbValue(heartbeat.LastCycle?.SentEvents));
         command.Parameters.AddWithValue("@LastCycleQueuedEvents", DbValue(heartbeat.LastCycle?.QueuedEvents));
-        command.Parameters.AddWithValue("@LastCycleError", DbValue(heartbeat.LastCycle?.Error));
-        command.Parameters.AddWithValue("@Message", DbValue(heartbeat.Message));
+        command.Parameters.AddWithValue("@LastCycleError", DbValue(TruncateHeartbeatText(heartbeat.LastCycle?.Error)));
+        command.Parameters.AddWithValue("@Message", DbValue(TruncateHeartbeatText(heartbeat.Message)));
+    }
+
+    private static string? TruncateHeartbeatText(string? value)
+    {
+        const int maximumLength = 1024;
+        return string.IsNullOrEmpty(value) || value.Length <= maximumLength
+            ? value
+            : value[..maximumLength];
     }
 
     private static AgentHealthResponse ReadHeartbeat(SqlDataReader reader)
@@ -7294,6 +8741,286 @@ internal sealed class RetentionSettingsStore
 #endif
 }
 
+internal sealed class InventoryScanSettingsStore
+{
+    private InventoryScanOptions _settings;
+#if SQLSERVER
+    private readonly bool _persistSettings;
+    private readonly string? _connectionString;
+#endif
+
+    public InventoryScanSettingsStore(IConfiguration configuration)
+    {
+#if SQLSERVER
+        _persistSettings = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+
+        _settings = Normalize(new InventoryScanSettingsRequest(
+            Enabled: configuration.GetValue("InventoryScan:Enabled", false),
+            IntervalHours: configuration.GetValue<int?>("InventoryScan:IntervalHours"),
+            BatchSize: configuration.GetValue<int?>("InventoryScan:BatchSize"),
+            MaxItemsPerScan: configuration.GetValue<int?>("InventoryScan:MaxItemsPerScan"),
+            IncludeLastAccessTime: configuration.GetValue("InventoryScan:IncludeLastAccessTime", true),
+            WindowStartLocal: configuration.GetValue<string>("InventoryScan:WindowStartLocal"),
+            WindowEndLocal: configuration.GetValue<string>("InventoryScan:WindowEndLocal"),
+            RootPath: configuration.GetValue<string>("InventoryScan:RootPath"),
+            Server: configuration.GetValue<string>("InventoryScan:Server"),
+            Share: configuration.GetValue<string>("InventoryScan:Share"),
+            RunRequestedUtc: null));
+    }
+
+    public async Task<InventoryScanOptions> GetAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            var persisted = await ReadSqlAsync(cancellationToken);
+            if (persisted is not null)
+            {
+                _settings = persisted;
+            }
+        }
+#endif
+
+        return _settings;
+    }
+
+    public async Task<InventoryScanOptions> SaveAsync(InventoryScanSettingsRequest request, CancellationToken cancellationToken)
+    {
+        var settings = Normalize(request);
+        _settings = settings;
+
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            await UpsertSqlAsync(settings, cancellationToken);
+        }
+#endif
+
+        return settings;
+    }
+
+    public async Task<InventoryScanOptions> RequestRunNowAsync(CancellationToken cancellationToken)
+    {
+        var current = await GetAsync(cancellationToken);
+        var settings = current with
+        {
+            Enabled = true,
+            RunRequestedUtc = DateTimeOffset.UtcNow,
+            UpdatedUtc = DateTimeOffset.UtcNow
+        };
+        _settings = settings;
+
+#if SQLSERVER
+        if (_persistSettings)
+        {
+            await UpsertSqlAsync(settings, cancellationToken);
+        }
+#endif
+
+        return settings;
+    }
+
+    private static InventoryScanOptions Normalize(InventoryScanSettingsRequest request)
+    {
+        var rootPath = string.IsNullOrWhiteSpace(request.RootPath)
+            ? @"C:\Corporativo"
+            : request.RootPath.Trim().Replace('/', '\\').TrimEnd('\\');
+
+        return new InventoryScanOptions(
+            Enabled: request.Enabled,
+            IntervalHours: Math.Clamp(request.IntervalHours ?? 24, 1, 168),
+            BatchSize: Math.Clamp(request.BatchSize ?? 1000, 100, 2000),
+            MaxItemsPerScan: Math.Clamp(request.MaxItemsPerScan ?? 0, 0, 10_000_000),
+            IncludeLastAccessTime: request.IncludeLastAccessTime,
+            WindowStartLocal: request.WindowStartLocal?.Trim() ?? string.Empty,
+            WindowEndLocal: request.WindowEndLocal?.Trim() ?? string.Empty,
+            RootPath: rootPath,
+            Server: string.IsNullOrWhiteSpace(request.Server) ? "FileServer" : request.Server.Trim(),
+            Share: string.IsNullOrWhiteSpace(request.Share) ? "Corporativo" : request.Share.Trim(),
+            RunRequestedUtc: request.RunRequestedUtc,
+            UpdatedUtc: DateTimeOffset.UtcNow);
+    }
+
+#if SQLSERVER
+    private async Task<InventoryScanOptions?> ReadSqlAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1)
+                Enabled,
+                IntervalHours,
+                BatchSize,
+                MaxItemsPerScan,
+                IncludeLastAccessTime,
+                WindowStartLocal,
+                WindowEndLocal,
+                RootPath,
+                ServerName,
+                ShareName,
+                UpdatedUtc,
+                RunRequestedUtc
+            FROM dbo.InventoryScanSettings
+            WHERE Id = 1;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadSettings(reader) : null;
+    }
+
+    private async Task UpsertSqlAsync(InventoryScanOptions settings, CancellationToken cancellationToken)
+    {
+        await using var connection = CreateSqlConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSqlSchemaAsync(connection, cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            MERGE dbo.InventoryScanSettings AS target
+            USING (SELECT 1 AS Id) AS source
+                ON target.Id = source.Id
+            WHEN MATCHED THEN
+                UPDATE SET
+                    Enabled = @Enabled,
+                    IntervalHours = @IntervalHours,
+                    BatchSize = @BatchSize,
+                    MaxItemsPerScan = @MaxItemsPerScan,
+                    IncludeLastAccessTime = @IncludeLastAccessTime,
+                    WindowStartLocal = @WindowStartLocal,
+                    WindowEndLocal = @WindowEndLocal,
+                    RootPath = @RootPath,
+                    ServerName = @ServerName,
+                    ShareName = @ShareName,
+                    UpdatedUtc = @UpdatedUtc,
+                    RunRequestedUtc = @RunRequestedUtc
+            WHEN NOT MATCHED THEN
+                INSERT
+                (
+                    Id,
+                    Enabled,
+                    IntervalHours,
+                    BatchSize,
+                    MaxItemsPerScan,
+                    IncludeLastAccessTime,
+                    WindowStartLocal,
+                    WindowEndLocal,
+                    RootPath,
+                    ServerName,
+                    ShareName,
+                    UpdatedUtc,
+                    RunRequestedUtc
+                )
+                VALUES
+                (
+                    1,
+                    @Enabled,
+                    @IntervalHours,
+                    @BatchSize,
+                    @MaxItemsPerScan,
+                    @IncludeLastAccessTime,
+                    @WindowStartLocal,
+                    @WindowEndLocal,
+                    @RootPath,
+                    @ServerName,
+                    @ShareName,
+                    @UpdatedUtc,
+                    @RunRequestedUtc
+                );
+            """;
+        AddParameters(command, settings);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task EnsureSqlSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.InventoryScanSettings', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.InventoryScanSettings
+                (
+                    Id INT NOT NULL CONSTRAINT PK_InventoryScanSettings PRIMARY KEY,
+                    Enabled BIT NOT NULL,
+                    IntervalHours INT NOT NULL,
+                    BatchSize INT NOT NULL,
+                    MaxItemsPerScan INT NOT NULL,
+                    IncludeLastAccessTime BIT NOT NULL,
+                    WindowStartLocal NVARCHAR(16) NOT NULL,
+                    WindowEndLocal NVARCHAR(16) NOT NULL,
+                    RootPath NVARCHAR(1024) NOT NULL,
+                    ServerName NVARCHAR(128) NOT NULL,
+                    ShareName NVARCHAR(128) NOT NULL,
+                    UpdatedUtc DATETIME2(3) NOT NULL,
+                    RunRequestedUtc DATETIME2(3) NULL
+                );
+            END;
+            ELSE IF COL_LENGTH(N'dbo.InventoryScanSettings', N'RunRequestedUtc') IS NULL
+            BEGIN
+                ALTER TABLE dbo.InventoryScanSettings ADD RunRequestedUtc DATETIME2(3) NULL;
+            END;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private SqlConnection CreateSqlConnection()
+    {
+        if (string.IsNullOrWhiteSpace(_connectionString))
+        {
+            throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+        }
+
+        return new SqlConnection(_connectionString);
+    }
+
+    private static void AddParameters(SqlCommand command, InventoryScanOptions settings)
+    {
+        command.Parameters.AddWithValue("@Enabled", settings.Enabled);
+        command.Parameters.AddWithValue("@IntervalHours", settings.IntervalHours);
+        command.Parameters.AddWithValue("@BatchSize", settings.BatchSize);
+        command.Parameters.AddWithValue("@MaxItemsPerScan", settings.MaxItemsPerScan);
+        command.Parameters.AddWithValue("@IncludeLastAccessTime", settings.IncludeLastAccessTime);
+        command.Parameters.AddWithValue("@WindowStartLocal", settings.WindowStartLocal);
+        command.Parameters.AddWithValue("@WindowEndLocal", settings.WindowEndLocal);
+        command.Parameters.AddWithValue("@RootPath", settings.RootPath);
+        command.Parameters.AddWithValue("@ServerName", settings.Server);
+        command.Parameters.AddWithValue("@ShareName", settings.Share);
+        command.Parameters.AddWithValue("@UpdatedUtc", settings.UpdatedUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@RunRequestedUtc", settings.RunRequestedUtc?.UtcDateTime ?? (object)DBNull.Value);
+    }
+
+    private static InventoryScanOptions ReadSettings(SqlDataReader reader)
+    {
+        return new InventoryScanOptions(
+            Enabled: reader.GetBoolean(reader.GetOrdinal("Enabled")),
+            IntervalHours: reader.GetInt32(reader.GetOrdinal("IntervalHours")),
+            BatchSize: reader.GetInt32(reader.GetOrdinal("BatchSize")),
+            MaxItemsPerScan: reader.GetInt32(reader.GetOrdinal("MaxItemsPerScan")),
+            IncludeLastAccessTime: reader.GetBoolean(reader.GetOrdinal("IncludeLastAccessTime")),
+            WindowStartLocal: reader.GetString(reader.GetOrdinal("WindowStartLocal")),
+            WindowEndLocal: reader.GetString(reader.GetOrdinal("WindowEndLocal")),
+            RootPath: reader.GetString(reader.GetOrdinal("RootPath")),
+            Server: reader.GetString(reader.GetOrdinal("ServerName")),
+            Share: reader.GetString(reader.GetOrdinal("ShareName")),
+            RunRequestedUtc: ReadNullableDateTimeOffset(reader, "RunRequestedUtc"),
+            UpdatedUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("UpdatedUtc")), DateTimeKind.Utc)));
+    }
+
+    private static DateTimeOffset? ReadNullableDateTimeOffset(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal)
+            ? null
+            : new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(ordinal), DateTimeKind.Utc));
+    }
+#endif
+}
+
 internal sealed class RetentionWorker : BackgroundService
 {
     private readonly IEventRepository _events;
@@ -8224,6 +9951,16 @@ internal static class AuthHelpers
             return AuthRole.Admin;
         }
 
+        if (request.Path.StartsWithSegments("/api/inventory/config") && !HttpMethods.IsGet(request.Method))
+        {
+            return AuthRole.Admin;
+        }
+
+        if (request.Path.StartsWithSegments("/api/inventory/scan-now"))
+        {
+            return AuthRole.Admin;
+        }
+
         if (request.Path.StartsWithSegments("/api/alerts") && HttpMethods.IsPost(request.Method))
         {
             return AuthRole.Operator;
@@ -8345,6 +10082,65 @@ internal sealed record RetentionSettingsResponse(
             settings.IntervalHours,
             settings.PurgeBatchSize,
             settings.UpdatedUtc);
+    }
+}
+
+internal sealed record InventoryScanOptions(
+    bool Enabled,
+    int IntervalHours,
+    int BatchSize,
+    int MaxItemsPerScan,
+    bool IncludeLastAccessTime,
+    string WindowStartLocal,
+    string WindowEndLocal,
+    string RootPath,
+    string Server,
+    string Share,
+    DateTimeOffset? RunRequestedUtc,
+    DateTimeOffset UpdatedUtc);
+
+internal sealed record InventoryScanSettingsRequest(
+    bool Enabled,
+    int? IntervalHours,
+    int? BatchSize,
+    int? MaxItemsPerScan,
+    bool IncludeLastAccessTime,
+    string? WindowStartLocal,
+    string? WindowEndLocal,
+    string? RootPath,
+    string? Server,
+    string? Share,
+    DateTimeOffset? RunRequestedUtc);
+
+internal sealed record InventoryScanSettingsResponse(
+    bool Enabled,
+    int IntervalHours,
+    int BatchSize,
+    int MaxItemsPerScan,
+    bool IncludeLastAccessTime,
+    string WindowStartLocal,
+    string WindowEndLocal,
+    string RootPath,
+    string Server,
+    string Share,
+    DateTimeOffset UpdatedUtc,
+    DateTimeOffset? RunRequestedUtc)
+{
+    public static InventoryScanSettingsResponse FromSettings(InventoryScanOptions settings)
+    {
+        return new InventoryScanSettingsResponse(
+            settings.Enabled,
+            settings.IntervalHours,
+            settings.BatchSize,
+            settings.MaxItemsPerScan,
+            settings.IncludeLastAccessTime,
+            settings.WindowStartLocal,
+            settings.WindowEndLocal,
+            settings.RootPath,
+            settings.Server,
+            settings.Share,
+            settings.UpdatedUtc,
+            settings.RunRequestedUtc);
     }
 }
 
@@ -8987,6 +10783,7 @@ internal sealed record MetricsResponse(
     ApiMetrics Api,
     DatabaseMetrics Database,
     DatabaseCapacityMetrics Capacity,
+    InventoryMetrics Inventory,
     AgentMetricsSummary Agents,
     RetentionMetrics Retention,
     MetricsThresholds Thresholds);
@@ -9050,6 +10847,28 @@ internal sealed record DatabaseCapacityDailyCount(
     string Date,
     string Series,
     long Count);
+
+internal sealed record InventoryMetrics(
+    string Status,
+    Guid? LastSnapshotId,
+    string? LastSnapshotStatus,
+    DateTimeOffset? LastScanStartedUtc,
+    DateTimeOffset? LastScanFinishedUtc,
+    long? LastScanAgeSeconds,
+    long FileCount,
+    long FolderCount,
+    long TotalBytes,
+    long ErrorCount,
+    long Inactive365DaysFileCount,
+    long Inactive365DaysBytes,
+    long LargeFileCount,
+    long LargeFileBytes,
+    long ExecutableFileCount,
+    long ExecutableFileBytes,
+    string? Server,
+    string? Share,
+    string? RootPath,
+    string? Error);
 
 internal sealed record AgentMetricsSummary(
     string Status,
@@ -9169,7 +10988,8 @@ internal sealed record AgentConfigResponse(
     DateTimeOffset GeneratedUtc,
     string DefaultShare,
     string[] UsnVolumes,
-    IReadOnlyCollection<MonitoredPath> MonitoredPaths);
+    IReadOnlyCollection<MonitoredPath> MonitoredPaths,
+    InventoryScanSettingsResponse InventoryScan);
 
 internal sealed record AdminAuditEntry(
     Guid Id,

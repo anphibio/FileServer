@@ -19,6 +19,7 @@ $json = & $scriptPath `
 
 $events = $json | ConvertFrom-Json
 $deletedPaths = @($events | Where-Object action -eq "deleted" | ForEach-Object path)
+$checkpoint = @($events | Where-Object cursorType -eq "usn_checkpoint")
 
 if ($deletedPaths -notcontains "C:\Corporativo\target-folder\target-file.txt") {
     throw "Expected deleted file event after unhydratable USN gap."
@@ -26,6 +27,10 @@ if ($deletedPaths -notcontains "C:\Corporativo\target-folder\target-file.txt") {
 
 if ($deletedPaths -notcontains "C:\Corporativo\target-folder") {
     throw "Expected deleted folder event after unhydratable USN gap."
+}
+
+if ($checkpoint.Count -ne 1 -or [long]$checkpoint[0].usn -ne 1048) {
+    throw "Expected a single USN checkpoint at the last processed record."
 }
 
 Write-Output "OK USN collector skips unhydratable gap and emits later monitored deletes."

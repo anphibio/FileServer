@@ -15,13 +15,19 @@ $ErrorActionPreference = "Stop"
 
 $agentExe = Join-Path $AgentDirectory "FileServerMonitor.Agent.exe"
 $configPath = Join-Path $AgentDirectory "appsettings.agent.json"
+$templatePath = Join-Path $AgentDirectory "appsettings.agent.template.json"
 
 if (-not (Test-Path -LiteralPath $agentExe)) {
     throw "Executavel do agente nao encontrado em '$agentExe'."
 }
 
 if (-not (Test-Path -LiteralPath $configPath)) {
-    throw "Configuracao do agente nao encontrada em '$configPath'."
+    if (Test-Path -LiteralPath $templatePath) {
+        Copy-Item -LiteralPath $templatePath -Destination $configPath
+        Write-Warning "Configuracao inicial criada em '$configPath' a partir do template. Revise API, chave, servidor e caminhos antes de iniciar em producao."
+    } else {
+        throw "Configuracao do agente nao encontrada em '$configPath'."
+    }
 }
 
 $binaryPath = "`"$agentExe`" `"$configPath`""

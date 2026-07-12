@@ -83,13 +83,29 @@ public static class FileAuditEventNormalizer
     {
         var cleanExtension = Clean(extension);
 
-        if (!string.IsNullOrWhiteSpace(cleanExtension))
+        if (cleanExtension is not null && IsValidExtension(cleanExtension))
         {
             return cleanExtension.StartsWith('.') ? cleanExtension.ToLowerInvariant() : $".{cleanExtension.ToLowerInvariant()}";
         }
 
         var pathExtension = System.IO.Path.GetExtension(path);
 
-        return string.IsNullOrWhiteSpace(pathExtension) ? null : pathExtension.ToLowerInvariant();
+        return IsValidExtension(pathExtension) ? pathExtension.ToLowerInvariant() : null;
+    }
+
+    private static bool IsValidExtension(string? extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            return false;
+        }
+
+        var value = extension.Trim();
+        var normalizedLength = value.StartsWith('.') ? value.Length : value.Length + 1;
+
+        return normalizedLength is > 1 and <= 32
+            && !value.Contains('\\')
+            && !value.Contains('/')
+            && !value.Any(char.IsWhiteSpace);
     }
 }

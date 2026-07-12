@@ -530,8 +530,28 @@ public sealed class EventCorrelator
             .Where(item => item.TimeDistance <= _correlationWindow)
             .Where(item => item.PathScore > 0)
             .OrderByDescending(item => item.PathScore)
+            .ThenBy(item => GetSecurityEvidencePriority(usnEvent, item.Event))
             .ThenBy(item => item.TimeDistance)
             .Select(item => item.Event);
+    }
+
+    private static int GetSecurityEvidencePriority(CollectedFileEvent usnEvent, CollectedFileEvent securityEvent)
+    {
+        var isUsnWrite = usnEvent.Action.Equals("changed", StringComparison.OrdinalIgnoreCase)
+            || usnEvent.Action.Equals("modified", StringComparison.OrdinalIgnoreCase);
+
+        if (!isUsnWrite)
+        {
+            return 0;
+        }
+
+        return securityEvent.Action switch
+        {
+            "modified" => 0,
+            "created_or_appended" => 1,
+            "accessed" => 2,
+            _ => 3
+        };
     }
 
     private static bool ShouldSuppressSecurityMatch(CollectedFileEvent usnEvent, CollectedFileEvent securityEvent)

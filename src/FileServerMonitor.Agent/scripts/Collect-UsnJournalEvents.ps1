@@ -17,7 +17,9 @@ param(
 
     [string]$KnownPathByFileIdJson,
 
-    [string]$KnownPathByFileIdJsonPath
+    [string]$KnownPathByFileIdJsonPath,
+
+    [int]$TailWaitSeconds = 8
 )
 
 Set-StrictMode -Version Latest
@@ -260,11 +262,64 @@ function Is-MoveTransition {
 function Normalize-Volume {
     param([string]$Value)
 
-    if ($Value.EndsWith("\")) {
-        return $Value.TrimEnd("\")
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    if ($Value.EndsWith('\')) {
+        return $Value.TrimEnd('\')
     }
 
     return $Value
+}
+
+function Invoke-FsutilTailCapture {
+    param(
+        [string]$VolumePath,
+        [int]$WaitSeconds
+    )
+
+    $tempDirectory = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "FileServerMonitor"
+    [System.IO.Directory]::CreateDirectory($tempDirectory) | Out-Null
+
+    $outputPath = Join-Path $tempDirectory ("usn-tail-out-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    $errorPath = Join-Path $tempDirectory ("usn-tail-err-" + [Guid]::NewGuid().ToString("N") + ".txt")
+
+    try {
+        $process = Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c fsutil usn readJournal $VolumePath wait tail csv" `
+            -RedirectStandardOutput $outputPath `
+            -RedirectStandardError $errorPath `
+            -PassThru `
+            -WindowStyle Hidden
+
+        Start-Sleep -Seconds ([Math]::Max(1, $WaitSeconds))
+
+        if (-not $process.HasExited) {
+            & taskkill /PID $process.Id /T /F | Out-Null
+            $null = $process.WaitForExit(5000)
+        }
+
+        $outputLines = if (Test-Path -LiteralPath $outputPath) {
+            Get-Content -LiteralPath $outputPath
+        } else {
+            @()
+        }
+
+        $errorLines = if (Test-Path -LiteralPath $errorPath) {
+            Get-Content -LiteralPath $errorPath
+        } else {
+            @()
+        }
+
+        return @{
+            Output = @($outputLines)
+            Error = @($errorLines)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $outputPath, $errorPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $normalizedVolume = Normalize-Volume -Value $Volume
@@ -274,16 +329,32 @@ $normalizedBasePath = if ([string]::IsNullOrWhiteSpace($BasePath)) {
     Normalize-Volume -Value $BasePath
 }
 
+$scanLimit = [Math]::Max($MaxEvents * 25, 5000)
+
 $raw = if ([string]::IsNullOrWhiteSpace($RawCsvPath)) {
     # fsutil usn readjournal e suportado no Windows Server 2022. A opcao csv existe em builds modernos
     # e facilita uma coleta inicial sem P/Invoke. Uma etapa posterior pode substituir isso por leitura nativa.
-    $arguments = @("usn", "readjournal", $normalizedVolume, "startusn=$StartUsn", "csv")
-    & fsutil @arguments 2>&1
+    $arguments = @("usn", "readjournal", $normalizedVolume, "startUsn=$StartUsn", "csv")
+    # Stop reading after one bounded work unit. Without this limit PowerShell buffers
+    # the entire journal tail before parsing, which can stall a busy volume for minutes.
+    $incremental = @(& fsutil @arguments 2>&1 | Select-Object -First ($scanLimit + 1))
+
+    $hasIncrementalError87 = @($incremental | Where-Object { [string]$_ -match 'Error 87: The parameter is incorrect\.' }).Count -gt 0
+    $hasIncrementalCsvHeader = @($incremental | Where-Object { [string]$_ -match '^\s*(Usn|USN),' } | Select-Object -First 1).Count -gt 0
+
+    if ($StartUsn -gt 0 -and $hasIncrementalError87 -and -not $hasIncrementalCsvHeader) {
+        $tailCapture = Invoke-FsutilTailCapture -VolumePath $normalizedVolume -WaitSeconds $TailWaitSeconds
+        @($tailCapture.Output | Select-Object -First ($scanLimit + 32))
+    } else {
+        $incremental
+    }
 } else {
     Get-Content -Path $RawCsvPath
 }
 
-if ([string]::IsNullOrWhiteSpace($RawCsvPath) -and $LASTEXITCODE -ne 0) {
+$hasCsvHeader = @($raw | Where-Object { [string]$_ -match '^\s*(Usn|USN),' } | Select-Object -First 1).Count -gt 0
+
+if ([string]::IsNullOrWhiteSpace($RawCsvPath) -and $LASTEXITCODE -ne 0 -and -not $hasCsvHeader) {
     throw "fsutil usn readjournal falhou para o volume '$normalizedVolume': $raw"
 }
 
@@ -369,7 +440,6 @@ $parsedRecords = foreach ($record in $records) {
     }
 }
 
-$scanLimit = [Math]::Max($MaxEvents * 250, 5000)
 $selectedRecords = @(
     $parsedRecords |
         Sort-Object { [long]$_.usn } |
@@ -489,6 +559,37 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
 }
 
 $result = @($hydratedRecords | Select-Object -First $MaxEvents)
+$lastProcessedUsn = if ($result.Count -gt 0) {
+    @($result | Measure-Object -Property usn -Maximum).Maximum
+} else {
+    @($selectedRecords | Measure-Object -Property usn -Maximum).Maximum
+}
+
+if ($null -ne $lastProcessedUsn) {
+    $result += [pscustomobject]@{
+        cursorType = "usn_checkpoint"
+        usn = [long]$lastProcessedUsn
+        volume = $normalizedVolume
+        timestampUtc = [DateTimeOffset]::UtcNow.ToString("o")
+        server = $ServerName
+        share = $DefaultShare
+        path = $normalizedBasePath
+        previousPath = $null
+        objectType = "internal"
+        action = "checkpoint"
+        user = "SYSTEM"
+        sid = $null
+        sourceHost = $null
+        sourceIp = $null
+        processName = "fsutil.exe"
+        fileSizeBytes = $null
+        extension = $null
+        fileReferenceId = $null
+        result = "success"
+        severity = "info"
+        source = "usn-journal"
+    }
+}
 
 if ($result.Count -eq 0) {
     Write-Output "[]"

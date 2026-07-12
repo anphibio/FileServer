@@ -1053,6 +1053,12 @@ function isRedundantDisplayAccessedEcho(event: DisplayEvent, allEvents: DisplayE
         && eventTime - candidateTime <= 15_000;
     }
 
+    if (candidate.action === "permission_changed") {
+      return pathsReferToSameItem(candidate.path, event.path)
+        && normalizeUser(candidate.user) === normalizeUser(event.user)
+        && Math.abs(candidateTime - eventTime) <= 5_000;
+    }
+
     if (candidate.action !== "created"
       && candidate.action !== "created_or_appended"
       && candidate.action !== "renamed"

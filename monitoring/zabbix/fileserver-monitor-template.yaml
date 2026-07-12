@@ -22,6 +22,9 @@ zabbix_export:
         - macro: '{$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}'
           value: '51200'
           description: 'Espaco reservado maximo esperado para as tabelas principais, em MB.'
+        - macro: '{$FILESERVER_MONITOR_INVENTORY_MAX_AGE}'
+          value: '90000'
+          description: 'Tempo maximo sem scan de inventario concluido, em segundos.'
       items:
         - uuid: 0d0fdcc35bd047e592adcb65fd1c39e8
           name: 'FileServer Monitor: metrics raw'
@@ -527,6 +530,267 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: 8f13a8e724054a659af8415f4b833ef5
+          name: 'FileServer Monitor: inventory status'
+          type: DEPENDENT
+          key: fileserver.inventory.status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.status
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 6ac496fc32d14b28a872c889c11f87ed
+          name: 'FileServer Monitor: inventory last snapshot status'
+          type: DEPENDENT
+          key: fileserver.inventory.last_snapshot_status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.lastSnapshotStatus
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "empty" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 04fa2ace9e354ec185c0521ee3bd73e9
+          name: 'FileServer Monitor: inventory last scan age'
+          type: DEPENDENT
+          key: fileserver.inventory.last_scan_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.lastScanAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 5f1d36a79732412098058041d93a3bfd
+          name: 'FileServer Monitor: inventory files'
+          type: DEPENDENT
+          key: fileserver.inventory.files
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.fileCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 604b086728ce4166b1890abbc02c6a11
+          name: 'FileServer Monitor: inventory folders'
+          type: DEPENDENT
+          key: fileserver.inventory.folders
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.folderCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 2bd3bbd1e8a04a3690526632a5ce403e
+          name: 'FileServer Monitor: inventory total bytes'
+          type: DEPENDENT
+          key: fileserver.inventory.total_bytes
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: B
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.totalBytes
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 1a371f3b93c84af691fa86d94adc2b5a
+          name: 'FileServer Monitor: inventory errors'
+          type: DEPENDENT
+          key: fileserver.inventory.errors
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.errorCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: eea14b026b3e4b868d4b3dc4a970b13e
+          name: 'FileServer Monitor: inventory inactive files +365d'
+          type: DEPENDENT
+          key: fileserver.inventory.inactive_365_files
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.inactive365DaysFileCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 3a84990685e8405b895931710a829598
+          name: 'FileServer Monitor: inventory inactive bytes +365d'
+          type: DEPENDENT
+          key: fileserver.inventory.inactive_365_bytes
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: B
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.inactive365DaysBytes
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: db5691b5602042299900b60bd3d01f13
+          name: 'FileServer Monitor: inventory large files'
+          type: DEPENDENT
+          key: fileserver.inventory.large_files
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.largeFileCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: b0e951f0b0d2495d9cd9108d295b2309
+          name: 'FileServer Monitor: inventory large file bytes'
+          type: DEPENDENT
+          key: fileserver.inventory.large_bytes
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: B
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.largeFileBytes
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: dcced3bb44a646818a44890957244228
+          name: 'FileServer Monitor: inventory executable and script files'
+          type: DEPENDENT
+          key: fileserver.inventory.executable_files
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.executableFileCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: bc4621c787d345908a44890957a44de7
+          name: 'FileServer Monitor: inventory executable and script bytes'
+          type: DEPENDENT
+          key: fileserver.inventory.executable_bytes
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: B
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.executableFileBytes
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 2286238eaf354f49bd0121c7ae0442fa
+          name: 'FileServer Monitor: inventory server'
+          type: DEPENDENT
+          key: fileserver.inventory.server
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.server
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "-" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 039d080c39544ad39d2373a27c80ae19
+          name: 'FileServer Monitor: inventory root path'
+          type: DEPENDENT
+          key: fileserver.inventory.root_path
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.inventory.rootPath
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "-" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
   triggers:
     - uuid: ba8cc84ff4ab4902a416070eb257a817
       expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
@@ -575,4 +839,24 @@ zabbix_export:
     - uuid: c1092e359fc24965a7e506d313cfd546
       expression: 'last(/Template App FileServer Monitor/fileserver.events.last_age_seconds)>{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}'
       name: 'FileServer Monitor: sem eventos recentes'
+      priority: INFO
+    - uuid: 0a074734be6541f38f6579ee8571abca
+      expression: 'last(/Template App FileServer Monitor/fileserver.inventory.status)="empty"'
+      name: 'FileServer Monitor: inventario ainda sem snapshot'
+      priority: INFO
+    - uuid: 5027a807f58e44c9a9328d0860cdfb2c
+      expression: 'last(/Template App FileServer Monitor/fileserver.inventory.status)="critical"'
+      name: 'FileServer Monitor: inventario com falha critica'
+      priority: HIGH
+    - uuid: f4d4b88674e149a0bad6388439cf02a6
+      expression: 'last(/Template App FileServer Monitor/fileserver.inventory.errors)>0'
+      name: 'FileServer Monitor: inventario com erros de leitura'
+      priority: WARNING
+    - uuid: 9925b8390f954cb8ac76dcf5f189cfb2
+      expression: 'last(/Template App FileServer Monitor/fileserver.inventory.last_scan_age_seconds)>{$FILESERVER_MONITOR_INVENTORY_MAX_AGE} and last(/Template App FileServer Monitor/fileserver.inventory.files)>0'
+      name: 'FileServer Monitor: inventario desatualizado'
+      priority: WARNING
+    - uuid: f33c8d32b2344187b39b2d2196f31c72
+      expression: 'last(/Template App FileServer Monitor/fileserver.inventory.executable_files)>0'
+      name: 'FileServer Monitor: executaveis ou scripts encontrados no compartilhamento'
       priority: INFO

@@ -108,7 +108,8 @@ public sealed class EventTimelineProjector
         var resolvedUsers = ResolveUnknownDisplayUsers(normalized).ToArray();
         var normalizedSecurityTextAppends = NormalizeSecurityTextAppendCreates(resolvedUsers).ToArray();
         var syntheticCreations = SynthesizeLikelyCreations(normalizedSecurityTextAppends, rawEvents).ToArray();
-        var syntheticDeletes = SynthesizeLikelyDescendantDeletions(syntheticCreations).ToArray();
+        var syntheticDescendantMoves = SynthesizeLikelyDescendantMoves(syntheticCreations).ToArray();
+        var syntheticDeletes = SynthesizeLikelyDescendantDeletions(syntheticDescendantMoves).ToArray();
         var promotedCreations = PromoteLikelyInitialCreations(syntheticDeletes).ToArray();
 
         var filtered = promotedCreations
@@ -278,15 +279,63 @@ public sealed class EventTimelineProjector
         return events.Concat(synthetic.Values).OrderByDescending(item => item.TimestampUtc);
     }
 
+    private static IEnumerable<FileAuditDisplayEvent> SynthesizeLikelyDescendantMoves(IReadOnlyCollection<FileAuditDisplayEvent> events)
+    {
+        var synthetic = new Dictionary<string, FileAuditDisplayEvent>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var moveEvent in events.Where(item =>
+                     item.Action is "moved" or "renamed"
+                     && IsFolderEvent(item)
+                     && !string.IsNullOrWhiteSpace(item.PreviousPath)))
+        {
+            var previousRoot = moveEvent.PreviousPath!;
+            foreach (var descendantPath in GetKnownLiveDescendantsBeforeTimestamp(previousRoot, moveEvent.TimestampUtc, events, moveEvent.Id))
+            {
+                var relocatedPath = TryRelocatePath(descendantPath, previousRoot, moveEvent.Path);
+                var derivedAction = IsMove(descendantPath, relocatedPath) ? "moved" : "renamed";
+                if (NormalizePath(relocatedPath) == NormalizePath(descendantPath))
+                {
+                    continue;
+                }
+
+                if (HasExplicitDescendantTransition(descendantPath, relocatedPath, moveEvent.TimestampUtc, events))
+                {
+                    continue;
+                }
+
+                var candidate = ToDisplayEvent(ToAuditEvent(moveEvent) with
+                {
+                    Id = StableSyntheticGuid(moveEvent.Id, $"{derivedAction}:{NormalizePath(descendantPath)}->{NormalizePath(relocatedPath)}"),
+                    Path = relocatedPath,
+                    PreviousPath = descendantPath,
+                    ObjectType = IsFileLikePath(relocatedPath) ? "file" : "folder",
+                    Action = derivedAction
+                });
+                synthetic[GetSyntheticTransitionKey(candidate)] = candidate;
+            }
+        }
+
+        return events.Concat(synthetic.Values).OrderByDescending(item => item.TimestampUtc);
+    }
+
     private static IEnumerable<string> GetKnownLiveDescendantsBeforeDelete(
         FileAuditDisplayEvent folderDelete,
         IReadOnlyCollection<FileAuditDisplayEvent> events)
     {
-        var folderPath = NormalizePath(folderDelete.Path);
+        return GetKnownLiveDescendantsBeforeTimestamp(folderDelete.Path, folderDelete.TimestampUtc, events, folderDelete.Id);
+    }
+
+    private static IEnumerable<string> GetKnownLiveDescendantsBeforeTimestamp(
+        string folderPath,
+        DateTimeOffset timestampUtc,
+        IReadOnlyCollection<FileAuditDisplayEvent> events,
+        Guid excludedEventId)
+    {
+        var normalizedFolderPath = NormalizePath(folderPath);
         var livePaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var ordered = events
-            .Where(item => item.Id != folderDelete.Id)
-            .Where(item => item.TimestampUtc < folderDelete.TimestampUtc)
+            .Where(item => item.Id != excludedEventId)
+            .Where(item => item.TimestampUtc < timestampUtc)
             .OrderBy(item => item.TimestampUtc);
 
         foreach (var item in ordered)
@@ -322,7 +371,7 @@ public sealed class EventTimelineProjector
             }
         }
 
-        return livePaths.Values.Where(path => IsDescendantPath(path, folderPath)).ToArray();
+        return livePaths.Values.Where(path => IsDescendantPath(path, normalizedFolderPath)).ToArray();
     }
 
     private static void RemoveKnownLivePathTree(Dictionary<string, string> livePaths, string deletedPath)
@@ -378,6 +427,24 @@ public sealed class EventTimelineProjector
         return string.Join("|", "synthetic-deleted", NormalizePath(item.Path), TrimToSecond(item.TimestampUtc).ToString("O"));
     }
 
+    private static bool HasExplicitDescendantTransition(
+        string previousPath,
+        string nextPath,
+        DateTimeOffset moveTime,
+        IReadOnlyCollection<FileAuditDisplayEvent> events)
+    {
+        return events.Any(item =>
+            item.Action is "moved" or "renamed"
+            && NormalizePath(item.Path) == NormalizePath(nextPath)
+            && NormalizePath(item.PreviousPath) == NormalizePath(previousPath)
+            && (item.TimestampUtc - moveTime).Duration() <= TimeSpan.FromSeconds(60));
+    }
+
+    private static string GetSyntheticTransitionKey(FileAuditDisplayEvent item)
+    {
+        return string.Join("|", $"synthetic-{item.Action}", NormalizePath(item.PreviousPath), NormalizePath(item.Path), TrimToSecond(item.TimestampUtc).ToString("O"));
+    }
+
     private static IEnumerable<FileAuditDisplayEvent> NormalizeProvisionalCreateTransitions(IEnumerable<FileAuditDisplayEvent> events)
     {
         var all = events.ToArray();
@@ -413,7 +480,7 @@ public sealed class EventTimelineProjector
         {
             if (item.Action is not ("created" or "created_or_appended")
                 || !item.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
-                || GetProvisionalDocumentKind(item.Path) != "text"
+                || !IsSecurityTextAppendCandidate(item.Path)
                 || HasNearbyUsnCreation(item, all)
                 || (!HasLaterDisplayAccessEcho(item, all) && !HasNearbyDisplayModification(item, all)))
             {
@@ -427,6 +494,12 @@ public sealed class EventTimelineProjector
                 DisplayTarget = GetLeafName(item.Path)
             };
         });
+    }
+
+    private static bool IsSecurityTextAppendCandidate(string path)
+    {
+        return GetProvisionalDocumentKind(path) == "text"
+            || string.Equals(GetPathExtension(path), ".txt", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool HasNearbyDisplayModification(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
@@ -509,6 +582,11 @@ public sealed class EventTimelineProjector
             && candidate.TimestampUtc < item.TimestampUtc
             && (NormalizePath(candidate.Path) == path || NormalizePath(candidate.PreviousPath) == path));
 
+        if (earlier.Any(candidate => NormalizePath(candidate.Path) == path && candidate.Action is not "accessed"))
+        {
+            return false;
+        }
+
         if (earlier.Any(candidate => IsStrongLifecycleAction(candidate.Action) && !IsIgnorableEarlierLifecycle(candidate, path)))
         {
             return false;
@@ -554,7 +632,10 @@ public sealed class EventTimelineProjector
 
         var isProvisionalOrigin = current.Action == "renamed"
             && (IsMaterializedProvisionalDocumentRename(previousPath, current.Path)
-                || (IsTransientArtifactPath(previousPath) && IsProvisionalDocumentName(current.Path)))
+                || (IsTransientArtifactPath(previousPath) && IsProvisionalDocumentName(current.Path))
+                || (IsProvisionalFolderName(previousPath)
+                    && IsLikelyFolderPath(current.Path)
+                    && NormalizePath(GetParentPath(previousPath)) == NormalizePath(GetParentPath(current.Path))))
             && !HasNearbyTransitionDestination(relevant, previousPath, current.TimestampUtc);
         var action = IsMove(previousPath, current.Path) ? "moved" : "renamed";
         var displayAction = isProvisionalOrigin ? "Criação" : action == "moved" ? "Movido" : "Renomeado";
@@ -774,6 +855,19 @@ public sealed class EventTimelineProjector
             return false;
         }
 
+        if (PathsReferToSameItem(current.PreviousPath, current.Path)
+            && !cluster.Any(item =>
+                item.Event.Id != current.Id
+                && item.Event.Action == "accessed"
+                && item.Event.Source.Contains("windows-security-log", StringComparison.OrdinalIgnoreCase)
+                && !PathsReferToSameItem(item.Event.Path, current.Path)
+                && SameObjectShape(item.Event.Path, current.Path)
+                && string.Equals(GetLeafName(item.Event.Path), GetLeafName(current.Path), StringComparison.OrdinalIgnoreCase)
+                && (item.Event.TimestampUtc - current.TimestampUtc).Duration() <= TimeSpan.FromMilliseconds(2500)))
+        {
+            return true;
+        }
+
         var touchesTransient = IsTransientArtifactPath(current.Path) || IsTransientArtifactPath(current.PreviousPath ?? "");
         if (!touchesTransient)
         {
@@ -840,11 +934,47 @@ public sealed class EventTimelineProjector
 
     private static bool IsRedundantDeletedNoise(FileAuditEvent current, IReadOnlyCollection<ClusterItem> cluster)
     {
-        return current.Action == "deleted"
-            && cluster.Any(item => item.Event.Id != current.Id
-                && item.Event.Action is "renamed" or "moved"
-                && (NormalizePath(item.Event.PreviousPath) == NormalizePath(current.Path)
-                    || NormalizePath(item.Event.Path) == NormalizePath(current.Path)));
+        if (current.Action != "deleted")
+        {
+            return false;
+        }
+
+        var currentPath = NormalizePath(current.Path);
+        var relocatedPath = cluster
+            .Select(item => item.Event)
+            .Where(candidate => candidate.Action == "moved"
+                && IsLikelyFolderPath(candidate.Path)
+                && !string.IsNullOrWhiteSpace(candidate.PreviousPath)
+                && candidate.TimestampUtc <= current.TimestampUtc
+                && current.TimestampUtc - candidate.TimestampUtc <= TimeSpan.FromSeconds(15))
+            .OrderBy(candidate => candidate.TimestampUtc)
+            .Aggregate(current.Path, (path, move) => TryRelocatePath(path, move.PreviousPath!, move.Path));
+        if (!PathsReferToSameItem(relocatedPath, current.Path)
+            && cluster.Any(item =>
+                item.Event.Id != current.Id
+                && item.Event.Action == "deleted"
+                && (item.Event.TimestampUtc - current.TimestampUtc).Duration() <= TimeSpan.FromSeconds(3)
+                && PathsReferToSameItem(item.Event.Path, relocatedPath)))
+        {
+            return true;
+        }
+
+        return cluster.Any(item =>
+        {
+            var candidate = item.Event;
+            if (candidate.Id == current.Id || candidate.Action is not ("renamed" or "moved"))
+            {
+                return false;
+            }
+
+            var delta = (candidate.TimestampUtc - current.TimestampUtc).Duration();
+            if (delta > TimeSpan.FromSeconds(3))
+            {
+                return false;
+            }
+
+            return NormalizePath(candidate.PreviousPath) == currentPath;
+        });
     }
 
     private static bool IsRedundantCreationNoise(FileAuditEvent current, IReadOnlyCollection<ClusterItem> cluster)
@@ -876,14 +1006,17 @@ public sealed class EventTimelineProjector
 
     private static bool IsRootOnlyNoise(FileAuditEvent current, IReadOnlyCollection<ClusterItem> cluster)
     {
-        if (!IsLikelyFolderPath(current.Path) || current.Action is "deleted" or "created" or "created_or_appended")
+        if (!IsLikelyFolderPath(current.Path) || current.Action is "deleted" or "renamed" or "moved")
         {
             return false;
         }
 
         if (IsShareRootPath(current))
         {
-            return true;
+            return cluster.Any(item =>
+                item.Event.Id != current.Id
+                && (item.Event.TimestampUtc - current.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
+                && NormalizePath(item.Event.Path).StartsWith($"{NormalizePath(current.Path)}\\", StringComparison.OrdinalIgnoreCase));
         }
 
         return cluster.Any(item =>
@@ -911,11 +1044,17 @@ public sealed class EventTimelineProjector
         return current.Source == "usn-journal"
             && IsUnknownUser(current.User)
             && current.Action is "changed" or "modified"
+            && (IsProvisionalDocumentName(current.Path)
+                || !cluster.Any(item =>
+                    item.Event.Id != current.Id
+                    && item.Event.Path == current.Path
+                    && item.Event.Source != "usn-journal"
+                    && item.Event.Action is "changed" or "modified" or "created_or_appended"))
             && cluster.Any(item =>
                 item.Event.Id != current.Id
                 && item.Event.Path == current.Path
                 && item.Event.Source != "usn-journal"
-                && item.Event.Action is not ("changed" or "modified"));
+                && item.Event.Action is not ("changed" or "modified" or "created_or_appended"));
     }
 
     private static bool IsRedundantChangedNoise(FileAuditEvent current, IReadOnlyCollection<ClusterItem> cluster)
@@ -943,12 +1082,19 @@ public sealed class EventTimelineProjector
 
             if (candidate.Action is "renamed" or "moved" or "deleted")
             {
-                return true;
+                return (candidate.TimestampUtc - current.TimestampUtc).Duration() <= TimeSpan.FromSeconds(2);
             }
 
-            if (candidate.Action is "created" or "created_or_appended" && IsFileLikePath(candidate.Path))
+            if (candidate.Action == "created" && IsFileLikePath(candidate.Path))
             {
-                return true;
+                return IsCreationEchoWindow(candidate.TimestampUtc, current.TimestampUtc);
+            }
+
+            if (candidate.Action == "created_or_appended"
+                && candidate.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase)
+                && IsFileLikePath(candidate.Path))
+            {
+                return IsCreationEchoWindow(candidate.TimestampUtc, current.TimestampUtc);
             }
 
             return candidate.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase)
@@ -1009,13 +1155,42 @@ public sealed class EventTimelineProjector
 
     private static bool IsRedundantDisplayDeleted(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
     {
-        return item.Action == "deleted"
-            && all.Any(candidate =>
-                candidate.Id != item.Id
-                && candidate.Action is "renamed" or "moved"
-                && !IsTransientArtifactPath(candidate.Path)
-                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
-                && PathsReferToSameItem(candidate.PreviousPath, item.Path));
+        if (item.Action != "deleted")
+        {
+            return false;
+        }
+
+        var stalePathFromFolderMove = all.Any(candidate =>
+        {
+            if (candidate.Id == item.Id
+                || candidate.Action != "moved"
+                || !IsLikelyFolderPath(candidate.Path)
+                || string.IsNullOrWhiteSpace(candidate.PreviousPath)
+                || candidate.TimestampUtc > item.TimestampUtc
+                || item.TimestampUtc - candidate.TimestampUtc > TimeSpan.FromMinutes(5))
+            {
+                return false;
+            }
+
+            var relocatedPath = TryRelocatePath(item.Path, candidate.PreviousPath, candidate.Path);
+            return !PathsReferToSameItem(relocatedPath, item.Path)
+                && all.Any(other =>
+                    other.Id != item.Id
+                    && other.Action == "deleted"
+                    && (other.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
+                    && PathsReferToSameItem(other.Path, relocatedPath));
+        });
+        if (stalePathFromFolderMove)
+        {
+            return true;
+        }
+
+        return all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Action is "renamed" or "moved"
+            && !IsTransientArtifactPath(candidate.Path)
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
+            && PathsReferToSameItem(candidate.PreviousPath, item.Path));
     }
 
     private static bool IsRedundantDisplayDeletedDuplicate(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
@@ -1025,6 +1200,17 @@ public sealed class EventTimelineProjector
             return false;
         }
 
+        var itemResolvedPath = ResolvePathThroughEarlierFolderMoves(item.Path, item.TimestampUtc, all);
+        if (!PathsReferToSameItem(itemResolvedPath, item.Path)
+            && all.Any(candidate =>
+                candidate.Id != item.Id
+                && candidate.Action == "deleted"
+                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
+                && PathsReferToSameItem(candidate.Path, itemResolvedPath)))
+        {
+            return true;
+        }
+
         return all.Any(candidate =>
         {
             if (candidate.Id == item.Id || candidate.Action != "deleted")
@@ -1032,9 +1218,29 @@ public sealed class EventTimelineProjector
                 return false;
             }
 
-            if ((candidate.TimestampUtc - item.TimestampUtc).Duration() > TimeSpan.FromSeconds(5) || !PathsReferToSameItem(candidate.Path, item.Path))
+            if ((candidate.TimestampUtc - item.TimestampUtc).Duration() > TimeSpan.FromSeconds(5))
             {
                 return false;
+            }
+
+            var sameDirectPath = PathsReferToSameItem(candidate.Path, item.Path);
+            var sameResolvedPath = PathsReferToSameItem(
+                ResolvePathThroughEarlierFolderMoves(candidate.Path, candidate.TimestampUtc, all),
+                itemResolvedPath);
+            if (!sameDirectPath && !sameResolvedPath)
+            {
+                return false;
+            }
+
+            if (!sameDirectPath && sameResolvedPath)
+            {
+                var candidateResolvedPath = ResolvePathThroughEarlierFolderMoves(candidate.Path, candidate.TimestampUtc, all);
+                var candidateMatchesResolved = NormalizePath(candidate.Path) == NormalizePath(candidateResolvedPath);
+                var itemMatchesResolved = NormalizePath(item.Path) == NormalizePath(itemResolvedPath);
+                if (candidateMatchesResolved != itemMatchesResolved)
+                {
+                    return candidateMatchesResolved;
+                }
             }
 
             if (HasReplacementCharacter(item.Path) != HasReplacementCharacter(candidate.Path))
@@ -1132,6 +1338,15 @@ public sealed class EventTimelineProjector
             return false;
         }
 
+        if (all.Any(candidate =>
+            candidate.Id != item.Id
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
+            && NormalizePath(candidate.Path) == NormalizePath(item.Path)
+            && candidate.Action is "created" or "created_or_appended" or "renamed" or "moved" or "deleted"))
+        {
+            return true;
+        }
+
         if (item.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase))
         {
             return true;
@@ -1164,6 +1379,15 @@ public sealed class EventTimelineProjector
             return false;
         }
 
+        if (IsShareRootDisplayPath(item)
+            && all.Any(candidate =>
+                candidate.Id != item.Id
+                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
+                && NormalizePath(candidate.Path).StartsWith($"{NormalizePath(item.Path)}\\", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
         if (IsLikelyFolderPath(item.Path))
         {
             var folderPath = NormalizePath(item.Path);
@@ -1171,10 +1395,32 @@ public sealed class EventTimelineProjector
                 candidate.Id != item.Id
                 && candidate.Action == "moved"
                 && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
-                && NormalizePath(GetParentPath(candidate.Path)) == folderPath))
+                    && NormalizePath(GetParentPath(candidate.Path)) == folderPath))
             {
                 return true;
             }
+
+            if (item.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
+                && all.Any(candidate =>
+                    candidate.Id != item.Id
+                    && candidate.Action == "deleted"
+                    && candidate.TimestampUtc <= item.TimestampUtc
+                    && item.TimestampUtc - candidate.TimestampUtc <= TimeSpan.FromSeconds(5)
+                    && PathsReferToSameItem(candidate.Path, item.Path)))
+            {
+                return true;
+            }
+        }
+
+        if (item.Action == "created_or_appended"
+            && item.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
+            && IsFileLikePath(item.Path))
+        {
+            return all.Any(candidate =>
+                candidate.Id != item.Id
+                && candidate.Action is "changed" or "modified"
+                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
+                && PathsReferToSameItem(candidate.Path, item.Path));
         }
 
         if (item.Source == "windows-security-log" && HasReplacementCharacter(item.Path))
@@ -1235,14 +1481,29 @@ public sealed class EventTimelineProjector
         }
 
         var path = NormalizePath(item.Path);
+        var nearDelete = all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Action == "deleted"
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(3)
+            && (NormalizePath(candidate.Path) == path || NormalizePath(candidate.PreviousPath) == path));
+        if (nearDelete)
+        {
+            return true;
+        }
+
+        if (IsLikelyFolderPath(item.Path))
+        {
+            return false;
+        }
+
         return all.Any(candidate =>
             candidate.Id != item.Id
-            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
-            && candidate.Action is "renamed" or "moved" or "created" or "created_or_appended" or "deleted"
-            && (NormalizePath(candidate.Path) == path
-                || NormalizePath(candidate.PreviousPath) == path
-                || path == NormalizePath(GetParentPath(candidate.Path))
-                || path == NormalizePath(GetParentPath(candidate.PreviousPath ?? ""))));
+            && candidate.Action is "created" or "created_or_appended"
+            && !(candidate.Action == "created_or_appended"
+                && candidate.Source.Equals("windows-security-log", StringComparison.OrdinalIgnoreCase)
+                && IsFileLikePath(candidate.Path))
+            && NormalizePath(candidate.Path) == path
+            && IsCreationEchoWindow(candidate.TimestampUtc, item.TimestampUtc));
     }
 
     private static bool IsRedundantDisplayAccessedEcho(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
@@ -1279,6 +1540,13 @@ public sealed class EventTimelineProjector
                 var delta = item.TimestampUtc - candidate.TimestampUtc;
                 return (delta >= TimeSpan.Zero && delta <= TimeSpan.FromSeconds(15))
                     || delta.Duration() <= TimeSpan.FromSeconds(2);
+            }
+
+            if (candidate.Action == "permission_changed")
+            {
+                return PathsReferToSameItem(candidate.Path, item.Path)
+                    && NormalizeUser(candidate.User) == NormalizeUser(item.User)
+                    && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5);
             }
 
             if (candidate.Action is not ("created" or "created_or_appended" or "renamed" or "moved" or "deleted"))
@@ -1594,6 +1862,66 @@ public sealed class EventTimelineProjector
         return action is "created" or "created_or_appended" or "deleted" or "renamed" or "moved";
     }
 
+    private static bool IsCreationEchoWindow(DateTimeOffset creationTimestampUtc, DateTimeOffset changedTimestampUtc)
+    {
+        if (creationTimestampUtc <= changedTimestampUtc)
+        {
+            return changedTimestampUtc - creationTimestampUtc <= TimeSpan.FromSeconds(5);
+        }
+
+        return creationTimestampUtc - changedTimestampUtc <= TimeSpan.FromSeconds(2);
+    }
+
+    private static string ResolvePathThroughEarlierFolderMoves(
+        string path,
+        DateTimeOffset timestampUtc,
+        IReadOnlyCollection<FileAuditDisplayEvent> events)
+    {
+        var resolved = path;
+        foreach (var move in events
+                     .Where(candidate => candidate.Action == "moved"
+                         && IsLikelyFolderPath(candidate.Path)
+                         && !string.IsNullOrWhiteSpace(candidate.PreviousPath)
+                         && candidate.TimestampUtc <= timestampUtc
+                         && timestampUtc - candidate.TimestampUtc <= TimeSpan.FromMinutes(5))
+                     .OrderBy(candidate => candidate.TimestampUtc))
+        {
+            var previousRoot = NormalizePath(move.PreviousPath);
+            var nextRoot = NormalizePath(move.Path);
+            var current = NormalizePath(resolved);
+            if (current == previousRoot)
+            {
+                resolved = move.Path;
+                continue;
+            }
+
+            if (current.StartsWith($"{previousRoot}\\", StringComparison.OrdinalIgnoreCase))
+            {
+                resolved = TryRelocatePath(resolved, move.PreviousPath!, move.Path);
+            }
+        }
+
+        return resolved;
+    }
+
+    private static string TryRelocatePath(string path, string previousRootPath, string nextRootPath)
+    {
+        var current = NormalizePath(path);
+        var previousRoot = NormalizePath(previousRootPath);
+        if (current == previousRoot)
+        {
+            return nextRootPath;
+        }
+
+        if (!current.StartsWith($"{previousRoot}\\", StringComparison.OrdinalIgnoreCase))
+        {
+            return path;
+        }
+
+        var suffix = path.Length >= previousRootPath.Length ? path[previousRootPath.Length..] : "";
+        return $"{nextRootPath}{suffix}";
+    }
+
     private static bool HasNearbyTransitionDestination(IEnumerable<ClusterItem> relevant, string path, DateTimeOffset beforeUtc)
     {
         var normalizedPath = NormalizePath(path);
@@ -1608,6 +1936,11 @@ public sealed class EventTimelineProjector
         var normalizedPrevious = NormalizePath(item.PreviousPath);
         var normalizedTransitionPrevious = NormalizePath(previousPath);
         var normalizedTransitionNext = NormalizePath(nextPath);
+
+        if (item.Action is "permission_changed" or "changed" or "modified")
+        {
+            return false;
+        }
 
         if (item.Action is "renamed" or "moved")
         {
@@ -1674,6 +2007,23 @@ public sealed class EventTimelineProjector
     }
 
     private static bool IsShareRootPath(FileAuditEvent item)
+    {
+        var share = item.Share.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(share))
+        {
+            return false;
+        }
+
+        if (!string.Equals(GetLeafName(item.Path), share, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var parent = NormalizePath(GetParentPath(item.Path));
+        return Regex.IsMatch(parent, @"^[a-z]:$", RegexOptions.IgnoreCase) || Regex.IsMatch(parent, @"^\\\\[^\\]+$");
+    }
+
+    private static bool IsShareRootDisplayPath(FileAuditDisplayEvent item)
     {
         var share = item.Share.Trim().ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(share))

@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="appsettings.agent.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="appsettings.agent.json" Link="appsettings.agent.template.json" TargetPath="appsettings.agent.template.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="scripts/Collect-SecurityFileEvents.ps1" CopyToOutputDirectory="PreserveNewest" />
     <None Include="scripts/Collect-UsnJournalEvents.ps1" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

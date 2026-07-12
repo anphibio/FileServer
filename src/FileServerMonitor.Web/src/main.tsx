@@ -7,10 +7,13 @@ import {
   Bell,
   CheckCircle2,
   ClipboardList,
+  Clock3,
   Database,
   Download,
   FileClock,
+  Files,
   FolderTree,
+  HardDrive,
   KeyRound,
   LogOut,
   LockKeyhole,
@@ -20,6 +23,7 @@ import {
   Server,
   ShieldCheck,
   ShieldAlert,
+  ScanLine,
   Trash2
 } from "lucide-react";
 import "./styles.css";
@@ -82,6 +86,21 @@ type RetentionConfig = {
   intervalHours: number;
   purgeBatchSize: number;
   updatedUtc: string;
+};
+
+type InventoryScanConfig = {
+  enabled: boolean;
+  intervalHours: number;
+  batchSize: number;
+  maxItemsPerScan: number;
+  includeLastAccessTime: boolean;
+  windowStartLocal: string;
+  windowEndLocal: string;
+  rootPath: string;
+  server: string;
+  share: string;
+  updatedUtc: string;
+  runRequestedUtc?: string | null;
 };
 
 type AuthenticatedUser = {
@@ -359,9 +378,65 @@ type InventorySummary = {
   folderCount: number;
   totalBytes: number;
   errorCount: number;
+  governance: InventoryGovernanceMetrics;
   topFolders: InventoryTopFolder[];
   topExtensions: InventoryTopExtension[];
+  contentCategories: InventoryContentCategory[];
+  topLargeFiles: InventoryFileCandidate[];
+  topInactiveFiles: InventoryFileCandidate[];
+  topExecutableFiles: InventoryFileCandidate[];
   ageBuckets: InventoryAgeBucket[];
+  observedActivity: InventoryObservedActivity;
+  growth: InventoryGrowthSummary;
+  recommendations: InventoryRecommendation[];
+};
+
+type InventorySnapshot = {
+  id: string;
+  server: string;
+  share: string;
+  rootPath: string;
+  startedUtc: string;
+  finishedUtc?: string | null;
+  status: string;
+  fileCount: number;
+  folderCount: number;
+  totalBytes: number;
+  errorCount: number;
+  error?: string | null;
+};
+
+type InventoryItem = {
+  id: string;
+  scannedAtUtc: string;
+  server: string;
+  share: string;
+  rootPath: string;
+  path: string;
+  relativePath: string;
+  name: string;
+  itemType: string;
+  extension?: string | null;
+  sizeBytes: number;
+  depth: number;
+  createdUtc?: string | null;
+  modifiedUtc?: string | null;
+  accessedUtc?: string | null;
+  status: string;
+  error?: string | null;
+};
+
+type InventoryGovernanceMetrics = {
+  inactive180DaysFileCount: number;
+  inactive180DaysBytes: number;
+  inactive365DaysFileCount: number;
+  inactive365DaysBytes: number;
+  neverAccessedFileCount: number;
+  neverAccessedBytes: number;
+  largeFileCount: number;
+  largeFileBytes: number;
+  executableFileCount: number;
+  executableFileBytes: number;
 };
 
 type InventoryTopFolder = {
@@ -377,10 +452,66 @@ type InventoryTopExtension = {
   totalBytes: number;
 };
 
+type InventoryContentCategory = {
+  category: string;
+  fileCount: number;
+  totalBytes: number;
+};
+
+type InventoryGrowthSummary = {
+  fileCountDelta: number;
+  folderCountDelta: number;
+  totalBytesDelta: number;
+  topGrowingFolders: InventoryFolderGrowth[];
+};
+
+type InventoryFolderGrowth = {
+  path: string;
+  fileCountDelta: number;
+  folderCountDelta: number;
+  totalBytesDelta: number;
+};
+
+type InventoryFileCandidate = {
+  path: string;
+  name: string;
+  extension?: string | null;
+  sizeBytes: number;
+  modifiedUtc?: string | null;
+  accessedUtc?: string | null;
+  ageDays?: number | null;
+};
+
 type InventoryAgeBucket = {
   label: string;
   fileCount: number;
   totalBytes: number;
+};
+
+type InventoryRecommendation = {
+  title: string;
+  detail: string;
+  severity: string;
+};
+
+type InventoryObservedActivity = {
+  totalEvents: number;
+  topFolders: InventoryTopActivityFolder[];
+  topUsers: InventoryTopActivityUser[];
+};
+
+type InventoryTopActivityFolder = {
+  path: string;
+  eventCount: number;
+  lastActivityUtc: string;
+  topAction: string;
+};
+
+type InventoryTopActivityUser = {
+  user: string;
+  eventCount: number;
+  lastActivityUtc: string;
+  topAction: string;
 };
 
 type Notice = {
@@ -977,8 +1108,157 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
         </form>
       </Panel>
 
+      <InventoryScanConfigPanel onNotify={onNotify} />
+
       <RetentionConfigPanel onNotify={onNotify} />
     </div>
+  );
+}
+
+function InventoryScanConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [config, setConfig] = useState<InventoryScanConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [requestingScan, setRequestingScan] = useState(false);
+
+  useEffect(() => {
+    fetchJson<InventoryScanConfig>("/api/inventory/config")
+      .then(setConfig)
+      .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar inventario." }));
+  }, [onNotify]);
+
+  function update<K extends keyof InventoryScanConfig>(key: K, value: InventoryScanConfig[K]) {
+    setConfig((current) => current ? { ...current, [key]: value } : current);
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+
+    if (!config) {
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/inventory/config`, {
+        method: "PUT",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify(config)
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel salvar inventario."));
+      }
+
+      setConfig((await response.json()) as InventoryScanConfig);
+      onNotify({ tone: "success", message: "Configuracao do inventario salva." });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel salvar inventario." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function requestScanNow() {
+    setRequestingScan(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/inventory/scan-now`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel solicitar o scan."));
+      }
+
+      setConfig((await response.json()) as InventoryScanConfig);
+      onNotify({ tone: "success", message: "Scan de inventario solicitado ao agente." });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel solicitar o scan." });
+    } finally {
+      setRequestingScan(false);
+    }
+  }
+
+  if (!config) {
+    return <Panel title="Inventário gerencial" subtitle="Carregando configuracao de scan..." />;
+  }
+
+  return (
+    <Panel title="Inventário gerencial" subtitle="Controle a varredura da estrutura de arquivos para indicadores de governança e capacidade.">
+      <form className="auth-form retention-form" onSubmit={submit}>
+        <div className="retention-summary">
+          <StatusCard label="Estado" value={config.enabled ? "Ativo" : "Inativo"} detail={config.enabled ? "Agentes podem executar o scan" : "Nenhum scan automatico sera solicitado"} />
+          <StatusCard label="Raiz" value={config.rootPath || "Nao definida"} detail={`${config.server || "Servidor"} · ${config.share || "Share"}`} />
+          <StatusCard label="Agenda" value={`${config.intervalHours} h`} detail={config.windowStartLocal || config.windowEndLocal ? `${config.windowStartLocal || "00:00"} ate ${config.windowEndLocal || "23:59"}` : "Sem janela fixa"} />
+        </div>
+
+        <label className="check-row">
+          <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
+          Habilitar scan de inventário
+        </label>
+
+        <label className="check-row">
+          <input type="checkbox" checked={config.includeLastAccessTime} onChange={(event) => update("includeLastAccessTime", event.target.checked)} />
+          Coletar data de último acesso
+        </label>
+
+        <div className="form-grid three">
+          <label>
+            Servidor
+            <input value={config.server} onChange={(event) => update("server", event.target.value)} placeholder="FileServer" />
+          </label>
+          <label>
+            Compartilhamento
+            <input value={config.share} onChange={(event) => update("share", event.target.value)} placeholder="Corporativo" />
+          </label>
+          <label>
+            Raiz do scan
+            <input value={config.rootPath} onChange={(event) => update("rootPath", event.target.value)} placeholder="C:\\Corporativo" />
+          </label>
+        </div>
+
+        <div className="form-grid five">
+          <label>
+            Intervalo (horas)
+            <input value={config.intervalHours} onChange={(event) => update("intervalHours", Number(event.target.value))} inputMode="numeric" min={1} max={168} type="number" />
+          </label>
+          <label>
+            Lote do scan
+            <input value={config.batchSize} onChange={(event) => update("batchSize", Number(event.target.value))} inputMode="numeric" min={100} max={2000} step={100} type="number" />
+          </label>
+          <label>
+            Limite de itens
+            <input value={config.maxItemsPerScan} onChange={(event) => update("maxItemsPerScan", Number(event.target.value))} inputMode="numeric" min={0} max={10000000} step={1000} type="number" />
+          </label>
+          <label>
+            Janela início
+            <input value={config.windowStartLocal} onChange={(event) => update("windowStartLocal", event.target.value)} placeholder="01:00" />
+          </label>
+          <label>
+            Janela fim
+            <input value={config.windowEndLocal} onChange={(event) => update("windowEndLocal", event.target.value)} placeholder="05:00" />
+          </label>
+        </div>
+
+        <div className="auth-badges">
+          <span className="badge info">Configuração enviada ao agente</span>
+          <span className="badge neutral">Use limite 0 para varrer tudo</span>
+          <span className="badge low">Atualizado em {formatDate(config.updatedUtc)}</span>
+          {config.runRequestedUtc ? <span className="badge info">Scan solicitado em {formatDate(config.runRequestedUtc)}</span> : null}
+        </div>
+
+        <div className="form-actions">
+          <button className="secondary-button" type="button" onClick={requestScanNow} disabled={requestingScan || saving}>
+            <RefreshCcw size={18} />
+            {requestingScan ? "Solicitando..." : "Executar scan agora"}
+          </button>
+          <button className="primary-button" type="submit" disabled={saving || requestingScan}>
+            <FolderTree size={18} />
+            {saving ? "Salvando..." : "Salvar inventário"}
+          </button>
+        </div>
+      </form>
+    </Panel>
   );
 }
 
@@ -2500,12 +2780,22 @@ function MonitoredPathsView({
 
 function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
   const [summary, setSummary] = useState<InventorySummary | null>(null);
+  const [snapshots, setSnapshots] = useState<InventorySnapshot[]>([]);
+  const [investigationKind, setInvestigationKind] = useState("executable");
+  const [investigationItems, setInvestigationItems] = useState<InventoryItem[]>([]);
+  const [loadingInvestigation, setLoadingInvestigation] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [requestingScan, setRequestingScan] = useState(false);
 
   async function loadInventory() {
     setLoading(true);
     try {
-      setSummary(await fetchJson<InventorySummary>("/api/inventory/summary"));
+      const [nextSummary, nextSnapshots] = await Promise.all([
+        fetchJson<InventorySummary>("/api/inventory/summary"),
+        fetchJson<InventorySnapshot[]>("/api/inventory/snapshots?take=10")
+      ]);
+      setSummary(nextSummary);
+      setSnapshots(nextSnapshots);
     } catch (error) {
       onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar inventario." });
     } finally {
@@ -2513,60 +2803,301 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
     }
   }
 
+  async function loadInventoryItems(kind = investigationKind) {
+    setInvestigationKind(kind);
+    setLoadingInvestigation(true);
+    try {
+      const params = new URLSearchParams({ kind, take: "100" });
+      const items = await fetchJson<InventoryItem[]>(`/api/inventory/items?${params.toString()}`);
+      setInvestigationItems(items);
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar achados do inventario." });
+    } finally {
+      setLoadingInvestigation(false);
+    }
+  }
+
   useEffect(() => {
     void loadInventory();
   }, []);
 
+  useEffect(() => {
+    if (summary?.snapshotId) {
+      void loadInventoryItems("executable");
+    }
+  }, [summary?.snapshotId]);
+
+  async function requestScanNow() {
+    setRequestingScan(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/inventory/scan-now`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel solicitar o scan."));
+      }
+
+      onNotify({ tone: "success", message: "Scan de inventario solicitado ao agente." });
+      await loadInventory();
+      window.setTimeout(() => {
+        void loadInventory();
+      }, 75_000);
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel solicitar o scan." });
+    } finally {
+      setRequestingScan(false);
+    }
+  }
+
   if (!summary || summary.status === "empty") {
     return (
-      <Panel title="Inventário Gerencial" subtitle={loading ? "Carregando inventário..." : "Nenhum snapshot de inventário encontrado."}>
-        <EmptyState text="Ative o scan de inventário no agente para gerar a primeira visão gerencial do compartilhamento." />
-      </Panel>
+      <div className="view-stack">
+        <Panel title="Inventário Gerencial" subtitle={loading ? "Carregando inventário..." : "Nenhum snapshot de inventário encontrado."}>
+          <EmptyState text="Ative o scan de inventário no agente para gerar a primeira visão gerencial do compartilhamento." />
+          <div className="toolbar">
+            <button className="text-button" type="button" onClick={requestScanNow} disabled={requestingScan || loading}>
+              <RefreshCcw size={16} />
+              {requestingScan ? "Solicitando..." : "Executar scan agora"}
+            </button>
+          </div>
+        </Panel>
+        <InventorySnapshotsPanel snapshots={snapshots} />
+      </div>
     );
   }
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Armazenamento"
-          value={formatBytes(summary.totalBytes)}
-          detail={`${summary.fileCount.toLocaleString("pt-BR")} arquivo(s) em ${summary.folderCount.toLocaleString("pt-BR")} pasta(s).`}
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Último scan"
-          value={summary.finishedUtc ? formatDate(summary.finishedUtc) : "Em andamento"}
-          detail={`${summary.server ?? "Servidor"} · ${summary.share ?? "Compartilhamento"}`}
-          tone={summary.status === "completed_with_errors" ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Erros de leitura"
-          value={summary.errorCount.toLocaleString("pt-BR")}
-          detail={summary.rootPath ?? "Raiz não informada"}
-          tone={summary.errorCount > 0 ? "warning" : "neutral"}
-        />
+    <div className="inventory-workspace">
+      <section className="inventory-overview" aria-label="Resumo do inventário">
+        <div className="inventory-overview-title">
+          <span className="inventory-kicker"><HardDrive size={16} /> Compartilhamento monitorado</span>
+          <h2>{summary.share ?? "Inventário de arquivos"}</h2>
+          <p>{summary.rootPath ?? "Raiz não informada"}</p>
+          <div className="inventory-overview-actions">
+            <button className="text-button" type="button" onClick={loadInventory} disabled={loading}>
+              <RefreshCcw size={16} />
+              {loading ? "Atualizando..." : "Atualizar dados"}
+            </button>
+            <button className="primary-button" type="button" onClick={requestScanNow} disabled={requestingScan || loading}>
+              <ScanLine size={16} />
+              {requestingScan ? "Solicitando..." : "Executar scan"}
+            </button>
+          </div>
+        </div>
+
+        <div className="inventory-capacity">
+          <span>Espaço catalogado</span>
+          <strong>{formatBytes(summary.totalBytes)}</strong>
+          <small>{summary.fileCount.toLocaleString("pt-BR")} arquivos em {summary.folderCount.toLocaleString("pt-BR")} pastas</small>
+        </div>
+
+        <dl className="inventory-scan-meta">
+          <div>
+            <dt>Último scan</dt>
+            <dd>{summary.finishedUtc ? formatDate(summary.finishedUtc) : "Em andamento"}</dd>
+          </div>
+          <div>
+            <dt>Servidor</dt>
+            <dd>{summary.server ?? "Não informado"}</dd>
+          </div>
+          <div>
+            <dt>Leitura</dt>
+            <dd className={summary.errorCount > 0 ? "warning-text" : "success-text"}>{summary.errorCount > 0 ? `${summary.errorCount} erro(s)` : "Sem erros"}</dd>
+          </div>
+          <div>
+            <dt>Crescimento</dt>
+            <dd className={summary.growth.totalBytesDelta > 0 ? "warning-text" : "success-text"}>{formatSignedBytes(summary.growth.totalBytesDelta)}</dd>
+          </div>
+        </dl>
       </section>
 
-      <div className="toolbar">
-        <button className="text-button" type="button" onClick={loadInventory} disabled={loading}>
-          <RefreshCcw size={16} />
-          {loading ? "Atualizando..." : "Atualizar inventário"}
-        </button>
+      <section className="inventory-action-strip" aria-label="Pontos de atenção">
+        <InventoryActionMetric icon={<FileClock size={19} />} label="Arquivos frios" value={summary.governance.inactive365DaysFileCount} detail={`${formatBytes(summary.governance.inactive365DaysBytes)} sem alteração há mais de um ano`} tone="warning" />
+        <InventoryActionMetric icon={<Clock3 size={19} />} label="Sem registro de acesso" value={summary.governance.neverAccessedFileCount} detail={formatBytes(summary.governance.neverAccessedBytes)} tone="neutral" />
+        <InventoryActionMetric icon={<Files size={19} />} label="Arquivos grandes" value={summary.governance.largeFileCount} detail={`${formatBytes(summary.governance.largeFileBytes)} acima de 1 GB`} tone="warning" />
+        <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
+      </section>
+
+      <div className="inventory-analysis-grid">
+        <Panel title="Composição do armazenamento" subtitle="Tipos de conteúdo que mais ocupam espaço.">
+          <InventoryCategoryChart items={summary.contentCategories} />
+        </Panel>
+        <Panel title="Ciclo de vida dos arquivos" subtitle="Distribuição pela última modificação conhecida.">
+          <InventoryAgeChart buckets={summary.ageBuckets} />
+        </Panel>
+        <Panel title="Atividade observada" subtitle="Ações correlacionadas nos últimos 30 dias.">
+          <div className="inventory-activity-total">
+            <Activity size={20} />
+            <strong>{summary.observedActivity.totalEvents.toLocaleString("pt-BR")}</strong>
+            <span>eventos reais</span>
+          </div>
+          <InventoryRanking
+            items={summary.observedActivity.topFolders}
+            getKey={(item) => item.path}
+            renderLabel={(item) => item.path}
+            renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
+            renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
+            maxValue={Math.max(...summary.observedActivity.topFolders.map((item) => item.eventCount), 1)}
+            getBarValue={(item) => item.eventCount}
+          />
+        </Panel>
       </div>
 
-      <div className="split-grid">
-        <Panel title="Top pastas por tamanho" subtitle="Primeira visão de consumo para decisão de limpeza e arquivamento.">
+      <Panel title="Recomendações para revisão" subtitle="Sinais do último snapshot para orientar limpeza, arquivamento e ajustes de acesso.">
+        {summary.recommendations.length === 0 ? (
+          <EmptyState text="Sem recomendação gerencial para o snapshot atual." />
+        ) : (
+          <div className="inventory-recommendations">
+            {summary.recommendations.map((item) => (
+              <article key={`${item.title}-${item.detail}`} className={item.severity === "warning" ? "warning" : "info"}>
+                {item.severity === "warning" ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
+                <div>
+                  <strong>{item.title}</strong>
+                  <p>{item.detail}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <div className="inventory-details-grid">
+        <Panel title="Pastas com maior consumo" subtitle="Priorize as maiores áreas para revisão de capacidade.">
           <InventoryRanking
             items={summary.topFolders}
             getKey={(item) => item.path}
             renderLabel={(item) => item.path}
             renderValue={(item) => formatBytes(item.totalBytes)}
-            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s) · ${item.folderCount.toLocaleString("pt-BR")} pasta(s)`}
+            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivos · ${item.folderCount.toLocaleString("pt-BR")} pastas`}
             maxValue={Math.max(...summary.topFolders.map((item) => item.totalBytes), 1)}
           />
         </Panel>
+        <Panel title="Usuários mais ativos" subtitle="Atividade real observada no mesmo período.">
+          <InventoryRanking
+            items={summary.observedActivity.topUsers}
+            getKey={(item) => item.user}
+            renderLabel={(item) => item.user}
+            renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
+            renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
+            maxValue={Math.max(...summary.observedActivity.topUsers.map((item) => item.eventCount), 1)}
+            getBarValue={(item) => item.eventCount}
+          />
+        </Panel>
+      </div>
 
+      <Panel title="Investigar achados" subtitle="Revise itens do último snapshot sem executar uma nova varredura.">
+        <div className="toolbar">
+          {[
+            ["executable", "Executáveis/scripts"],
+            ["large", "Arquivos grandes"],
+            ["inactive365", "Inativos +365d"],
+            ["errors", "Erros de leitura"]
+          ].map(([kind, label]) => (
+            <button
+              key={kind}
+              className={investigationKind === kind ? "primary-button compact" : "text-button"}
+              type="button"
+              onClick={() => loadInventoryItems(kind)}
+              disabled={loadingInvestigation}
+            >
+              <Search size={16} />
+              {label}
+            </button>
+          ))}
+        </div>
+        {loadingInvestigation ? (
+          <EmptyState text="Carregando achados do inventário..." />
+        ) : investigationItems.length === 0 ? (
+          <EmptyState text="Escolha um tipo de achado para listar até 100 itens do último scan." />
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Nome</th>
+                  <th>Tipo</th>
+                  <th>Tamanho</th>
+                  <th>Modificado</th>
+                  <th>Acessado</th>
+                  <th>Status</th>
+                  <th>Caminho</th>
+                </tr>
+              </thead>
+              <tbody>
+                {investigationItems.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.name}</td>
+                    <td>{item.extension || item.itemType}</td>
+                    <td>{formatBytes(item.sizeBytes)}</td>
+                    <td>{item.modifiedUtc ? formatDate(item.modifiedUtc) : "-"}</td>
+                    <td>{item.accessedUtc ? formatDate(item.accessedUtc) : "-"}</td>
+                    <td>
+                      <span className={`status ${item.status === "active" ? "ok" : "attention"}`}>
+                        {item.status === "active" ? "ativo" : item.status}
+                      </span>
+                    </td>
+                    <td title={item.path}>{item.path}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Pastas que mais cresceram" subtitle="Comparação entre o snapshot atual e o anterior do mesmo compartilhamento.">
+        <InventoryRanking
+          items={summary.growth.topGrowingFolders}
+          getKey={(item) => item.path}
+          renderLabel={(item) => item.path}
+          renderValue={(item) => formatSignedBytes(item.totalBytesDelta)}
+          renderDetail={(item) => `${formatSignedNumber(item.fileCountDelta)} arquivo(s) · ${formatSignedNumber(item.folderCountDelta)} pasta(s)`}
+          maxValue={Math.max(...summary.growth.topGrowingFolders.map((item) => item.totalBytesDelta), 1)}
+          getBarValue={(item) => item.totalBytesDelta}
+        />
+      </Panel>
+
+      <div className="inventory-details-grid">
+        <Panel title="Maiores arquivos" subtitle="Candidatos para revisão de consumo, arquivamento ou política de retenção.">
+          <InventoryRanking
+            items={summary.topLargeFiles}
+            getKey={(item) => item.path}
+            renderLabel={(item) => item.name}
+            renderValue={(item) => formatBytes(item.sizeBytes)}
+            renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
+            maxValue={Math.max(...summary.topLargeFiles.map((item) => item.sizeBytes), 1)}
+            getBarValue={(item) => item.sizeBytes}
+          />
+        </Panel>
+
+        <Panel title="Arquivos antigos" subtitle="Itens com modificação mais antiga no snapshot atual.">
+          <InventoryRanking
+            items={summary.topInactiveFiles}
+            getKey={(item) => item.path}
+            renderLabel={(item) => item.name}
+            renderValue={(item) => item.ageDays === null || item.ageDays === undefined ? "sem idade" : `${item.ageDays.toLocaleString("pt-BR")} dia(s)`}
+            renderDetail={(item) => `${formatBytes(item.sizeBytes)} · ${item.path}`}
+            maxValue={Math.max(...summary.topInactiveFiles.map((item) => item.ageDays ?? 0), 1)}
+            getBarValue={(item) => item.ageDays ?? 0}
+          />
+        </Panel>
+      </div>
+
+      <Panel title="Executáveis e scripts encontrados" subtitle="Arquivos que merecem revisão rápida em compartilhamentos corporativos.">
+        <InventoryRanking
+          items={summary.topExecutableFiles}
+          getKey={(item) => item.path}
+          renderLabel={(item) => item.name}
+          renderValue={(item) => `${item.extension ?? "(sem extensão)"} · ${formatBytes(item.sizeBytes)}`}
+          renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
+          maxValue={Math.max(...summary.topExecutableFiles.map((item) => item.sizeBytes), 1)}
+          getBarValue={(item) => item.sizeBytes}
+        />
+      </Panel>
+
+      <div className="inventory-details-grid">
         <Panel title="Top extensões por tamanho" subtitle="Ajuda a encontrar arquivos de mídia, backup, PST, ISO e outros consumidores.">
           <InventoryRanking
             items={summary.topExtensions}
@@ -2579,17 +3110,163 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
         </Panel>
       </div>
 
-      <Panel title="Idade dos arquivos" subtitle="Distribuição por última data conhecida no filesystem.">
-        <div className="inventory-age-grid">
-          {summary.ageBuckets.map((bucket) => (
-            <article key={bucket.label}>
-              <span>{bucket.label}</span>
-              <strong>{bucket.fileCount.toLocaleString("pt-BR")}</strong>
-              <small>{formatBytes(bucket.totalBytes)}</small>
-            </article>
-          ))}
+      <InventorySnapshotsPanel snapshots={snapshots} />
+    </div>
+  );
+}
+
+function InventorySnapshotsPanel({ snapshots }: { snapshots: InventorySnapshot[] }) {
+  return (
+    <Panel title="Histórico de scans" subtitle="Últimas varreduras do inventário usadas para acompanhar cobertura e falhas de leitura.">
+      {snapshots.length === 0 ? (
+        <EmptyState text="Nenhum scan registrado ainda." />
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Início</th>
+                <th>Fim</th>
+                <th>Status</th>
+                <th>Servidor</th>
+                <th>Share</th>
+                <th>Arquivos</th>
+                <th>Pastas</th>
+                <th>Tamanho</th>
+                <th>Erros</th>
+                <th>Raiz</th>
+              </tr>
+            </thead>
+            <tbody>
+              {snapshots.map((snapshot) => (
+                <tr key={snapshot.id}>
+                  <td>{formatDate(snapshot.startedUtc)}</td>
+                  <td>{snapshot.finishedUtc ? formatDate(snapshot.finishedUtc) : "Em andamento"}</td>
+                  <td>
+                    <span className={`status ${snapshot.status === "completed" ? "ok" : snapshot.status === "failed" ? "critical" : "attention"}`}>
+                      {formatInventoryStatus(snapshot.status)}
+                    </span>
+                  </td>
+                  <td>{snapshot.server}</td>
+                  <td>{snapshot.share}</td>
+                  <td>{snapshot.fileCount.toLocaleString("pt-BR")}</td>
+                  <td>{snapshot.folderCount.toLocaleString("pt-BR")}</td>
+                  <td>{formatBytes(snapshot.totalBytes)}</td>
+                  <td>{snapshot.errorCount.toLocaleString("pt-BR")}</td>
+                  <td title={snapshot.rootPath}>{snapshot.rootPath}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      </Panel>
+      )}
+    </Panel>
+  );
+}
+
+function formatInventoryStatus(status: string) {
+  const normalized = status.toLowerCase();
+  if (normalized === "completed") {
+    return "concluído";
+  }
+
+  if (normalized === "completed_with_errors") {
+    return "concluído com erro";
+  }
+
+  if (normalized === "failed") {
+    return "falhou";
+  }
+
+  if (normalized === "running") {
+    return "em execução";
+  }
+
+  return status;
+}
+
+function InventoryActionMetric({
+  icon,
+  label,
+  value,
+  detail,
+  tone
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: number;
+  detail: string;
+  tone: "neutral" | "warning" | "danger";
+}) {
+  return (
+    <article className={`inventory-action-metric ${tone}`}>
+      <span className="inventory-action-icon">{icon}</span>
+      <div>
+        <span>{label}</span>
+        <strong>{value.toLocaleString("pt-BR")}</strong>
+        <small>{detail}</small>
+      </div>
+    </article>
+  );
+}
+
+function InventoryCategoryChart({ items }: { items: InventoryContentCategory[] }) {
+  const colors = ["#2f6f9f", "#4d8d77", "#b87535", "#6c6db4", "#a5576b", "#6d7b8a"];
+  const ranked = items.filter((item) => item.totalBytes > 0).slice(0, 6);
+  const total = ranked.reduce((sum, item) => sum + item.totalBytes, 0);
+
+  if (ranked.length === 0 || total === 0) {
+    return <EmptyState text="Sem tipos de conteúdo para representar no último snapshot." />;
+  }
+
+  let cursor = 0;
+  const segments = ranked.map((item, index) => {
+    const start = cursor;
+    cursor += (item.totalBytes / total) * 100;
+    return `${colors[index]} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+  });
+
+  return (
+    <div className="inventory-category-chart">
+      <div className="inventory-donut" style={{ background: `conic-gradient(${segments.join(", ")})` }} aria-label="Distribuição por tipo de conteúdo">
+        <div>
+          <strong>{formatBytes(total)}</strong>
+          <span>top categorias</span>
+        </div>
+      </div>
+      <div className="inventory-category-legend">
+        {ranked.map((item, index) => (
+          <div key={item.category}>
+            <i style={{ background: colors[index] }} />
+            <span title={formatInventoryCategory(item.category)}>{formatInventoryCategory(item.category)}</span>
+            <strong>{formatBytes(item.totalBytes)}</strong>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InventoryAgeChart({ buckets }: { buckets: InventoryAgeBucket[] }) {
+  const max = Math.max(...buckets.map((bucket) => bucket.fileCount), 1);
+
+  if (buckets.length === 0) {
+    return <EmptyState text="Sem dados de idade no último snapshot." />;
+  }
+
+  return (
+    <div className="inventory-age-chart" aria-label="Idade dos arquivos">
+      {buckets.map((bucket) => {
+        const height = Math.max(8, Math.round((bucket.fileCount / max) * 100));
+        return (
+          <article key={bucket.label}>
+            <strong>{bucket.fileCount.toLocaleString("pt-BR")}</strong>
+            <div className="inventory-age-bar"><i style={{ height: `${height}%` }} /></div>
+            <span>{bucket.label}</span>
+            <small>{formatBytes(bucket.totalBytes)}</small>
+          </article>
+        );
+      })}
     </div>
   );
 }
@@ -2600,7 +3277,8 @@ function InventoryRanking<T>({
   renderLabel,
   renderValue,
   renderDetail,
-  maxValue
+  maxValue,
+  getBarValue
 }: {
   items: T[];
   getKey: (item: T) => string;
@@ -2608,6 +3286,7 @@ function InventoryRanking<T>({
   renderValue: (item: T) => string;
   renderDetail: (item: T) => string;
   maxValue: number;
+  getBarValue?: (item: T) => number;
 }) {
   if (items.length === 0) {
     return <EmptyState text="Sem dados para exibir." />;
@@ -2616,7 +3295,7 @@ function InventoryRanking<T>({
   return (
     <div className="inventory-ranking">
       {items.map((item) => {
-        const value = Number((item as { totalBytes?: number }).totalBytes ?? 0);
+        const value = getBarValue ? getBarValue(item) : Number((item as { totalBytes?: number }).totalBytes ?? 0);
         const width = Math.max(3, Math.round((value / maxValue) * 100));
         return (
           <article key={getKey(item)}>
@@ -3734,6 +4413,56 @@ function formatBytes(value: number) {
   }
 
   return `${current.toLocaleString("pt-BR", { maximumFractionDigits: unitIndex === 0 ? 0 : 1 })} ${units[unitIndex]}`;
+}
+
+function formatSignedBytes(value: number) {
+  if (value === 0) {
+    return "0 B";
+  }
+
+  return `${value > 0 ? "+" : "-"}${formatBytes(Math.abs(value))}`;
+}
+
+function formatSignedNumber(value: number) {
+  if (value === 0) {
+    return "0";
+  }
+
+  return `${value > 0 ? "+" : "-"}${Math.abs(value).toLocaleString("pt-BR")}`;
+}
+
+function formatInventoryFileAge(item: InventoryFileCandidate) {
+  const age = item.ageDays === null || item.ageDays === undefined ? "idade indisponível" : `${item.ageDays.toLocaleString("pt-BR")} dia(s)`;
+
+  if (item.modifiedUtc) {
+    return `${age} desde última modificação`;
+  }
+
+  if (item.accessedUtc) {
+    return `${age} desde último acesso`;
+  }
+
+  return age;
+}
+
+function formatInventoryCategory(category: string) {
+  const labels: Record<string, string> = {
+    audio: "Áudio",
+    binarios: "Binários",
+    compactados: "Compactados",
+    dados: "Dados",
+    "dados sensiveis": "Dados sensíveis",
+    documentos: "Documentos",
+    imagens: "Imagens",
+    "imagens de disco": "Imagens de disco",
+    instaladores: "Instaladores",
+    outros: "Outros",
+    "projetos cad": "Projetos CAD",
+    scripts: "Scripts",
+    videos: "Vídeos"
+  };
+
+  return labels[category] ?? category;
 }
 
 function getOperationalPosture(

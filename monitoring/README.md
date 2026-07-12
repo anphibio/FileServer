@@ -8,8 +8,9 @@ A API expõe:
 
 - `GET /health`: checagem simples de disponibilidade.
 - `GET /metrics`: retrato completo do ambiente em JSON para Zabbix/Grafana.
+- `GET /api/inventory/items`: lista itens do último snapshot para investigação, filtrando por achados como `executable`, `large`, `inactive365` ou `errors`.
 
-O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, capacidade das tabelas principais, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado e contadores do último ciclo de coleta.
+O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, capacidade das tabelas principais, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado, contadores do último ciclo de coleta e saúde do inventário gerencial.
 
 Principais sinais de banco e capacidade:
 
@@ -34,6 +35,23 @@ Principais sinais de agente:
 - `maxCollectedEventAgeSeconds`: maior atraso desde o último evento coletado por um agente.
 - `cycleErrors`: quantidade de agentes cujo último ciclo reportou erro.
 
+Principais sinais de inventário:
+
+- `inventory.status`: `healthy`, `running`, `degraded`, `critical` ou `empty`.
+- `inventory.lastSnapshotStatus`: status bruto do último snapshot.
+- `inventory.lastScanAgeSeconds`: idade do último scan concluído ou iniciado.
+- `inventory.fileCount`: quantidade de arquivos no último scan.
+- `inventory.folderCount`: quantidade de pastas no último scan.
+- `inventory.totalBytes`: tamanho total inventariado.
+- `inventory.errorCount`: quantidade de erros de leitura no scan.
+- `inventory.inactive365DaysFileCount`: quantidade de arquivos sem acesso observado há 365 dias ou mais.
+- `inventory.inactive365DaysBytes`: espaço ocupado por arquivos sem acesso observado há 365 dias ou mais.
+- `inventory.largeFileCount`: quantidade de arquivos com 1 GB ou mais.
+- `inventory.largeFileBytes`: espaço ocupado por arquivos com 1 GB ou mais.
+- `inventory.executableFileCount`: quantidade de executáveis e scripts encontrados no compartilhamento.
+- `inventory.executableFileBytes`: espaço ocupado por executáveis e scripts.
+- `inventory.server`, `inventory.share` e `inventory.rootPath`: escopo do último scan.
+
 ## Zabbix
 
 Importe o arquivo:
@@ -48,6 +66,7 @@ Macros principais:
 - `{$FILESERVER_MONITOR_QUEUE_WARN}`: alerta quando a fila local de algum agente chegar nesse valor.
 - `{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}`: alerta quando nenhum evento novo chegar por esse tempo, em segundos.
 - `{$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}`: alerta quando as tabelas principais reservarem mais espaço que esse limite, em MB.
+- `{$FILESERVER_MONITOR_INVENTORY_MAX_AGE}`: alerta quando o inventário ficar mais antigo que esse tempo, em segundos.
 
 O template usa item HTTP agent no endpoint `/metrics` e cria itens dependentes com JSONPath.
 
@@ -58,6 +77,8 @@ Importe o arquivo:
 `monitoring/grafana/fileserver-monitor-dashboard.json`
 
 O dashboard espera o datasource do plugin Zabbix (`alexanderzobnin-zabbix-datasource`). Na importação, selecione o datasource e o host Zabbix onde o template foi vinculado.
+
+Além da visão de API, banco, capacidade e agentes, o dashboard inclui a faixa **Inventário gerencial**, com status do último scan, idade do scan, quantidade de arquivos/pastas, tamanho inventariado, erros de leitura, arquivos inativos, arquivos grandes e executáveis/scripts.
 
 Depois da importação, use as variáveis no topo do dashboard:
 
