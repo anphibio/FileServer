@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace FileServerMonitor.Core;
 
 public sealed record FileInventoryItemInput(
@@ -72,6 +74,9 @@ public sealed record FileInventorySummary(
     IReadOnlyCollection<FileInventoryAgeBucket> AgeBuckets,
     FileInventoryObservedActivitySummary ObservedActivity,
     FileInventoryGrowthSummary Growth,
+    FileInventoryCycleComparison Comparison,
+    FileInventoryManagerialInsight Insight,
+    FileInventoryExecutiveOverview ExecutiveOverview,
     IReadOnlyCollection<FileInventoryRecommendation> Recommendations);
 
 public sealed record FileInventoryGovernanceMetrics(
@@ -98,6 +103,16 @@ public sealed record FileInventoryGrowthSummary(
     long TotalBytesDelta,
     IReadOnlyCollection<FileInventoryFolderGrowth> TopGrowingFolders);
 
+public sealed record FileInventoryCycleComparison(
+    Guid? PreviousSnapshotId,
+    DateTimeOffset? PreviousStartedUtc,
+    long PreviousFileCount,
+    long PreviousFolderCount,
+    long PreviousTotalBytes,
+    long PreviousErrorCount,
+    decimal TotalBytesGrowthPercent,
+    long ErrorCountDelta);
+
 public sealed record FileInventoryFolderGrowth(
     string Path,
     long FileCountDelta,
@@ -116,6 +131,42 @@ public sealed record FileInventoryFileCandidate(
 public sealed record FileInventoryAgeBucket(string Label, long FileCount, long TotalBytes);
 
 public sealed record FileInventoryRecommendation(string Title, string Detail, string Severity);
+
+public sealed record FileInventoryManagerialInsight(
+    int Score,
+    string Tone,
+    string Trend,
+    IReadOnlyCollection<string> Positives,
+    IReadOnlyCollection<string> Stables,
+    IReadOnlyCollection<string> Attentions);
+
+public sealed record FileInventoryExecutiveOverview(
+    IReadOnlyCollection<string> Headlines,
+    IReadOnlyCollection<FileInventoryExecutiveArea> StorageHotspots,
+    IReadOnlyCollection<FileInventoryExecutiveArea> ActivityHotspots,
+    IReadOnlyCollection<FileInventoryExecutiveActor> UserHotspots,
+    IReadOnlyCollection<FileInventoryExecutivePriority> Priorities);
+
+public sealed record FileInventoryExecutiveArea(
+    string Path,
+    string Label,
+    long PrimaryValue,
+    string PrimaryText,
+    string SecondaryText,
+    string Tone);
+
+public sealed record FileInventoryExecutiveActor(
+    string User,
+    long EventCount,
+    string PrimaryText,
+    string SecondaryText,
+    string Tone);
+
+public sealed record FileInventoryExecutivePriority(
+    string Title,
+    string Detail,
+    string Severity,
+    string Tone);
 
 public sealed record FileInventoryObservedActivityInput(
     DateTimeOffset TimestampUtc,
@@ -285,6 +336,9 @@ public static class FileInventoryAnalyzer
             AgeBuckets: BuildAgeBuckets(files, currentNow),
             ObservedActivity: BuildObservedActivitySummary(Array.Empty<FileInventoryObservedActivityInput>(), safeTop),
             Growth: BuildEmptyGrowthSummary(),
+            Comparison: BuildEmptyCycleComparison(),
+            Insight: BuildEmptyManagerialInsight(),
+            ExecutiveOverview: BuildEmptyExecutiveOverview(),
             Recommendations: BuildRecommendations(snapshot, items, files, currentNow));
     }
 
@@ -336,6 +390,247 @@ public static class FileInventoryAnalyzer
             TopGrowingFolders: Array.Empty<FileInventoryFolderGrowth>());
     }
 
+    public static FileInventoryCycleComparison BuildCycleComparison(
+        FileInventorySnapshot currentSnapshot,
+        FileInventorySnapshot previousSnapshot,
+        FileInventoryGrowthSummary growth)
+    {
+        var previousTotalBytes = Math.Max(previousSnapshot.TotalBytes, 0);
+        var growthPercent = previousTotalBytes > 0
+            ? decimal.Round((decimal)growth.TotalBytesDelta / previousTotalBytes * 100m, 2, MidpointRounding.AwayFromZero)
+            : 0m;
+
+        return new FileInventoryCycleComparison(
+            PreviousSnapshotId: previousSnapshot.Id,
+            PreviousStartedUtc: previousSnapshot.StartedUtc,
+            PreviousFileCount: previousSnapshot.FileCount,
+            PreviousFolderCount: previousSnapshot.FolderCount,
+            PreviousTotalBytes: previousSnapshot.TotalBytes,
+            PreviousErrorCount: previousSnapshot.ErrorCount,
+            TotalBytesGrowthPercent: growthPercent,
+            ErrorCountDelta: currentSnapshot.ErrorCount - previousSnapshot.ErrorCount);
+    }
+
+    public static FileInventoryCycleComparison BuildEmptyCycleComparison()
+    {
+        return new FileInventoryCycleComparison(
+            PreviousSnapshotId: null,
+            PreviousStartedUtc: null,
+            PreviousFileCount: 0,
+            PreviousFolderCount: 0,
+            PreviousTotalBytes: 0,
+            PreviousErrorCount: 0,
+            TotalBytesGrowthPercent: 0m,
+            ErrorCountDelta: 0);
+    }
+
+    public static FileInventoryManagerialInsight BuildManagerialInsight(FileInventorySummary summary)
+    {
+        var totalBytesSafe = Math.Max(summary.TotalBytes, 1);
+        var inactiveBytesRatio = (double)summary.Governance.Inactive365DaysBytes / totalBytesSafe;
+        var neverAccessedBytesRatio = (double)summary.Governance.NeverAccessedBytes / totalBytesSafe;
+        var warningRecommendations = summary.Recommendations.Count(item => item.Severity.Equals("warning", StringComparison.OrdinalIgnoreCase));
+        var infoRecommendations = Math.Max(0, summary.Recommendations.Count - warningRecommendations);
+        var inactivePenalty = Math.Min(26, (int)Math.Round(inactiveBytesRatio * 42, MidpointRounding.AwayFromZero));
+        var neverAccessPenalty = Math.Min(16, (int)Math.Round(neverAccessedBytesRatio * 28, MidpointRounding.AwayFromZero));
+        var executablePenalty = Math.Min(15, checked((int)Math.Min(summary.Governance.ExecutableFileCount * 2, int.MaxValue)));
+        var largePenalty = Math.Min(10, checked((int)Math.Min(summary.Governance.LargeFileCount, int.MaxValue)));
+        var errorPenalty = Math.Min(15, checked((int)Math.Min(summary.ErrorCount * 4, int.MaxValue)));
+        var recommendationPenalty = Math.Min(18, warningRecommendations * 5 + infoRecommendations * 2);
+        var score = Math.Clamp(100 - inactivePenalty - neverAccessPenalty - executablePenalty - largePenalty - errorPenalty - recommendationPenalty, 0, 100);
+        var growthPercent = (double)summary.Comparison.TotalBytesGrowthPercent;
+        var errorDelta = summary.Comparison.ErrorCountDelta;
+
+        var positives = new List<string>();
+        var stables = new List<string>();
+        var attentions = new List<string>();
+
+        if (summary.ErrorCount == 0)
+        {
+            positives.Add("Leitura sem erro no ultimo scan.");
+        }
+        else
+        {
+            attentions.Add($"{summary.ErrorCount} erro(s) de leitura no ultimo scan.");
+        }
+
+        if (summary.ObservedActivity.TotalEvents > 0)
+        {
+            positives.Add("Atividade observada cruzada com a timeline persistida.");
+        }
+        else
+        {
+            stables.Add("Sem atividade recente associada ao snapshot atual.");
+        }
+
+        if (summary.Comparison.PreviousSnapshotId is null)
+        {
+            stables.Add("Primeiro ciclo comparavel ainda nao disponivel.");
+        }
+        else if (Math.Abs(growthPercent) <= 3)
+        {
+            stables.Add("Volume estavel entre os dois ultimos ciclos.");
+        }
+        else if (growthPercent > 3)
+        {
+            attentions.Add($"Crescimento de {FormatPercent(growthPercent)} desde o ciclo anterior.");
+        }
+        else
+        {
+            positives.Add($"Reducao de {FormatPercent(Math.Abs(growthPercent))} no volume monitorado.");
+        }
+
+        if (summary.Governance.Inactive365DaysFileCount > 0)
+        {
+            attentions.Add($"{summary.Governance.Inactive365DaysFileCount.ToString("N0", CultureInfo.GetCultureInfo("pt-BR"))} arquivo(s) frio(s) ha mais de um ano.");
+        }
+        else
+        {
+            positives.Add("Nenhum arquivo frio acima de 365 dias no snapshot atual.");
+        }
+
+        if (summary.Governance.ExecutableFileCount > 0)
+        {
+            attentions.Add($"{summary.Governance.ExecutableFileCount.ToString("N0", CultureInfo.GetCultureInfo("pt-BR"))} executavel(is) ou script(s) exigem revisao.");
+        }
+        else
+        {
+            positives.Add("Nenhum executavel ou script exposto no recorte principal.");
+        }
+
+        if (summary.Recommendations.Count == 0)
+        {
+            positives.Add("Sem recomendacoes abertas no ultimo snapshot.");
+        }
+        else
+        {
+            attentions.Add($"{summary.Recommendations.Count.ToString("N0", CultureInfo.GetCultureInfo("pt-BR"))} recomendacao(oes) aguardando tratamento.");
+        }
+
+        var trend = "stable";
+        if (score >= 85 && errorDelta <= 0 && growthPercent <= 3)
+        {
+            trend = "improved";
+        }
+        else if (score < 65 || errorDelta > 0 || growthPercent > 12)
+        {
+            trend = "worsened";
+        }
+
+        var tone = score >= 85 ? "green" : score >= 65 ? "amber" : "danger";
+
+        return new FileInventoryManagerialInsight(
+            Score: score,
+            Tone: tone,
+            Trend: trend,
+            Positives: positives,
+            Stables: stables,
+            Attentions: attentions);
+    }
+
+    public static FileInventoryManagerialInsight BuildEmptyManagerialInsight()
+    {
+        return new FileInventoryManagerialInsight(
+            Score: 0,
+            Tone: "green",
+            Trend: "stable",
+            Positives: Array.Empty<string>(),
+            Stables: Array.Empty<string>(),
+            Attentions: Array.Empty<string>());
+    }
+
+    public static FileInventoryExecutiveOverview BuildExecutiveOverview(FileInventorySummary summary)
+    {
+        var ptBr = CultureInfo.GetCultureInfo("pt-BR");
+        var headlines = new List<string>();
+
+        if (summary.TopFolders.Count > 0)
+        {
+            var largestArea = summary.TopFolders.First();
+            headlines.Add($"Maior concentracao de dados em {largestArea.Path} com {FormatBytes(largestArea.TotalBytes)}.");
+        }
+
+        if (summary.ObservedActivity.TopFolders.Count > 0)
+        {
+            var activityArea = summary.ObservedActivity.TopFolders.First();
+            headlines.Add($"Area mais movimentada: {activityArea.Path} com {activityArea.EventCount.ToString("N0", ptBr)} evento(s).");
+        }
+
+        if (summary.ObservedActivity.TopUsers.Count > 0)
+        {
+            var activityUser = summary.ObservedActivity.TopUsers.First();
+            headlines.Add($"Usuario mais ativo no periodo: {activityUser.User} com {activityUser.EventCount.ToString("N0", ptBr)} acao(oes).");
+        }
+
+        if (summary.Governance.Inactive365DaysFileCount > 0)
+        {
+            headlines.Add($"{summary.Governance.Inactive365DaysFileCount.ToString("N0", ptBr)} arquivo(s) estao frios ha mais de 365 dias.");
+        }
+
+        if (summary.Recommendations.Count > 0)
+        {
+            headlines.Add($"{summary.Recommendations.Count.ToString("N0", ptBr)} recomendacao(oes) automaticas seguem abertas.");
+        }
+
+        var storageHotspots = summary.TopFolders
+            .Take(3)
+            .Select(item => new FileInventoryExecutiveArea(
+                Path: item.Path,
+                Label: item.Path,
+                PrimaryValue: item.TotalBytes,
+                PrimaryText: FormatBytes(item.TotalBytes),
+                SecondaryText: $"{item.FileCount.ToString("N0", ptBr)} arquivo(s) · {item.FolderCount.ToString("N0", ptBr)} pasta(s)",
+                Tone: "navy"))
+            .ToArray();
+
+        var activityHotspots = summary.ObservedActivity.TopFolders
+            .Take(3)
+            .Select(item => new FileInventoryExecutiveArea(
+                Path: item.Path,
+                Label: item.Path,
+                PrimaryValue: item.EventCount,
+                PrimaryText: $"{item.EventCount.ToString("N0", ptBr)} evento(s)",
+                SecondaryText: $"Ultima atividade em {item.LastActivityUtc:dd/MM/yyyy HH:mm} · acao dominante {NormalizeActionLabel(item.TopAction)}",
+                Tone: "blue"))
+            .ToArray();
+
+        var userHotspots = summary.ObservedActivity.TopUsers
+            .Take(3)
+            .Select(item => new FileInventoryExecutiveActor(
+                User: item.User,
+                EventCount: item.EventCount,
+                PrimaryText: $"{item.EventCount.ToString("N0", ptBr)} evento(s)",
+                SecondaryText: $"Ultima atividade em {item.LastActivityUtc:dd/MM/yyyy HH:mm} · acao dominante {NormalizeActionLabel(item.TopAction)}",
+                Tone: "green"))
+            .ToArray();
+
+        var priorities = summary.Recommendations
+            .Take(4)
+            .Select(item => new FileInventoryExecutivePriority(
+                Title: item.Title,
+                Detail: item.Detail,
+                Severity: item.Severity,
+                Tone: item.Severity.Equals("warning", StringComparison.OrdinalIgnoreCase) ? "danger" : "amber"))
+            .ToArray();
+
+        return new FileInventoryExecutiveOverview(
+            Headlines: headlines.Take(5).ToArray(),
+            StorageHotspots: storageHotspots,
+            ActivityHotspots: activityHotspots,
+            UserHotspots: userHotspots,
+            Priorities: priorities);
+    }
+
+    public static FileInventoryExecutiveOverview BuildEmptyExecutiveOverview()
+    {
+        return new FileInventoryExecutiveOverview(
+            Headlines: Array.Empty<string>(),
+            StorageHotspots: Array.Empty<FileInventoryExecutiveArea>(),
+            ActivityHotspots: Array.Empty<FileInventoryExecutiveArea>(),
+            UserHotspots: Array.Empty<FileInventoryExecutiveActor>(),
+            Priorities: Array.Empty<FileInventoryExecutivePriority>());
+    }
+
     private static Dictionary<string, FolderGrowthStats> BuildFolderGrowthStats(IReadOnlyCollection<FileInventoryItem> items)
     {
         return items
@@ -347,6 +642,25 @@ public static class FileInventoryAnalyzer
                     FolderCount: group.LongCount(item => item.ItemType == "folder"),
                     TotalBytes: group.Where(item => item.ItemType == "file").Sum(item => item.SizeBytes)),
                 StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string FormatPercent(double value)
+    {
+        return $"{value:0.#}%".Replace(".", ",");
+    }
+
+    private static string NormalizeActionLabel(string action)
+    {
+        return action.Trim().ToLowerInvariant() switch
+        {
+            "created" => "criacao",
+            "modified" => "alteracao",
+            "deleted" => "exclusao",
+            "renamed" => "rename",
+            "moved" => "movimentacao",
+            "accessed" => "acesso",
+            _ => action
+        };
     }
 
     public static FileInventoryObservedActivitySummary BuildObservedActivitySummary(

@@ -2,6 +2,19 @@
 
 Este modelo serve como base para um relatorio mensal ou trimestral apresentado para areas gestoras, seguranca, infraestrutura e dono do compartilhamento.
 
+## Principios do QBR
+
+O relatorio nao deve ser apenas uma exportacao de eventos. Ele precisa responder quatro perguntas:
+
+1. o ambiente cresceu ou encolheu;
+2. o risco aumentou ou reduziu;
+3. quem mais movimentou o ambiente e onde;
+4. o que precisa ser tratado antes do proximo ciclo.
+
+## Estrutura sugerida do relatorio
+
+O formato abaixo foi pensado para refletir o que o QBR da Varonis faz bem, mas usando o que o File Server Monitor consegue sustentar com honestidade.
+
 ## 1. Resumo Executivo
 
 - periodo analisado;
@@ -31,6 +44,7 @@ No periodo analisado, o ambiente monitorado apresentou crescimento de armazename
 - grafico de crescimento;
 - ranking de top pastas por tamanho;
 - ranking de top extensoes.
+- comparativo com snapshot anterior.
 
 ## 3. Atividade Operacional
 
@@ -49,6 +63,7 @@ No periodo analisado, o ambiente monitorado apresentou crescimento de armazename
 - ranking por usuario;
 - ranking por pasta;
 - heatmap por horario e dia da semana.
+- comparativo com periodo anterior.
 
 ## 4. Risco e Governanca
 
@@ -66,6 +81,7 @@ No periodo analisado, o ambiente monitorado apresentou crescimento de armazename
 - tabela de achados;
 - ranking de areas prioritarias;
 - semaforo por severidade.
+- score de higiene por compartilhamento ou pasta raiz.
 
 ## 5. Incidentes e Anomalias
 
@@ -81,6 +97,7 @@ No periodo analisado, o ambiente monitorado apresentou crescimento de armazename
 - linha do tempo resumida;
 - cards de anomalia;
 - comparativo com media historica.
+- top caminhos e top usuarios por tipo de incidente.
 
 ## 6. Evolucao desde o ultimo ciclo
 
@@ -141,7 +158,8 @@ O relatorio QBR nativo do File Server Monitor deve combinar:
 - inventario gerencial persistido por snapshot;
 - atividade correlacionada persistida na timeline;
 - anomalias operacionais;
-- recomendacoes automativas calculadas pela API.
+- recomendacoes automativas calculadas pela API;
+- comparativos entre ciclos salvos.
 
 ### Fontes internas do produto
 
@@ -162,3 +180,15 @@ Uma primeira versao do QBR nativo do produto pode sair mesmo antes de classifica
 - acessos negados;
 - anomalias relevantes;
 - recomendacoes priorizadas.
+
+## 11. Extensoes que agregam muito valor no futuro
+
+Quando a base atual estiver consolidada, o QBR pode subir de patamar com:
+
+- ACL e heranca quebrada;
+- dono da area;
+- score de higiene;
+- dados sensiveis por extensao, nome ou motor dedicado;
+- recomendacoes automaticas tratadas x pendentes;
+- tendencia trimestral por compartilhamento;
+- benchmark interno entre areas.

@@ -243,6 +243,38 @@ function Add-ResolvedPath {
     }
 }
 
+function Relocate-ResolvedDescendants {
+    param(
+        [hashtable]$Map,
+        [string]$PreviousPath,
+        [string]$CurrentPath
+    )
+
+    $previousRoot = Normalize-ResolvedPath -Path $PreviousPath
+    $currentRoot = Normalize-ResolvedPath -Path $CurrentPath
+
+    if ([string]::IsNullOrWhiteSpace($previousRoot) `
+        -or [string]::IsNullOrWhiteSpace($currentRoot) `
+        -or [string]::Equals($previousRoot, $currentRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return
+    }
+
+    foreach ($fileId in @($Map.Keys)) {
+        $knownPath = Normalize-ResolvedPath -Path ([string]$Map[$fileId])
+        if ([string]::IsNullOrWhiteSpace($knownPath)) {
+            continue
+        }
+
+        if (-not [string]::Equals($knownPath, $previousRoot, [System.StringComparison]::OrdinalIgnoreCase) `
+            -and -not $knownPath.StartsWith("$previousRoot\", [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        $suffix = $knownPath.Substring($previousRoot.Length)
+        $Map[$fileId] = "$currentRoot$suffix"
+    }
+}
+
 function Is-MoveTransition {
     param(
         [string]$PreviousPath,
@@ -515,23 +547,30 @@ $hydratedRecords = foreach ($record in $selectedRecords) {
         $resolvedPath = $knownPath
     }
 
+    $objectType = if ($record.fileAttributes -match "Directory|Diretório|Diretorio") {
+        "folder"
+    } elseif ([string]::IsNullOrWhiteSpace((Get-Extension -Path $resolvedPath))) {
+        "unknown"
+    } else {
+        "file"
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($record.fileId)) {
         if ($record.action -eq "deleted") {
             $currentPathByFileId.Remove($record.fileId)
             $pendingRenameOldPathByFileId.Remove($record.fileId)
         } else {
+            if ($resolvedAction -in @("renamed", "moved") `
+                -and $objectType -eq "folder" `
+                -and -not [string]::IsNullOrWhiteSpace($previousPath)) {
+                Relocate-ResolvedDescendants -Map $currentPathByFileId -PreviousPath $previousPath -CurrentPath $resolvedPath
+            }
+
             $currentPathByFileId[$record.fileId] = $resolvedPath
         }
     }
 
     $extension = Get-Extension -Path $resolvedPath
-    $objectType = if ($record.fileAttributes -match "Directory|Diretório|Diretorio") {
-        "folder"
-    } elseif ([string]::IsNullOrWhiteSpace($extension)) {
-        "unknown"
-    } else {
-        "file"
-    }
 
     [pscustomobject]@{
         cursorType = "usn"

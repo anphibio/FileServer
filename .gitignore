@@ -13,6 +13,7 @@ obj/
 *.suo
 TestResults/
 publish/
+artifacts/
 node_modules/
 **/dist/
 *.tsbuildinfo

@@ -15,6 +15,7 @@ var tests = new (string Name, Action Test)[]
     ("consolida rename do USN e suprime ruido do security log", CollapsesUsnRenameAndSuppressesSecurityNoise),
     ("consolida rename do USN mesmo com eventos intercalados", CollapsesUsnRenameWithInterleavedEvents),
     ("infere rename a partir de ruído do USN com o mesmo file id", InfersRenameFromUsnNoiseWithSameFileId),
+    ("nao infere transicao maior quando ja existe rename explicito do mesmo arquivo", DoesNotInferNoiseTransitionOverExplicitFileRename),
     ("trata nome provisorio de bitmap como criacao final", TreatsBitmapProvisionalRenameAsFinalCreation),
     ("trata nome provisorio do Office como criacao final", TreatsOfficeProvisionalRenameAsFinalCreation),
     ("trata nome provisorio do PowerPoint como criacao final", TreatsPowerPointProvisionalRenameAsFinalCreation),
@@ -27,8 +28,10 @@ var tests = new (string Name, Action Test)[]
     ("nao cruza planilhas provisorias repetidas", DoesNotCrossCorrelateRepeatedExcelProvisionals),
     ("timeline colapsa acessos repetidos ao mesmo arquivo", TimelineCollapsesRepeatedFileAccess),
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
+    ("timeline preserva criacao de pastas com arquivos filhos", TimelineKeepsFolderCreatesWithChildFiles),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove criacao tardia de pasta quando a arvore foi excluida", TimelineSuppressesLateFolderCreateEchoAroundDelete),
+    ("timeline remove criacao tardia de arquivo quando a arvore foi excluida", TimelineSuppressesLateFileCreateEchoAroundDelete),
     ("timeline remove ecos de exclusao em rename", TimelineSuppressesDeleteEchoAroundRename),
     ("timeline preserva alteracao real antes de exclusao", TimelineKeepsRealModificationBeforeDelete),
     ("timeline preserva alteracao real antes de acesso", TimelineKeepsRealModificationBeforeAccess),
@@ -38,17 +41,34 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva modificacao do USN quando Security Log tambem registra append", TimelinePrefersUsnModificationOverSecurityAppend),
     ("timeline trata append de texto com modified vizinho como alteracao", TimelineTreatsSecurityTextAppendWithNearbyModifyAsModification),
     ("timeline preserva alteracao real antes de rename move permissao e exclusao", TimelineKeepsRealModificationThroughMixedLifecycle),
+    ("timeline preserva alteracao real um segundo apos criacao antes de acl e rename", TimelineKeepsRealModificationOneSecondAfterCreationBeforeAclAndRename),
+    ("timeline preserva alteracao real depois de acl antes de rename move e delete", TimelineKeepsRealTextModificationAfterAclBeforeRenameMoveAndDelete),
+    ("timeline nao transforma rename de arquivo em criacao durante escrita no mesmo segundo", TimelineKeepsRenameSemanticsDuringSameSecondFileWrites),
+    ("timeline preserva delete final depois de rename do arquivo no mesmo segundo", TimelineKeepsFinalDeleteAfterSameSecondRename),
     ("timeline preserva permissao alterada antes de rename posterior", TimelineKeepsPermissionChangeBeforeLaterRename),
     ("timeline remove delete em caminho antigo depois de move de pasta", TimelineSuppressesStaleDescendantDeleteAfterFolderMove),
     ("timeline sintetiza move dos descendentes conhecidos quando a pasta e movida", TimelineSynthesizesKnownDescendantMovesAfterFolderMove),
+    ("timeline sintetiza move dos descendentes quando criacao e move caem no mesmo segundo", TimelineSynthesizesDescendantMovesWhenFolderCreateAndMoveShareSecond),
+    ("timeline nao sintetiza descendente com nome antigo quando arquivo e pasta renomeiam no mesmo segundo", TimelineDoesNotSynthesizeStaleChildNameWhenFileAndFolderRenameShareSecond),
     ("timeline evita duplicar move explicito de descendente quando a pasta e movida", TimelineDoesNotDuplicateExplicitDescendantMoveAfterFolderMove),
     ("timeline sintetiza rename dos descendentes conhecidos quando a pasta e renomeada", TimelineSynthesizesKnownDescendantRenamesAfterFolderRename),
     ("timeline evita duplicar rename explicito de descendente quando a pasta e renomeada", TimelineDoesNotDuplicateExplicitDescendantRenameAfterFolderRename),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("timeline trata rename de pasta provisoria do windows como criacao", TimelineTreatsProvisionalFolderRenameAsCreation),
+    ("timeline preserva rename de pasta provisoria quando ja houve criacao explicita", TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
+    ("timeline remove acesso tecnico logo apos rename de arquivo", TimelineSuppressesAccessEchoAfterFileRename),
     ("timeline remove acesso tecnico junto da alteracao de permissao", TimelineSuppressesTechnicalAccessAroundPermissionChange),
     ("timeline remove acesso tecnico em pasta junto da alteracao de permissao", TimelineSuppressesTechnicalFolderAccessAroundPermissionChange),
+    ("timeline preserva alteracao de permissao na pasta mesmo com filhos no mesmo recorte", TimelineKeepsFolderPermissionChangeWithChildActivity),
+    ("timeline preserva permissao de arquivo antes de rename e move da pasta pai", TimelineKeepsChildPermissionChangeBeforeFolderRenameAndMove),
+    ("timeline preserva permissao em arquivo ja realocado para o caminho final", TimelineKeepsPermissionChangeAfterFolderMoveAtFinalPath),
+    ("timeline preserva permissao alterada mesmo quando exclusao vem logo depois", TimelineKeepsPermissionChangeBeforeDeleteOnSamePath),
+    ("timeline preserva lote misto paralelo sem ruido cruzado", TimelineKeepsLongMixedParallelBatchStable),
+    ("timeline preserva contagem em lote misto de maior volume", TimelineKeepsMassMixedBatchCountsStable),
+    ("timeline remove modified imediato depois de criacao confirmada", TimelineSuppressesImmediateSecurityModifyAfterConfirmedCreate),
+    ("timeline preserva alteracao real depois de criacao antes de exclusao", TimelineKeepsRealModificationAfterCreateBeforeDelete),
+    ("timeline preserva acesso real depois de criacao antes de move", TimelineKeepsRealAccessAfterCreateBeforeMove),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth),
     ("mapa conhecido reloca descendentes quando a pasta e movida", KnownPathMapRelocatesFolderDescendants),
     ("fila duravel descarrega apenas o limite mantendo a ordem", DurableQueueFlushesWithinLimitAndPreservesOrder),
@@ -56,7 +76,8 @@ var tests = new (string Name, Action Test)[]
     ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
     ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary),
     ("inventario cruza uso real observado por pasta e usuario", InventoryBuildsObservedActivitySummary),
-    ("inventario calcula crescimento entre snapshots", InventoryBuildsGrowthSummary)
+    ("inventario calcula crescimento entre snapshots", InventoryBuildsGrowthSummary),
+    ("inventario calcula comparacao e insight gerencial", InventoryBuildsManagerialInsight)
 };
 
 var failures = new List<string>();
@@ -366,6 +387,78 @@ static void InventoryBuildsGrowthSummary()
     Assert(growth.TopGrowingFolders.First().TotalBytesDelta == 5120, "Pasta RH deveria carregar delta de bytes.");
 }
 
+static void InventoryBuildsManagerialInsight()
+{
+    var previousSnapshotId = Guid.NewGuid();
+    var currentSnapshotId = Guid.NewGuid();
+    var now = DateTimeOffset.Parse("2026-07-02T03:00:00Z");
+    var previousSnapshot = new FileInventorySnapshot(
+        Id: previousSnapshotId,
+        Server: "FileServer",
+        Share: "Corporativo",
+        RootPath: @"C:\Corporativo",
+        StartedUtc: now.AddDays(-1).AddMinutes(-5),
+        FinishedUtc: now.AddDays(-1),
+        Status: "completed",
+        FileCount: 2,
+        FolderCount: 1,
+        TotalBytes: 2048,
+        ErrorCount: 1,
+        Error: null);
+    var currentSnapshot = new FileInventorySnapshot(
+        Id: currentSnapshotId,
+        Server: "FileServer",
+        Share: "Corporativo",
+        RootPath: @"C:\Corporativo",
+        StartedUtc: now.AddMinutes(-5),
+        FinishedUtc: now,
+        Status: "completed",
+        FileCount: 2,
+        FolderCount: 1,
+        TotalBytes: 2304,
+        ErrorCount: 0,
+        Error: null);
+    var previousItems = new[]
+    {
+        BuildInventoryItem(previousSnapshotId, now.AddDays(-1), @"C:\Corporativo\RH", "folder", 0, modifiedUtc: now.AddDays(-40)),
+        BuildInventoryItem(previousSnapshotId, now.AddDays(-1), @"C:\Corporativo\RH\a.txt", "file", 1024, modifiedUtc: now.AddDays(-40)),
+        BuildInventoryItem(previousSnapshotId, now.AddDays(-1), @"C:\Corporativo\RH\b.txt", "file", 1024, modifiedUtc: now.AddDays(-20))
+    };
+    var currentItems = new[]
+    {
+        BuildInventoryItem(currentSnapshotId, now, @"C:\Corporativo\RH", "folder", 0, modifiedUtc: now.AddDays(-10)),
+        BuildInventoryItem(currentSnapshotId, now, @"C:\Corporativo\RH\a.txt", "file", 1024, modifiedUtc: now.AddDays(-10)),
+        BuildInventoryItem(currentSnapshotId, now, @"C:\Corporativo\RH\b.txt", "file", 1280, modifiedUtc: now.AddDays(-3))
+    };
+    var growth = FileInventoryAnalyzer.BuildGrowthSummary(currentItems, previousItems, top: 5);
+    var comparison = FileInventoryAnalyzer.BuildCycleComparison(currentSnapshot, previousSnapshot, growth);
+    var summary = FileInventoryAnalyzer.BuildSummary(currentSnapshot, currentItems, top: 5, nowUtc: now) with
+    {
+        Growth = growth,
+        Comparison = comparison,
+        ObservedActivity = FileInventoryAnalyzer.BuildObservedActivitySummary(new[]
+        {
+            new FileInventoryObservedActivityInput(now.AddMinutes(-2), @"C:\Corporativo\RH\b.txt", @"FILESERVER\ana", "modified")
+        }, top: 5)
+    };
+
+    var insight = FileInventoryAnalyzer.BuildManagerialInsight(summary);
+
+    Assert(comparison.PreviousSnapshotId == previousSnapshotId, "Comparacao deveria carregar snapshot anterior.");
+    Assert(comparison.TotalBytesGrowthPercent > 10m && comparison.TotalBytesGrowthPercent < 13m, "Comparacao deveria calcular percentual de crescimento.");
+    Assert(comparison.ErrorCountDelta == -1, "Comparacao deveria calcular delta de erros.");
+    Assert(insight.Score > 70, "Insight deveria gerar um score coerente.");
+    Assert(insight.Tone is "amber" or "green", "Insight deveria classificar um tom valido.");
+    Assert(insight.Positives.Any(item => item.Contains("Atividade observada", StringComparison.OrdinalIgnoreCase)), "Insight deveria reconhecer atividade cruzada.");
+    Assert(insight.Attentions.Any(item => item.Contains("Crescimento", StringComparison.OrdinalIgnoreCase)), "Insight deveria apontar crescimento relevante.");
+
+    var executiveOverview = FileInventoryAnalyzer.BuildExecutiveOverview(summary with { Insight = insight });
+    Assert(executiveOverview.StorageHotspots.Count > 0, "Visao executiva deveria destacar areas de armazenamento.");
+    Assert(executiveOverview.ActivityHotspots.Count > 0, "Visao executiva deveria destacar areas com atividade.");
+    Assert(executiveOverview.UserHotspots.Count > 0, "Visao executiva deveria destacar usuarios ativos.");
+    Assert(executiveOverview.Headlines.Any(item => item.Contains("Usuario mais ativo", StringComparison.OrdinalIgnoreCase)), "Visao executiva deveria sintetizar usuario mais ativo.");
+}
+
 static void AgentClassifiesOperationalHealth()
 {
     var now = DateTimeOffset.Parse("2026-07-02T12:00:00Z");
@@ -632,6 +725,27 @@ static void InfersRenameFromUsnNoiseWithSameFileId()
     Assert(correlated.All(item => item.RecordId is not 10 and not 11), "Ruido do Security Log deveria ser suprimido para rename inferido.");
 }
 
+static void DoesNotInferNoiseTransitionOverExplicitFileRename()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(5));
+    var events = new[]
+    {
+        BuildCollectedEvent("usn", timestamp, "\\\\FS01\\Dados\\Projeto\\Nova pasta\\file.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "created", usn: 100, fileReferenceId: "file-1"),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(1), "\\\\FS01\\Dados\\Projeto\\Financeiro 2026\\file.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 110, fileReferenceId: "file-1"),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(1).AddMilliseconds(100), "\\\\FS01\\Dados\\Projeto\\Financeiro 2026\\relatorio-final.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 111, fileReferenceId: "file-1"),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(2), "\\\\FS01\\Dados\\Arquivo\\Projeto", "UNKNOWN", "usn-journal", "fsutil.exe", action: "moved", usn: 120, fileReferenceId: "folder-1") with { ObjectType = "folder", Extension = null },
+        BuildCollectedEvent("usn", timestamp.AddSeconds(3), "\\\\FS01\\Dados\\Arquivo\\Projeto\\Financeiro 2026\\relatorio-final.txt", "UNKNOWN", "usn-journal", "fsutil.exe", action: "modified", usn: 130, fileReferenceId: "file-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var renamed = correlated.Single(item => item.Action == "renamed");
+
+    Assert(renamed.PreviousPath == "\\\\FS01\\Dados\\Projeto\\Financeiro 2026\\file.txt", "Rename explicito do arquivo deve ser preservado.");
+    Assert(correlated.Any(item => item.Action == "created" && item.Path == "\\\\FS01\\Dados\\Projeto\\Nova pasta\\file.txt"), "Criacao original nao deve ser fundida em uma transicao maior.");
+    Assert(correlated.Count(item => item.Action == "moved" && item.FileReferenceId == "file-1") == 0, "Correlator nao deve inventar um move extra do arquivo quando ja existe rename explicito.");
+}
+
 static void TreatsBitmapProvisionalRenameAsFinalCreation()
 {
     var timestamp = DateTimeOffset.UtcNow;
@@ -869,6 +983,36 @@ static void TimelineKeepsDistinctFolderAccess()
     Assert(display.All(item => item.Action == "accessed"), "Eventos de pasta deveriam continuar como acesso.");
 }
 
+static void TimelineKeepsFolderCreatesWithChildFiles()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-13T05:03:51Z");
+    var projector = new EventTimelineProjector();
+    var root = @"C:\Corporativo\codex-create-tree";
+    var folder = $@"{root}\Nova pasta";
+    var nested = $@"{folder}\Subpasta interna";
+    var sibling = $@"{root}\Example folder";
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", root, objectType: "folder", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp, "created", folder, objectType: "folder", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "created", nested, objectType: "folder", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "created", sibling, objectType: "folder", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "created", $@"{root}\arquivo-raiz.txt", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "created", $@"{folder}\arquivo-pasta.txt", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "created", $@"{nested}\arquivo-subpasta.txt", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "created", $@"{sibling}\Novo(a) Planilha do Microsoft Excel.xlsx", source: "usn-journal", user: "UNKNOWN")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+    var debug = string.Join(" || ", display.OrderBy(item => item.Path).Select(item => $"{item.Action}|{item.ObjectType}|{item.Path}"));
+
+    Assert(display.Any(item => item.Action == "created" && item.Path == root), $"Criacao da pasta raiz do recorte deveria aparecer. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "created" && item.Path == folder), $"Criacao da pasta filha deveria aparecer. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "created" && item.Path == nested), $"Criacao da subpasta deveria aparecer. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "created" && item.Path == sibling), $"Criacao da pasta irma deveria aparecer. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "created") == 8, $"Deveriam aparecer 4 pastas e 4 arquivos criados. Atual: {debug}");
+}
+
 static void TimelineSuppressesLateFolderCreateEchoAroundDelete()
 {
     var timestamp = DateTimeOffset.Parse("2026-07-11T22:18:20Z");
@@ -887,6 +1031,25 @@ static void TimelineSuppressesLateFolderCreateEchoAroundDelete()
 
     Assert(display.All(item => !(item.Action == "created" && item.Path == folder)), $"Criacao tardia da pasta logo apos o delete da arvore deveria ser suprimida. Atual: {debug}");
     Assert(display.Any(item => item.Action == "deleted" && item.Path == folder), $"Exclusao real da pasta deveria permanecer visivel. Atual: {debug}");
+}
+
+static void TimelineSuppressesLateFileCreateEchoAroundDelete()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-13T05:11:58Z");
+    var file = @"C:\Corporativo\codex-create-tree\Example folder\Novo(a) Planilha do Microsoft Excel.xlsx";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddMinutes(-8), "created", file, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "deleted", file, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(723), "created", file, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "created" && item.Path == file) == 1, $"Criacao tardia apos delete nao deveria virar nova criacao. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "deleted" && item.Path == file), $"Exclusao real do arquivo deveria permanecer visivel. Atual: {debug}");
 }
 
 static void TimelineSynthesizesKnownDescendantDeletes()
@@ -1124,14 +1287,140 @@ static void TimelineKeepsRealModificationThroughMixedLifecycle()
     Assert(targetEvents.Any(item => item.Action == "moved" && item.Path == movedPath && item.PreviousPath == renamedPath), $"A movimentacao do arquivo deveria permanecer visivel. Atual: {debug}");
     Assert(targetEvents.Any(item => item.Action == "permission_changed" && item.Path == movedPath), $"A alteracao de permissao deveria permanecer visivel. Atual: {debug}");
     Assert(targetEvents.Any(item => item.Action == "deleted" && item.Path == movedPath), $"A exclusao do arquivo movido deveria permanecer visivel. Atual: {debug}");
-    Assert(targetEvents.Any(item => item.Action == "created" && item.Path == folderAfterRename), $"A pasta provisoria deveria materializar como criacao no nome final. Atual: {debug}");
-    Assert(targetEvents.All(item => !(item.Action == "renamed" && item.Path == folderAfterRename && item.PreviousPath == folderBeforeRename)), $"Rename de pasta provisoria nao deveria sobreviver separado. Atual: {debug}");
+    Assert(targetEvents.Any(item => item.Action == "renamed" && item.Path == folderAfterRename && item.PreviousPath == folderBeforeRename), $"Quando a pasta provisoria ja foi criada antes, o rename dela deveria permanecer visivel. Atual: {debug}");
+    Assert(targetEvents.All(item => !(item.Action == "created" && item.Path == folderAfterRename)), $"Nao deveria surgir criacao sintetica no nome final da pasta quando a origem ja foi criada. Atual: {debug}");
     Assert(targetEvents.Any(item => item.Action == "moved" && item.Path == folderAfterMove && item.PreviousPath == folderAfterRename), $"A movimentacao da pasta deveria permanecer visivel. Atual: {debug}");
     Assert(targetEvents.Any(item => item.Action == "deleted" && item.Path == folderAfterMove), $"A exclusao final da pasta deveria permanecer visivel. Atual: {debug}");
     Assert(targetEvents.Count(item => item.Action == "modified" && item.Path == movedPath) == 0, $"A escrita tecnica do delete do arquivo nao deveria sobreviver como alteracao. Atual: {debug}");
     Assert(targetEvents.Count(item => item.Action == "modified" && item.Path == folderAfterMove) == 0, $"A escrita tecnica do delete da pasta nao deveria sobreviver como alteracao. Atual: {debug}");
     Assert(targetEvents.Count(item => item.Action == "accessed" && item.Path == movedPath) == 0, $"O acesso tecnico ao arquivo movido nao deveria sobreviver como ruido. Atual: {debug}");
     Assert(targetEvents.Count(item => item.Action == "accessed" && item.Path == folderAfterMove) == 0, $"O acesso tecnico a pasta excluida nao deveria sobreviver como ruido. Atual: {debug}");
+}
+
+static void TimelineKeepsRealModificationOneSecondAfterCreationBeforeAclAndRename()
+{
+    var projector = new EventTimelineProjector();
+    var timestamp = DateTimeOffset.Parse("2026-07-13T04:07:22Z");
+    var originalPath = @"C:\Corporativo\codex-acl-deep\Departamento\SubArea\planilha.csv";
+    var renamedPath = @"C:\Corporativo\codex-acl-deep\Departamento\SubArea\planilha-renomeada.csv";
+
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "modified", originalPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "permission_changed", originalPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4), "renamed", renamedPath, previousPath: originalPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4).AddMilliseconds(157), "accessed", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4).AddMilliseconds(157), "deleted", originalPath, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "created" && item.Path == originalPath), $"Criacao inicial deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "modified" && item.Path == originalPath), $"Alteracao real um segundo apos a criacao deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "permission_changed" && item.Path == originalPath), $"ACL posterior deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "renamed" && item.Path == renamedPath && item.PreviousPath == originalPath), $"Rename posterior deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == originalPath) == 0, $"Acesso tecnico do rename nao deveria sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "deleted" && item.Path == originalPath) == 0, $"Delete tecnico do caminho antigo nao deveria sobreviver. Atual: {debug}");
+}
+
+static void TimelineKeepsRealTextModificationAfterAclBeforeRenameMoveAndDelete()
+{
+    var projector = new EventTimelineProjector();
+    var timestamp = DateTimeOffset.Parse("2026-07-13T04:38:53Z");
+    var originalPath = @"C:\Corporativo\codex-acl-inheritance\Financeiro\Folha\folha-01.csv";
+    var renamedPath = @"C:\Corporativo\codex-acl-inheritance\Financeiro\Folha-2026\folha-01.csv";
+    var movedPath = @"C:\Corporativo\codex-acl-inheritance\Arquivo\Folha-2026\folha-01.csv";
+    var folderBeforeRename = @"C:\Corporativo\codex-acl-inheritance\Financeiro\Folha";
+    var folderAfterRename = @"C:\Corporativo\codex-acl-inheritance\Financeiro\Folha-2026";
+    var folderAfterMove = @"C:\Corporativo\codex-acl-inheritance\Arquivo\Folha-2026";
+
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(timestamp.AddSeconds(3).AddMilliseconds(813), "permission_changed", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4), "modified", originalPath, source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(4).AddMilliseconds(823), "created_or_appended", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4).AddMilliseconds(820), "accessed", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(5), "renamed", folderAfterRename, previousPath: folderBeforeRename, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(5), "moved", renamedPath, previousPath: originalPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(6), "moved", folderAfterMove, previousPath: folderAfterRename, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(6), "moved", movedPath, previousPath: renamedPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(7), "deleted", movedPath, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "modified" && item.Path == originalPath), $"Alteracao real depois de ACL deveria sobreviver mesmo com rename/move/delete logo depois. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "permission_changed" && item.Path == originalPath), $"ACL anterior deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == movedPath && item.PreviousPath == renamedPath), $"Move do arquivo deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "deleted" && item.Path == movedPath), $"Delete final deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && (item.Path == originalPath || item.Path == movedPath)) == 0, $"Acesso tecnico de append/delete nao deveria sobreviver. Atual: {debug}");
+}
+
+static void TimelineKeepsRenameSemanticsDuringSameSecondFileWrites()
+{
+    var projector = new EventTimelineProjector();
+    var root = @"C:\Corporativo\codex-same-second-rename-write";
+    var originalFolder = $@"{root}\Projeto\Nova pasta";
+    var renamedFolder = $@"{root}\Projeto\Financeiro 2026";
+    var movedProject = $@"{root}\Arquivo\Projeto";
+    var originalPath = $@"{originalFolder}\file.txt";
+    var renamedPath = $@"{renamedFolder}\relatorio-final.txt";
+    var movedPath = $@"{movedProject}\Financeiro 2026\relatorio-final.txt";
+    var finalPath = $@"{movedProject}\Financeiro 2026\relatorio-2026.txt";
+
+    var events = new[]
+    {
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:50Z"), "created", $@"{root}\Projeto", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:50.050Z"), "created", originalFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:50.100Z"), "created", originalPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:51Z"), "renamed", renamedFolder, previousPath: originalFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:51.100Z"), "renamed", renamedPath, previousPath: $@"{renamedFolder}\file.txt", source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:51.220Z"), "created_or_appended", renamedPath, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:51.230Z"), "accessed", renamedPath, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:52Z"), "moved", movedProject, previousPath: $@"{root}\Projeto", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:53Z"), "modified", movedPath, source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:53.200Z"), "renamed", finalPath, previousPath: movedPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:53.260Z"), "created_or_appended", finalPath, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T06:12:53.270Z"), "accessed", finalPath, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var targetEvents = display.Where(item =>
+        item.Path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+        || (item.PreviousPath?.StartsWith(root, StringComparison.OrdinalIgnoreCase) ?? false)).ToArray();
+    var debug = string.Join(" || ", targetEvents.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(targetEvents.Any(item => item.Action == "renamed" && item.Path == renamedPath && item.PreviousPath == $@"{renamedFolder}\file.txt"), $"Rename explicito do arquivo para relatorio-final deveria permanecer visivel. Atual: {debug}");
+    Assert(targetEvents.Any(item => item.Action == "renamed" && item.Path == finalPath && item.PreviousPath == movedPath), $"Rename explicito do arquivo para relatorio-2026 deveria permanecer visivel. Atual: {debug}");
+    Assert(targetEvents.All(item => !(item.Path == renamedPath && (item.Action is "created" or "created_or_appended"))), $"Arquivo renomeado para relatorio-final nao deveria reaparecer como criacao. Atual: {debug}");
+    Assert(targetEvents.All(item => !(item.Path == finalPath && (item.Action is "created" or "created_or_appended"))), $"Arquivo renomeado para relatorio-2026 nao deveria reaparecer como criacao. Atual: {debug}");
+}
+
+static void TimelineKeepsFinalDeleteAfterSameSecondRename()
+{
+    var projector = new EventTimelineProjector();
+    var root = @"C:\Corporativo\codex-parallel-mixed-17";
+    var originalPath = $@"{root}\Alpha\one.txt";
+    var renamedPath = $@"{root}\Alpha\one-final.txt";
+    var events = new[]
+    {
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:40Z"), "created", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:41Z"), "modified", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:42Z"), "renamed", renamedPath, previousPath: originalPath, source: "usn-journal"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:42Z"), "deleted", renamedPath, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:42.090Z"), "deleted", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-12T10:55:42.090Z"), "accessed", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "renamed" && item.Path == renamedPath && item.PreviousPath == originalPath), $"Rename para o nome final deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "deleted" && item.Path == renamedPath), $"Delete do nome final nao deveria sumir quando acontece logo apos o rename. Atual: {debug}");
 }
 
 static void TimelineKeepsPermissionChangeBeforeLaterRename()
@@ -1222,6 +1511,65 @@ static void TimelineSynthesizesKnownDescendantMovesAfterFolderMove()
     Assert(childMoves[0].Source == "usn-journal+security-log", $"Move derivado deveria herdar a origem do move da pasta. Atual: {debug}");
 }
 
+static void TimelineSynthesizesDescendantMovesWhenFolderCreateAndMoveShareSecond()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T10:34:12Z");
+    var root = @"C:\Corporativo\codex-descendant-move-09";
+    var oldFolder = $@"{root}\Origem";
+    var newFolder = $@"{root}\Destino\Origem";
+    var oldChildA = $@"{oldFolder}\SubA\a.txt";
+    var oldChildB = $@"{oldFolder}\SubB\b.txt";
+    var newChildA = $@"{newFolder}\SubA\a.txt";
+    var newChildB = $@"{newFolder}\SubB\b.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", root, objectType: "folder", source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "created", oldFolder, objectType: "folder", source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "created", oldChildA, source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "created", oldChildB, source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "moved", newFolder, previousPath: oldFolder, objectType: "folder", source: "usn-journal")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var derivedMoves = display.Where(item => item.Action == "moved" && item.Path.StartsWith(newFolder, StringComparison.OrdinalIgnoreCase)).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(derivedMoves.Any(item => item.Path == newChildA && item.PreviousPath == oldChildA), $"Arquivo a.txt deveria ganhar move derivado mesmo quando criacao e move caem no mesmo segundo. Atual: {debug}");
+    Assert(derivedMoves.Any(item => item.Path == newChildB && item.PreviousPath == oldChildB), $"Arquivo b.txt deveria ganhar move derivado mesmo quando criacao e move caem no mesmo segundo. Atual: {debug}");
+}
+
+static void TimelineDoesNotSynthesizeStaleChildNameWhenFileAndFolderRenameShareSecond()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-13T04:15:35Z");
+    var root = @"C:\Corporativo\codex-parallel-mixed";
+    var oldFolder = $@"{root}\worker-1\Origem";
+    var renamedFolder = $@"{root}\worker-1\Origem-Renomeada";
+    var finalFolder = $@"{root}\worker-1\Destino\Origem-Renomeada";
+    var oldChild = $@"{oldFolder}\arquivo-3.txt";
+    var renamedChild = $@"{oldFolder}\arquivo-3-renomeado.txt";
+    var childAfterFolderRename = $@"{renamedFolder}\arquivo-3-renomeado.txt";
+    var staleChildAfterFolderRename = $@"{renamedFolder}\arquivo-3.txt";
+    var finalChild = $@"{finalFolder}\arquivo-3-renomeado.txt";
+    var staleFinalChild = $@"{finalFolder}\arquivo-3.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddSeconds(-1), "created", oldChild, source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "renamed", renamedChild, previousPath: oldChild, source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "renamed", renamedFolder, previousPath: oldFolder, objectType: "folder", source: "usn-journal"),
+        BuildTimelineEvent(timestamp, "moved", finalFolder, previousPath: renamedFolder, objectType: "folder", source: "usn-journal")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "renamed" && item.Path == renamedChild && item.PreviousPath == oldChild), $"Rename real do arquivo deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == childAfterFolderRename && item.PreviousPath == renamedChild), $"Rename da pasta deveria realocar o filho ja com nome novo. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == finalChild && item.PreviousPath == childAfterFolderRename), $"Move final da pasta deveria realocar o filho ja com nome novo. Atual: {debug}");
+    Assert(display.All(item => item.Path != staleChildAfterFolderRename && item.Path != staleFinalChild), $"Nao deveria existir descendente sintetico com nome antigo do arquivo. Atual: {debug}");
+}
+
 static void TimelineDoesNotDuplicateExplicitDescendantMoveAfterFolderMove()
 {
     var timestamp = DateTimeOffset.Parse("2026-07-11T11:45:00Z");
@@ -1300,6 +1648,7 @@ static void TimelineTreatsProvisionalFolderRenameAsCreation()
     var events = new[]
     {
         BuildTimelineEvent(timestamp.AddSeconds(-1), "created_or_appended", @"C:\Corporativo", objectType: "folder", source: "windows-security-log"),
+        BuildTimelineEvent(timestamp, "created", @"C:\Corporativo\Nova pasta", objectType: "folder", source: "usn-journal+security-log"),
         BuildTimelineEvent(timestamp, "renamed", @"C:\Corporativo\teste - 11", previousPath: @"C:\Corporativo\Nova pasta", objectType: "folder", source: "usn-journal+security-log")
     };
 
@@ -1310,6 +1659,38 @@ static void TimelineTreatsProvisionalFolderRenameAsCreation()
     Assert(display[0].Action == "created", $"Rename vindo de 'Nova pasta' deveria virar criação. Atual: {debug}");
     Assert(display[0].DisplayAction == "Criação", $"A ação visível deveria ser criação. Atual: {debug}");
     Assert(display[0].Path == @"C:\Corporativo\teste - 11", $"A criação deveria apontar para o nome final. Atual: {debug}");
+}
+
+static void TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T06:12:50Z");
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", @"C:\Corporativo\codex-deep-mixed-live-05\Projeto", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "created", @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Nova pasta", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "created", @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Nova pasta\file.txt", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "renamed", @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026", previousPath: @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Nova pasta", objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "renamed", @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026\relatorio-final.txt", previousPath: @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026\file.txt", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "moved", @"C:\Corporativo\codex-deep-mixed-live-05\Arquivo\Projeto", previousPath: @"C:\Corporativo\codex-deep-mixed-live-05\Projeto", objectType: "folder", source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var folderRename = display.SingleOrDefault(item =>
+        item.Action == "renamed"
+        && item.Path == @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026");
+    var syntheticFolderCreate = display.SingleOrDefault(item =>
+        item.Action == "created"
+        && item.Path == @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026");
+    var childMove = display.SingleOrDefault(item =>
+        item.Action == "moved"
+        && item.Path == @"C:\Corporativo\codex-deep-mixed-live-05\Arquivo\Projeto\Financeiro 2026\relatorio-final.txt");
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(folderRename is not null, $"Rename explicito da pasta deveria continuar como rename quando a pasta original ja foi criada. Atual: {debug}");
+    Assert(syntheticFolderCreate is null, $"Nao deveria surgir criacao sintetica no nome final da pasta quando ja existe criacao da origem. Atual: {debug}");
+    Assert(childMove is not null, $"Move derivado do arquivo interno deveria continuar visivel para rastreio. Atual: {debug}");
+    Assert(childMove!.PreviousPath == @"C:\Corporativo\codex-deep-mixed-live-05\Projeto\Financeiro 2026\relatorio-final.txt", $"Move derivado do arquivo deveria usar o ultimo caminho conhecido antes do move da pasta. Atual: {debug}");
 }
 
 static void TimelineSuppressesTechnicalAccessAroundPermissionChange()
@@ -1347,6 +1728,212 @@ static void TimelineSuppressesTechnicalFolderAccessAroundPermissionChange()
     Assert(display[0].Action == "permission_changed", $"A acao semantica deveria permanecer como permissao alterada. Atual: {debug}");
 }
 
+static void TimelineKeepsFolderPermissionChangeWithChildActivity()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T10:46:41Z");
+    var folder = @"C:\Corporativo\codex-acl-13";
+    var child = $@"{folder}\acl-target.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddSeconds(-9), "created", child, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp, "permission_changed", folder, objectType: "folder", source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp, "permission_changed", child, source: "usn-journal+security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|src={item.Source}|user={item.User}"));
+
+    Assert(display.Any(item => item.Action == "permission_changed" && item.Path == folder), $"Alteracao de permissao da pasta nao deveria ser descartada so porque houve atividade em arquivo filho. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "permission_changed" && item.Path == child), $"Alteracao de permissao do arquivo filho deveria continuar visivel. Atual: {debug}");
+}
+
+static void TimelineKeepsChildPermissionChangeBeforeFolderRenameAndMove()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T14:12:00Z");
+    var oldFolder = @"C:\Corporativo\codex-acl-mixed-21\Projeto";
+    var renamedFolder = @"C:\Corporativo\codex-acl-mixed-21\Projeto 2026";
+    var finalFolder = @"C:\Corporativo\codex-acl-mixed-21\Arquivo\Projeto 2026";
+    var oldChild = $@"{oldFolder}\financeiro.xlsx";
+    var renamedChild = $@"{renamedFolder}\financeiro.xlsx";
+    var finalChild = $@"{finalFolder}\financeiro.xlsx";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddSeconds(-6), "created", oldFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(-5), "created", oldChild, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "permission_changed", oldChild, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(900), "accessed", oldChild, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "renamed", renamedFolder, previousPath: oldFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4), "moved", finalFolder, previousPath: renamedFolder, objectType: "folder", source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "permission_changed" && item.Path == oldChild) == 1, $"Permissao alterada do arquivo deveria sobreviver exatamente uma vez no caminho original. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == oldChild) == 0, $"Acesso tecnico adjacente a mudanca de permissao nao deveria sobreviver. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "renamed" && item.Path == renamedFolder && item.PreviousPath == oldFolder), $"Rename da pasta pai deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == finalFolder && item.PreviousPath == renamedFolder), $"Move da pasta pai deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == renamedChild && item.PreviousPath == oldChild), $"Arquivo conhecido deveria ganhar o move derivado do rename da pasta. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == finalChild && item.PreviousPath == renamedChild), $"Arquivo conhecido deveria ganhar o move derivado do deslocamento final da pasta. Atual: {debug}");
+}
+
+static void TimelineKeepsPermissionChangeAfterFolderMoveAtFinalPath()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T18:05:00Z");
+    var oldFolder = @"C:\Corporativo\codex-acl-final-44\Origem";
+    var finalFolder = @"C:\Corporativo\codex-acl-final-44\Arquivo\Origem";
+    var oldChild = $@"{oldFolder}\contrato.docx";
+    var finalChild = $@"{finalFolder}\contrato.docx";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddSeconds(-12), "created", oldChild, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "moved", finalFolder, previousPath: oldFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "permission_changed", finalChild, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp.AddSeconds(2).AddMilliseconds(850), "accessed", finalChild, source: "windows-security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "moved" && item.Path == finalFolder && item.PreviousPath == oldFolder), $"Move da pasta deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == finalChild && item.PreviousPath == oldChild), $"Arquivo conhecido deveria ganhar move derivado para o caminho final. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "permission_changed" && item.Path == finalChild) == 1, $"Permissao alterada no caminho final deveria sobreviver uma unica vez. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == finalChild) == 0, $"Acesso tecnico depois da ACL nao deveria sobreviver no caminho final. Atual: {debug}");
+}
+
+static void TimelineKeepsPermissionChangeBeforeDeleteOnSamePath()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T18:20:00Z");
+    var path = @"C:\Corporativo\codex-acl-delete-17\sigiloso.xlsx";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "permission_changed", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(600), "accessed", path, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp.AddSeconds(2), "deleted", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp.AddSeconds(2).AddMilliseconds(120), "accessed", path, source: "windows-security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).Where(item => item.Path == path).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "permission_changed") == 1, $"Permissao alterada deveria continuar visivel antes da exclusao. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "deleted") == 1, $"Exclusao final deveria continuar visivel. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed") == 0, $"Acessos tecnicos ao redor da ACL/delete nao deveriam sobreviver. Atual: {debug}");
+}
+
+static void TimelineKeepsLongMixedParallelBatchStable()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T16:20:00Z");
+    var root = @"C:\Corporativo\codex-mixed-parallel-31";
+    var alpha = $@"{root}\alpha.txt";
+    var beta = $@"{root}\beta.txt";
+    var betaFinal = $@"{root}\beta-final.txt";
+    var gammaFolder = $@"{root}\Gamma";
+    var gammaArchive = $@"{root}\Arquivo\Gamma";
+    var gammaChild = $@"{gammaFolder}\inside.txt";
+    var gammaMovedChild = $@"{gammaArchive}\inside.txt";
+    var delta = $@"{root}\delta.txt";
+    var epsilon = $@"{root}\epsilon.txt";
+    var zeta = $@"{root}\zeta.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp.AddSeconds(-6), "created", gammaFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(-5), "created", gammaChild, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "created", alpha, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(-20), "created", zeta, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4), "modified", zeta, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "created", beta, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(220), "renamed", betaFinal, previousPath: beta, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(260), "created_or_appended", betaFinal, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(300), "accessed", betaFinal, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(500), "permission_changed", delta, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(1250), "accessed", delta, source: "windows-security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(700), "moved", gammaArchive, previousPath: gammaFolder, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(900), "deleted", epsilon, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(930), "accessed", epsilon, source: "windows-security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "created" && item.Path == alpha), $"Criacao de alpha deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "modified" && item.Path == zeta), $"Alteracao real de zeta deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "renamed" && item.Path == betaFinal && item.PreviousPath == beta), $"Rename de beta deveria permanecer visivel. Atual: {debug}");
+    Assert(display.All(item => !(item.Path == betaFinal && item.Action is "created" or "created_or_appended")), $"Beta renomeado nao deveria reaparecer como criacao. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == betaFinal) == 0, $"Acesso tecnico de beta renomeado nao deveria sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "permission_changed" && item.Path == delta) == 1, $"Delta deveria aparecer uma vez como permissao alterada. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == delta) == 0, $"Acesso tecnico de delta nao deveria sobreviver. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == gammaArchive && item.PreviousPath == gammaFolder), $"Move da pasta Gamma deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == gammaMovedChild && item.PreviousPath == gammaChild), $"Arquivo interno de Gamma deveria ganhar move derivado. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "deleted" && item.Path == epsilon) == 1, $"Delete de epsilon deveria permanecer uma unica vez. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == epsilon) == 0, $"Acesso tecnico de epsilon excluido nao deveria sobreviver. Atual: {debug}");
+}
+
+static void TimelineKeepsMassMixedBatchCountsStable()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-12T19:10:00Z");
+    var root = @"C:\Corporativo\codex-mass-mixed-52";
+    var projector = new EventTimelineProjector();
+    var events = new List<FileAuditEvent>();
+
+    for (var index = 1; index <= 5; index++)
+    {
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(index), "created", $@"{root}\create-{index}.txt", source: "usn-journal+security-log"));
+    }
+
+    for (var index = 1; index <= 5; index++)
+    {
+        var before = $@"{root}\rename-{index}.txt";
+        var after = $@"{root}\rename-{index}-final.txt";
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(10 + index), "created", before, source: "usn-journal+security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(11 + index), "renamed", after, previousPath: before, source: "usn-journal+security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(11 + index).AddMilliseconds(120), "created_or_appended", after, source: "windows-security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(11 + index).AddMilliseconds(160), "accessed", after, source: "windows-security-log"));
+    }
+
+    for (var index = 1; index <= 4; index++)
+    {
+        var path = $@"{root}\acl-{index}.docx";
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(30 + index), "permission_changed", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(30 + index).AddMilliseconds(900), "accessed", path, source: "windows-security-log", user: @"FILESERVER\Administrator"));
+    }
+
+    for (var index = 1; index <= 3; index++)
+    {
+        var sourceFolder = $@"{root}\Move-{index}";
+        var sourceChild = $@"{sourceFolder}\inside-{index}.txt";
+        var targetFolder = $@"{root}\Arquivo\Move-{index}";
+        var targetChild = $@"{targetFolder}\inside-{index}.txt";
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(45 + index), "created", sourceChild, source: "usn-journal+security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(46 + index), "moved", targetFolder, previousPath: sourceFolder, objectType: "folder", source: "usn-journal+security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(47 + index), "permission_changed", targetChild, source: "usn-journal+security-log"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(47 + index).AddMilliseconds(700), "accessed", targetChild, source: "windows-security-log"));
+    }
+
+    for (var index = 1; index <= 4; index++)
+    {
+        var path = $@"{root}\delete-{index}.xlsx";
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(60 + index), "deleted", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"));
+        events.Add(BuildTimelineEvent(timestamp.AddSeconds(60 + index).AddMilliseconds(120), "accessed", path, source: "windows-security-log", user: @"FILESERVER\Administrator"));
+    }
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "created" && item.Path.StartsWith($@"{root}\create-", StringComparison.OrdinalIgnoreCase)) == 5, $"As 5 criacoes simples deveriam sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "renamed" && item.Path.Contains("-final.txt", StringComparison.OrdinalIgnoreCase)) == 5, $"Os 5 renames explicitos deveriam sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "permission_changed" && item.Path.Contains(@"\acl-", StringComparison.OrdinalIgnoreCase)) == 4, $"As 4 ACLs diretas deveriam sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "moved" && item.Path.StartsWith($@"{root}\Arquivo\Move-", StringComparison.OrdinalIgnoreCase) && item.PreviousPath is not null) >= 6, $"Os 3 moves de pasta e os 3 moves derivados dos filhos deveriam sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "deleted" && item.Path.StartsWith($@"{root}\delete-", StringComparison.OrdinalIgnoreCase)) == 4, $"Os 4 deletes finais deveriam sobreviver. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) == 0, $"Nao deveria restar ruido de acesso tecnico no lote misto. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "created" && item.Path.Contains("-final.txt", StringComparison.OrdinalIgnoreCase)) == 0, $"Arquivos renomeados nao deveriam reaparecer como criacao. Atual: {debug}");
+}
+
 static void KnownPathMapRelocatesFolderDescendants()
 {
     var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -1361,6 +1948,77 @@ static void KnownPathMapRelocatesFolderDescendants()
     Assert(paths["folder"] == @"C:\Corporativo\destination\folder-after", "A pasta deveria acompanhar o novo caminho.");
     Assert(paths["nested"] == @"C:\Corporativo\destination\folder-after\nested.txt", "O arquivo interno deveria acompanhar a pasta movida.");
     Assert(paths["unrelated"] == @"C:\Corporativo\source\other.txt", "Caminhos fora da pasta movida nao deveriam ser alterados.");
+}
+
+static void TimelineKeepsRealModificationAfterCreateBeforeDelete()
+{
+    var projector = new EventTimelineProjector();
+    var path = @"C:\Corporativo\codex-mixed-real\Origem\arquivo-c.txt";
+    var events = new[]
+    {
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:30.000Z"), "created", path, source: "usn-journal"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:30.050Z"), "created_or_appended", path, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:30.060Z"), "accessed", path, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:32.000Z"), "modified", path, source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:40.000Z"), "deleted", path, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events)
+        .Where(item => item.Path == path)
+        .OrderBy(item => item.TimestampUtc)
+        .ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Length == 3, $"Criacao, alteracao real e exclusao deveriam permanecer visiveis. Atual: {debug}");
+    Assert(display[0].Action == "created", $"Primeiro evento deveria ser criacao. Atual: {debug}");
+    Assert(display[1].Action == "modified", $"Segundo evento deveria ser alteracao real, nao criacao sintetica. Atual: {debug}");
+    Assert(display[1].DisplayAction == "Alterado", $"Alteracao real deveria aparecer como Alterado. Atual: {debug}");
+    Assert(display[2].Action == "deleted", $"Ultimo evento deveria ser exclusao. Atual: {debug}");
+}
+
+static void TimelineSuppressesImmediateSecurityModifyAfterConfirmedCreate()
+{
+    var projector = new EventTimelineProjector();
+    var path = @"C:\Corporativo\Example folder\Novo(a) Documento de Texto - Copia (10).txt";
+    var events = new[]
+    {
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T08:08:44.000Z"), "created", path, source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T08:08:45.000Z"), "created", path, source: "usn-journal+security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T08:08:45.003Z"), "modified", path, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events)
+        .Where(item => item.Path == path)
+        .OrderBy(item => item.TimestampUtc)
+        .ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|src={item.Source}"));
+
+    Assert(display.Length == 1, $"Modified imediato apos criacao confirmada deveria ser suprimido. Atual: {debug}");
+    Assert(display[0].Action == "created", $"Evento restante deveria ser criacao. Atual: {debug}");
+}
+
+static void TimelineKeepsRealAccessAfterCreateBeforeMove()
+{
+    var projector = new EventTimelineProjector();
+    var originalPath = @"C:\Corporativo\codex-mixed-real\Origem\arquivo-a.txt";
+    var movedPath = @"C:\Corporativo\codex-mixed-real\Destino\arquivo-a.txt";
+    var events = new[]
+    {
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:30.000Z"), "created", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:30.050Z"), "created_or_appended", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:34.013Z"), "accessed", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(DateTimeOffset.Parse("2026-07-13T02:46:36.000Z"), "moved", movedPath, previousPath: originalPath, source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events)
+        .Where(item => item.Path == originalPath || item.Path == movedPath || item.PreviousPath == originalPath)
+        .OrderBy(item => item.TimestampUtc)
+        .ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "created" && item.Path == originalPath), $"Criacao inicial deveria permanecer visivel. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "accessed" && item.Path == originalPath), $"Acesso real antes do move nao deveria sumir como ruido. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == movedPath && item.PreviousPath == originalPath), $"Move final deveria permanecer visivel. Atual: {debug}");
 }
 
 static void TimelineKeepsRenameBetweenWindowsDefaultNames()
@@ -1387,6 +2045,26 @@ static void TimelineKeepsRenameBetweenWindowsDefaultNames()
     Assert(renamed.Path == nextPath, "Rename deveria apontar para o novo nome.");
     Assert(renamed.PreviousPath == previousPath, "Rename deveria preservar o nome anterior.");
     Assert(display.All(item => item.Action != "created"), "Rename entre nomes padrao nao deveria virar criacao.");
+}
+
+static void TimelineSuppressesAccessEchoAfterFileRename()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-14T15:22:04Z");
+    var previousPath = @"C:\Corporativo\Novo(a) Documento de Texto - Copia (3).txt";
+    var nextPath = @"C:\Corporativo\Novo(a) Documento de Texto - Copia (3) teste.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "renamed", nextPath, previousPath, source: "usn-journal"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(1200), "accessed", nextPath, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+
+    Assert(display.Length == 1, $"Rename com eco de acesso deveria gerar apenas um evento. Atual: {string.Join(", ", display.Select(item => $"{item.Action}:{item.Path}"))}");
+    Assert(display[0].Action == "renamed", "Evento restante deveria ser o rename.");
+    Assert(display[0].Path == nextPath, "Rename deveria apontar para o nome final.");
+    Assert(display[0].PreviousPath == previousPath, "Rename deveria preservar o nome anterior.");
 }
 
 static IReadOnlyCollection<FileAuditEvent> BuildEvents(string action, int count)

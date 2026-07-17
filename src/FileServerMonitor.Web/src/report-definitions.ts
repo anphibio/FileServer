@@ -1,4 +1,8 @@
 export type ReportScenarioId =
+  | "executive-qbr"
+  | "capacity-cleanup"
+  | "cold-data"
+  | "hot-folder"
   | "folder-activity"
   | "user-activity"
   | "server-activity"
@@ -7,7 +11,9 @@ export type ReportScenarioId =
   | "recurrent-denied-access"
   | "permission-changes"
   | "mass-rename"
+  | "mass-move"
   | "executable-creation"
+  | "after-hours-activity"
   | "source-host-activity"
   | "suspicious-remote-access";
 
@@ -43,6 +49,38 @@ export type ReportScenario = {
 export const executableExtensions = ".exe,.msi,.bat,.cmd,.ps1,.psm1,.vbs,.js,.jar,.dll,.scr";
 
 export const reportScenarios: ReportScenario[] = [
+  {
+    id: "executive-qbr",
+    title: "QBR executivo do ciclo",
+    description: "Consolida um recorte gerencial com volume, atividade, risco e prioridades do período.",
+    focus: "Use para fechar um ciclo mensal ou trimestral com uma leitura executiva antes da reunião.",
+    groupBy: "path",
+    preset: { periodHours: "720", groupBy: "path" }
+  },
+  {
+    id: "capacity-cleanup",
+    title: "Capacidade e limpeza",
+    description: "Cruza atividade recente com o inventário para priorizar áreas grandes, frias ou candidatas a arquivamento.",
+    focus: "Use para montar plano de limpeza por pasta antes de ampliar storage ou rever retenção.",
+    groupBy: "path",
+    preset: { periodHours: "720", groupBy: "path" }
+  },
+  {
+    id: "cold-data",
+    title: "Dados frios e sem acesso",
+    description: "Apoia a revisão de arquivos antigos, sem acesso observado ou com baixa atividade recente.",
+    focus: "Use com um caminho específico para separar o que pode virar arquivamento, descarte ou validação com a área.",
+    groupBy: "path",
+    preset: { periodHours: "720", groupBy: "path" }
+  },
+  {
+    id: "hot-folder",
+    title: "Pasta quente",
+    description: "Combina volume, quantidade de eventos e usuários ativos para achar áreas críticas de uso intenso.",
+    focus: "Use para investigar pastas com alta movimentação, crescimento acelerado ou concentração operacional.",
+    groupBy: "user",
+    preset: { periodHours: "168", groupBy: "user" }
+  },
   {
     id: "folder-activity",
     title: "Atividade por pasta",
@@ -108,12 +146,28 @@ export const reportScenarios: ReportScenario[] = [
     preset: { action: "renamed", groupBy: "user" }
   },
   {
+    id: "mass-move",
+    title: "Movimentacao em massa",
+    description: "Foca movimentações de arquivos e pastas para rastrear origem, destino e usuário responsável.",
+    focus: "Use quando uma área não encontra arquivos porque a pasta ou seus descendentes foram movidos.",
+    groupBy: "user",
+    preset: { action: "moved", groupBy: "user" }
+  },
+  {
     id: "executable-creation",
     title: "Criacao de executaveis",
     description: "Foca criacao de executaveis e scripts em caminhos monitorados.",
     focus: "Use para revisao rapida de arquivos potencialmente suspeitos.",
     groupBy: "extension",
     preset: { action: "created", extension: executableExtensions, groupBy: "extension" }
+  },
+  {
+    id: "after-hours-activity",
+    title: "Atividade fora do expediente",
+    description: "Prepara um recorte para revisar ações sensíveis executadas em período incomum.",
+    focus: "Use em conjunto com período personalizado para analisar exclusões, renomes, movimentos e criações fora da janela esperada.",
+    groupBy: "user",
+    preset: { periodHours: "24", groupBy: "user" }
   },
   {
     id: "source-host-activity",

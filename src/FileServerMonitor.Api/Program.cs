@@ -562,13 +562,20 @@ app.MapPost("/api/events/timeline/rebuild", async (
         ToUtc: toUtc,
         Take: safeTake);
     var rawEvents = await repository.QueryAsync(query, cancellationToken);
-    var timeline = ProjectTimeline(rawEvents, user: null, action: null);
+    var contextEvents = await QueryKnownDescendantContextForFolderTransitionsAsync(rawEvents, timelineRepository, cancellationToken);
+    var timelineSource = contextEvents.Count == 0
+        ? rawEvents
+        : rawEvents.Concat(contextEvents).ToArray();
+    var timeline = ProjectTimeline(timelineSource, user: null, action: null);
 
     if (rawEvents.Count > 0)
     {
         var fromWindow = fromUtc ?? rawEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
         var toWindow = toUtc ?? rawEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
-        await timelineRepository.ReplaceWindowAsync(fromWindow, toWindow, timeline, TimelineCorrelationVersion, cancellationToken);
+        var windowTimeline = timeline
+            .Where(item => item.TimestampUtc >= fromWindow && item.TimestampUtc <= toWindow)
+            .ToArray();
+        await timelineRepository.ReplaceWindowAsync(fromWindow, toWindow, windowTimeline, TimelineCorrelationVersion, cancellationToken);
     }
 
     return Results.Ok(new TimelineRebuildResponse(
@@ -652,7 +659,15 @@ app.MapGet("/api/inventory/summary", async (
             top: safeTop,
             cancellationToken);
 
-    return Results.Ok(summary with { ObservedActivity = observedActivity });
+    var enrichedSummary = summary with { ObservedActivity = observedActivity };
+    var insight = FileInventoryAnalyzer.BuildManagerialInsight(enrichedSummary);
+    var executiveOverview = FileInventoryAnalyzer.BuildExecutiveOverview(enrichedSummary with { Insight = insight });
+
+    return Results.Ok(enrichedSummary with
+    {
+        Insight = insight,
+        ExecutiveOverview = executiveOverview
+    });
 });
 
 app.MapGet("/api/inventory/items", async (
@@ -1326,6 +1341,29 @@ static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditD
         auditEvent.DisplayTarget);
 }
 
+static FileAuditEvent ToAuditEvent(FileAuditDisplayEvent auditEvent)
+{
+    return new FileAuditEvent(
+        auditEvent.Id,
+        auditEvent.TimestampUtc,
+        auditEvent.Server,
+        auditEvent.Share,
+        auditEvent.Path,
+        auditEvent.PreviousPath,
+        auditEvent.ObjectType,
+        auditEvent.Action,
+        auditEvent.User,
+        auditEvent.Sid,
+        auditEvent.SourceHost,
+        auditEvent.SourceIp,
+        auditEvent.ProcessName,
+        auditEvent.FileSizeBytes,
+        auditEvent.Extension,
+        auditEvent.Result,
+        auditEvent.Severity,
+        auditEvent.Source);
+}
+
 static async Task<IReadOnlyCollection<FileAuditEvent>> QueryTimelineSourceEventsAsync(
     string? server,
     string? share,
@@ -1507,9 +1545,50 @@ static async Task RebuildTimelineForIngestedEventsAsync(
         ToUtc: toUtc,
         Take: 20_000);
     var rawEvents = await repository.QueryAsync(query, cancellationToken);
-    var timeline = ProjectTimeline(rawEvents, user: null, action: null);
+    var contextEvents = await QueryKnownDescendantContextForFolderTransitionsAsync(rawEvents, timelineRepository, cancellationToken);
+    var timelineSource = contextEvents.Count == 0
+        ? rawEvents
+        : rawEvents.Concat(contextEvents).ToArray();
+    var timeline = ProjectTimeline(timelineSource, user: null, action: null);
 
-    await timelineRepository.ReplaceWindowAsync(fromUtc, toUtc, timeline, TimelineCorrelationVersion, cancellationToken);
+    var windowTimeline = timeline
+        .Where(item => item.TimestampUtc >= fromUtc && item.TimestampUtc <= toUtc)
+        .ToArray();
+    await timelineRepository.ReplaceWindowAsync(fromUtc, toUtc, windowTimeline, TimelineCorrelationVersion, cancellationToken);
+}
+
+static async Task<IReadOnlyCollection<FileAuditEvent>> QueryKnownDescendantContextForFolderTransitionsAsync(
+    IReadOnlyCollection<FileAuditEvent> rawEvents,
+    ITimelineRepository timelineRepository,
+    CancellationToken cancellationToken)
+{
+    var folderTransitions = rawEvents
+        .Where(item => item.Action is "moved" or "renamed"
+            && !string.IsNullOrWhiteSpace(item.PreviousPath)
+            && item.ObjectType is "folder" or "directory")
+        .OrderBy(item => item.TimestampUtc)
+        .ToArray();
+    if (folderTransitions.Length == 0)
+    {
+        return Array.Empty<FileAuditEvent>();
+    }
+
+    var context = new Dictionary<Guid, FileAuditEvent>();
+    foreach (var transition in folderTransitions)
+    {
+        var descendants = await timelineRepository.QueryKnownLiveDescendantsAsync(
+            transition.PreviousPath!,
+            transition.TimestampUtc,
+            5_000,
+            cancellationToken);
+
+        foreach (var descendant in descendants)
+        {
+            context.TryAdd(descendant.Id, ToAuditEvent(descendant));
+        }
+    }
+
+    return context.Values.ToArray();
 }
 
 static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTimelineIfCoveredAsync(
@@ -1524,6 +1603,11 @@ static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTim
     }
 
     var coverage = await timelineRepository.GetCoverageAsync(cancellationToken);
+    if (query.FromUtc is null && query.ToUtc is null && coverage.Count > 0)
+    {
+        return await timelineRepository.QueryAsync(query, cancellationToken);
+    }
+
     if (!HasTimelineCoverage(coverage, query.FromUtc, query.ToUtc))
     {
         return null;
@@ -2342,6 +2426,12 @@ internal interface ITimelineRepository
 
     Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryAsync(TimelineQuery query, CancellationToken cancellationToken);
 
+    Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryKnownLiveDescendantsAsync(
+        string previousRoot,
+        DateTimeOffset beforeUtc,
+        int take,
+        CancellationToken cancellationToken);
+
     Task<ActivitySummaryResponse> GetActivitySummaryAsync(ActivitySummaryQuery query, CancellationToken cancellationToken);
 
     Task<FileInventoryObservedActivitySummary> GetObservedActivitySummaryAsync(
@@ -2497,6 +2587,91 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
         await EnsureOperationalIndexesAsync(connection, cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = BuildTimelineQuerySql(query, command);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var events = new List<FileAuditDisplayEvent>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            events.Add(ReadTimelineEvent(reader));
+        }
+
+        return events;
+    }
+
+    public async Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryKnownLiveDescendantsAsync(
+        string previousRoot,
+        DateTimeOffset beforeUtc,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        var normalizedRoot = FileInventoryNormalizer.NormalizePath(previousRoot).TrimEnd('\\');
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            return Array.Empty<FileAuditDisplayEvent>();
+        }
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureOperationalIndexesAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandTimeout = 120;
+        command.Parameters.AddWithValue("@RootPrefix", $"{normalizedRoot}\\%");
+        command.Parameters.AddWithValue("@BeforeUtc", beforeUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@Take", Math.Clamp(take, 1, 10_000));
+        command.CommandText = """
+            WITH CandidateHistory AS
+            (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (PARTITION BY FullPath ORDER BY TimestampUtc DESC, CorrelatedUtc DESC) AS PathRank
+                FROM dbo.FileAuditTimelineEvents
+                WHERE TimestampUtc < @BeforeUtc
+                  AND FullPath LIKE @RootPrefix
+                  AND ObjectType <> N'folder'
+            ),
+            LiveCandidates AS
+            (
+                SELECT TOP (@Take) *
+                FROM CandidateHistory candidate
+                WHERE candidate.PathRank = 1
+                  AND candidate.ActionName <> N'deleted'
+                  AND NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM dbo.FileAuditTimelineEvents terminal
+                      WHERE terminal.TimestampUtc > candidate.TimestampUtc
+                        AND terminal.TimestampUtc < @BeforeUtc
+                        AND (
+                            (terminal.FullPath = candidate.FullPath AND terminal.ActionName = N'deleted')
+                            OR (terminal.PreviousPath = candidate.FullPath AND terminal.ActionName IN (N'moved', N'renamed', N'deleted'))
+                        )
+                  )
+                ORDER BY candidate.TimestampUtc DESC
+            )
+            SELECT
+                Id,
+                TimestampUtc,
+                ServerName,
+                ShareName,
+                FullPath,
+                PreviousPath,
+                ObjectType,
+                ActionName,
+                UserName,
+                Sid,
+                SourceHost,
+                SourceIp,
+                ProcessName,
+                FileSizeBytes,
+                Extension,
+                ResultName,
+                Severity,
+                SourceName,
+                DisplayAction,
+                DisplayTarget
+            FROM LiveCandidates
+            ORDER BY TimestampUtc DESC;
+            """;
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         var events = new List<FileAuditDisplayEvent>();
@@ -3773,6 +3948,9 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         var growth = previousSnapshot is null
             ? FileInventoryAnalyzer.BuildEmptyGrowthSummary()
             : await BuildSqlGrowthSummaryAsync(connection, snapshot, previousSnapshot, top, cancellationToken);
+        var comparison = previousSnapshot is null
+            ? FileInventoryAnalyzer.BuildEmptyCycleComparison()
+            : FileInventoryAnalyzer.BuildCycleComparison(snapshot, previousSnapshot, growth);
 
         await using var command = connection.CreateCommand();
         command.CommandTimeout = 300;
@@ -3987,6 +4165,9 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             AgeBuckets: ageBuckets,
             ObservedActivity: FileInventoryAnalyzer.BuildObservedActivitySummary(Array.Empty<FileInventoryObservedActivityInput>(), top),
             Growth: growth,
+            Comparison: comparison,
+            Insight: FileInventoryAnalyzer.BuildEmptyManagerialInsight(),
+            ExecutiveOverview: FileInventoryAnalyzer.BuildEmptyExecutiveOverview(),
             Recommendations: BuildInventoryRecommendations(snapshot, governance));
     }
 
@@ -5226,6 +5407,40 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
         return Task.FromResult(result);
     }
 
+    public Task<IReadOnlyCollection<FileAuditDisplayEvent>> QueryKnownLiveDescendantsAsync(
+        string previousRoot,
+        DateTimeOffset beforeUtc,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        var normalizedRoot = FileInventoryNormalizer.NormalizePath(previousRoot).TrimEnd('\\');
+        if (string.IsNullOrWhiteSpace(normalizedRoot))
+        {
+            return Task.FromResult<IReadOnlyCollection<FileAuditDisplayEvent>>(Array.Empty<FileAuditDisplayEvent>());
+        }
+
+        var candidates = _events.Values
+            .Where(item => item.TimestampUtc < beforeUtc)
+            .Where(item => item.ObjectType != "folder")
+            .Where(item => FileInventoryNormalizer.NormalizePath(item.Path).StartsWith($"{normalizedRoot}\\", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(item => FileInventoryNormalizer.NormalizePath(item.Path), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderByDescending(item => item.TimestampUtc).First())
+            .Where(item => item.Action != "deleted")
+            .Where(item => !_events.Values.Any(terminal =>
+                terminal.TimestampUtc > item.TimestampUtc
+                && terminal.TimestampUtc < beforeUtc
+                && (
+                    (FileInventoryNormalizer.NormalizePath(terminal.Path).Equals(FileInventoryNormalizer.NormalizePath(item.Path), StringComparison.OrdinalIgnoreCase)
+                        && terminal.Action == "deleted")
+                    || (FileInventoryNormalizer.NormalizePath(terminal.PreviousPath ?? "").Equals(FileInventoryNormalizer.NormalizePath(item.Path), StringComparison.OrdinalIgnoreCase)
+                        && terminal.Action is "moved" or "renamed" or "deleted"))))
+            .OrderByDescending(item => item.TimestampUtc)
+            .Take(Math.Clamp(take, 1, 10_000))
+            .ToArray();
+
+        return Task.FromResult<IReadOnlyCollection<FileAuditDisplayEvent>>(candidates);
+    }
+
     public Task<ActivitySummaryResponse> GetActivitySummaryAsync(
         ActivitySummaryQuery query,
         CancellationToken cancellationToken)
@@ -5516,8 +5731,15 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
         var growth = previousSnapshot is null
             ? FileInventoryAnalyzer.BuildEmptyGrowthSummary()
             : FileInventoryAnalyzer.BuildGrowthSummary(items, previousItems, top);
+        var comparison = previousSnapshot is null
+            ? FileInventoryAnalyzer.BuildEmptyCycleComparison()
+            : FileInventoryAnalyzer.BuildCycleComparison(snapshot, previousSnapshot, growth);
 
-        return Task.FromResult(FileInventoryAnalyzer.BuildSummary(snapshot, items, top) with { Growth = growth });
+        return Task.FromResult(FileInventoryAnalyzer.BuildSummary(snapshot, items, top) with
+        {
+            Growth = growth,
+            Comparison = comparison
+        });
     }
 
     public Task<IReadOnlyCollection<FileInventoryItem>> QueryLatestItemsAsync(

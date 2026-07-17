@@ -265,6 +265,11 @@ public sealed class EventCorrelator
         var oldEvent = orderedPair[0];
         var newEvent = orderedPair[1];
 
+        if (HasExplicitPathTransitionForSameFileReference(ordered, oldEvent, newEvent, currentIndex, pairIndex))
+        {
+            return false;
+        }
+
         if (NormalizePath(oldEvent.Path).Equals(NormalizePath(newEvent.Path), StringComparison.OrdinalIgnoreCase))
         {
             return false;
@@ -283,6 +288,38 @@ public sealed class EventCorrelator
             ObjectType = PromoteObjectType(oldEvent.ObjectType, newEvent.ObjectType)
         };
         return true;
+    }
+
+    private bool HasExplicitPathTransitionForSameFileReference(
+        CollectedFileEvent[] ordered,
+        CollectedFileEvent oldEvent,
+        CollectedFileEvent newEvent,
+        int currentIndex,
+        int pairIndex)
+    {
+        if (string.IsNullOrWhiteSpace(oldEvent.FileReferenceId))
+        {
+            return false;
+        }
+
+        var lowerBound = oldEvent.TimestampUtc <= newEvent.TimestampUtc ? oldEvent.TimestampUtc : newEvent.TimestampUtc;
+        var upperBound = oldEvent.TimestampUtc >= newEvent.TimestampUtc ? oldEvent.TimestampUtc : newEvent.TimestampUtc;
+
+        return ordered
+            .Select((candidate, candidateIndex) => new { candidate, candidateIndex })
+            .Where(item => item.candidateIndex != currentIndex && item.candidateIndex != pairIndex)
+            .Where(item => item.candidate.CursorType.Equals("usn", StringComparison.OrdinalIgnoreCase))
+            .Where(item =>
+                item.candidate.Action.Equals("renamed_old", StringComparison.OrdinalIgnoreCase)
+                || item.candidate.Action.Equals("renamed_new", StringComparison.OrdinalIgnoreCase)
+                || item.candidate.Action.Equals("renamed", StringComparison.OrdinalIgnoreCase)
+                || item.candidate.Action.Equals("moved", StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.Equals(item.candidate.Volume, newEvent.Volume, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.Server.Equals(newEvent.Server, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.Share.Equals(newEvent.Share, StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.Equals(item.candidate.FileReferenceId, oldEvent.FileReferenceId, StringComparison.OrdinalIgnoreCase))
+            .Where(item => item.candidate.TimestampUtc >= lowerBound && item.candidate.TimestampUtc <= upperBound)
+            .Any();
     }
 
     private static CollectedFileEvent FinalizeCorrelatedEvent(CollectedFileEvent item)

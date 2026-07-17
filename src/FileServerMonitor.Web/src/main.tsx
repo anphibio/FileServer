@@ -36,6 +36,7 @@ import {
   summarizeReportFilters,
   type ReportFilters,
   type ReportGrouping,
+  type ReportScenario,
   type ReportScenarioId
 } from "./report-definitions";
 
@@ -388,6 +389,9 @@ type InventorySummary = {
   ageBuckets: InventoryAgeBucket[];
   observedActivity: InventoryObservedActivity;
   growth: InventoryGrowthSummary;
+  comparison: InventoryCycleComparison;
+  insight: InventoryManagerialInsight;
+  executiveOverview: InventoryExecutiveOverview;
   recommendations: InventoryRecommendation[];
 };
 
@@ -465,6 +469,58 @@ type InventoryGrowthSummary = {
   topGrowingFolders: InventoryFolderGrowth[];
 };
 
+type InventoryCycleComparison = {
+  previousSnapshotId?: string | null;
+  previousStartedUtc?: string | null;
+  previousFileCount: number;
+  previousFolderCount: number;
+  previousTotalBytes: number;
+  previousErrorCount: number;
+  totalBytesGrowthPercent: number;
+  errorCountDelta: number;
+};
+
+type InventoryManagerialInsight = {
+  score: number;
+  tone: "green" | "amber" | "danger";
+  trend: "improved" | "stable" | "worsened";
+  positives: string[];
+  stables: string[];
+  attentions: string[];
+};
+
+type InventoryExecutiveOverview = {
+  headlines: string[];
+  storageHotspots: InventoryExecutiveArea[];
+  activityHotspots: InventoryExecutiveArea[];
+  userHotspots: InventoryExecutiveActor[];
+  priorities: InventoryExecutivePriority[];
+};
+
+type InventoryExecutiveArea = {
+  path: string;
+  label: string;
+  primaryValue: number;
+  primaryText: string;
+  secondaryText: string;
+  tone: string;
+};
+
+type InventoryExecutiveActor = {
+  user: string;
+  eventCount: number;
+  primaryText: string;
+  secondaryText: string;
+  tone: string;
+};
+
+type InventoryExecutivePriority = {
+  title: string;
+  detail: string;
+  severity: string;
+  tone: string;
+};
+
 type InventoryFolderGrowth = {
   path: string;
   fileCountDelta: number;
@@ -524,6 +580,15 @@ type GeneratedReport = {
   generatedAt: string;
   filtersSummary: string;
   events: DisplayEvent[];
+  executiveSummary: string;
+  highlights: string[];
+  risks: string[];
+  nextSteps: string[];
+  topActions: Array<{ label: string; count: number }>;
+  topUsers: Array<{ label: string; count: number }>;
+  topPaths: Array<{ label: string; count: number }>;
+  sections: Array<{ title: string; items: string[] }>;
+  inventorySummary?: InventorySummary | null;
 };
 
 type Tab = "dashboard" | "events" | "investigation" | "reports" | "inventory" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
@@ -606,20 +671,31 @@ function App() {
     }
   }
 
-  async function loadData() {
-    setLoading(true);
+  async function loadData(showLoading = true) {
+    if (showLoading) {
+      setLoading(true);
+    }
     setError(null);
 
     try {
       const [healthResult, eventsResult, alertsResult, alertRulesResult, agentsResult, pathsResult, summaryResult, anomaliesResult, auditResult] = await Promise.all([
         fetchJson<HealthResponse>("/health"),
-        fetchJson<TimelinePageResponse>(buildTimelinePageUrl(eventsPage, eventFilter)),
+        fetchJson<TimelinePageResponse>(buildTimelinePageUrl(eventsPage, eventFilter), { timeoutMs: 12_000 }).catch((timelineError) => {
+          console.warn("Falha ao carregar linha do tempo inicial.", timelineError);
+          return {
+            items: events,
+            page: eventsPage,
+            pageSize: EVENTS_PAGE_SIZE,
+            totalItems: eventsTotalItems,
+            totalPages: eventsTotalPages
+          };
+        }),
         fetchJson<FileServerAlert[]>("/api/alerts?take=100"),
         fetchJson<AlertRuleConfig[]>("/api/alert-rules"),
         fetchJson<AgentHealth[]>("/api/agents/health"),
         fetchJson<MonitoredPath[]>("/api/monitored-paths"),
         fetchJson<ActivitySummary>(buildActivitySummaryUrl(summaryFilters)),
-        fetchJson<BaselineAnomalyResponse>(buildBaselineAnomaliesUrl(summaryFilters)).catch((anomalyError) => {
+        fetchJson<BaselineAnomalyResponse>(buildBaselineAnomaliesUrl(summaryFilters), { timeoutMs: 4_000 }).catch((anomalyError) => {
           console.warn("Falha ao carregar anomalias de baseline.", anomalyError);
           return null;
         }),
@@ -641,7 +717,9 @@ function App() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Falha ao carregar dados.");
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   }
 
@@ -655,7 +733,7 @@ function App() {
     }
 
     loadData();
-    const timer = window.setInterval(loadData, 30000);
+    const timer = window.setInterval(() => loadData(false), 30000);
     return () => window.clearInterval(timer);
   }, [summaryFilters, eventsPage, eventFilter, authStatus?.enabled, authUser]);
 
@@ -813,7 +891,7 @@ function App() {
                 <span className="user-role">{labelForRole(accessPolicy.role)}</span>
               </button>
             )}
-            <button className="icon-button" onClick={loadData} disabled={loading} title="Atualizar dados">
+            <button className="icon-button" onClick={() => loadData()} disabled={loading} title="Atualizar dados">
               <RefreshCcw size={18} />
             </button>
           </div>
@@ -1780,6 +1858,8 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedReport, setGeneratedReport] = useState<GeneratedReport | null>(null);
+  const [activeReportResultTab, setActiveReportResultTab] = useState<"summary" | "timeline" | "groups">("summary");
+  const [showAdvancedReportFilters, setShowAdvancedReportFilters] = useState(false);
   const [page, setPage] = useState(1);
   const scenario = getReportScenario(selectedScenario);
   const reportTitle = mode === "guided" ? scenario.title : "Relatorio personalizado";
@@ -1790,6 +1870,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     [events, safePage]
   );
   const groupedRows = useMemo(() => buildReportGroups(events, filters.groupBy), [events, filters.groupBy]);
+  const reportScenarioGroups = useMemo(() => groupReportScenariosByCategory(reportScenarios), []);
   const uniqueUsers = useMemo(() => new Set(events.map((event) => event.user).filter(Boolean)).size, [events]);
   const affectedPaths = useMemo(() => new Set(events.map((event) => event.path).filter(Boolean)).size, [events]);
   const dominantAction = useMemo(() => getTopEventAction(events), [events]);
@@ -1803,6 +1884,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     setMode("guided");
     setFilters(createFiltersForScenario(id));
     setGeneratedReport(null);
+    setActiveReportResultTab("summary");
     setError(null);
   }
 
@@ -1810,7 +1892,30 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     setMode("custom");
     setFilters(createDefaultReportFilters());
     setGeneratedReport(null);
+    setActiveReportResultTab("summary");
     setError(null);
+  }
+
+  async function loadReportEventsForCurrentFilters(options: { showNotice: boolean; activateTimeline: boolean }) {
+    const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, getReportEventTake(mode === "guided" ? selectedScenario : null)));
+    setEvents(result);
+    setPage(1);
+    setSearched(true);
+
+    if (options.activateTimeline) {
+      setActiveReportResultTab("timeline");
+    }
+
+    if (options.showNotice) {
+      onNotify({
+        tone: result.length > 0 ? "success" : "warning",
+        message: result.length > 0
+          ? `Relatorio atualizado com ${result.length.toLocaleString("pt-BR")} evento(s).`
+          : "Nenhum evento encontrado para este recorte."
+      });
+    }
+
+    return result;
   }
 
   async function submit(event: React.FormEvent) {
@@ -1824,16 +1929,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     setGeneratedReport(null);
 
     try {
-      const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, 20000));
-      setEvents(result);
-      setPage(1);
-      setSearched(true);
-      onNotify({
-        tone: result.length > 0 ? "success" : "warning",
-        message: result.length > 0
-          ? `Relatorio atualizado com ${result.length.toLocaleString("pt-BR")} evento(s).`
-          : "Nenhum evento encontrado para este recorte."
-      });
+      await loadReportEventsForCurrentFilters({ showNotice: true, activateTimeline: true });
     } catch (searchError) {
       setError(searchError instanceof Error ? searchError.message : "Falha ao consultar relatorio.");
     } finally {
@@ -1841,24 +1937,42 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     }
   }
 
-  function generateReport() {
-    if (!searched) {
-      onNotify({ tone: "warning", message: "Consulte o recorte antes de gerar o relatorio." });
+  async function generateReport() {
+    if (!validateReportFilters(filters, setError, onNotify)) {
       return;
     }
 
-    setGeneratedReport({
-      title: reportTitle,
-      generatedAt: new Date().toISOString(),
-      filtersSummary: summarizeReportFilters(filters),
-      events
-    });
-    onNotify({ tone: "success", message: "Previa do relatorio gerada com o mesmo recorte da investigacao." });
+    setLoading(true);
+    setError(null);
+    setGeneratedReport(null);
+
+    try {
+      const reportEvents = await loadReportEventsForCurrentFilters({ showNotice: false, activateTimeline: false });
+      const inventorySummary = await fetchInventorySummaryForReport(filters);
+      setGeneratedReport(buildGeneratedReport(reportTitle, filters, reportEvents, inventorySummary));
+      setActiveReportResultTab("summary");
+      onNotify({
+        tone: "success",
+        message: `Relatorio gerado com ${reportEvents.length.toLocaleString("pt-BR")} evento(s) no recorte.`
+      });
+    } catch (error) {
+      const fallbackEvents = searched ? events : [];
+      onNotify({
+        tone: "warning",
+        message: error instanceof Error
+          ? `Previa textual gerada, mas a leitura de inventario nao foi anexada: ${error.message}`
+          : "Previa textual gerada sem o resumo de inventario."
+      });
+      setGeneratedReport(buildGeneratedReport(reportTitle, filters, fallbackEvents, null));
+      setActiveReportResultTab("summary");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <div className="view-stack reports-view">
-      <section className="executive-grid">
+      <section className="executive-grid reports-kpi-strip">
         <ExecutiveCard
           title="Eventos no recorte"
           value={searched ? events.length.toLocaleString("pt-BR") : "-"}
@@ -1879,37 +1993,61 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
         />
       </section>
 
-      <Panel title="Relatorios guiados" subtitle="Use cenarios prontos para montar rapidamente um recorte comum de investigacao.">
-        <div className="report-mode-bar">
-          <button className={mode === "guided" ? "active" : ""} type="button" onClick={() => setMode("guided")}>
-            Guiados
-          </button>
-          <button className={mode === "custom" ? "active" : ""} type="button" onClick={startCustomReport}>
-            Personalizado
-          </button>
-        </div>
+      <section className="report-workflow">
+        <Panel title="Modelos de relatório" subtitle="Escolha um atalho guiado ou monte um recorte livre.">
+          <div className="report-mode-bar">
+            <button className={mode === "guided" ? "active" : ""} type="button" onClick={() => setMode("guided")}>
+              Guiados
+            </button>
+            <button className={mode === "custom" ? "active" : ""} type="button" onClick={startCustomReport}>
+              Personalizado
+            </button>
+          </div>
 
-        {mode === "guided" ? (
-          <div className="report-card-grid">
-            {reportScenarios.map((item) => (
-              <button
-                key={item.id}
-                className={`report-card ${selectedScenario === item.id ? "active" : ""}`}
-                type="button"
-                onClick={() => selectScenario(item.id)}
-              >
-                <strong>{item.title}</strong>
-                <span>{item.description}</span>
+          {generatedReport && (
+            <div className="report-current-model">
+              <div>
+                <span>Relatório gerado</span>
+                <strong>{generatedReport.title}</strong>
+              </div>
+              <button className="text-button" type="button" onClick={() => setGeneratedReport(null)}>
+                Trocar modelo
               </button>
-            ))}
-          </div>
-        ) : (
-          <div className="custom-report-note">
-            <strong>Relatorio personalizado</strong>
-            <span>Monte livremente o periodo, escopo, acao, origem e agrupamento antes de investigar.</span>
-          </div>
-        )}
-      </Panel>
+            </div>
+          )}
+
+          {mode === "guided" ? (
+            <div className="report-scenario-groups">
+              {reportScenarioGroups.map((group) => (
+                <section key={group.category} className="report-scenario-group">
+                  <div className="report-scenario-group-head">
+                    <strong>{group.category}</strong>
+                    <span>{group.items.length} modelo(s)</span>
+                  </div>
+                  <div className="report-card-grid compact">
+                    {group.items.map((item) => (
+                      <button
+                        key={item.id}
+                        className={`report-card ${selectedScenario === item.id ? "active" : ""}`}
+                        type="button"
+                        onClick={() => selectScenario(item.id)}
+                      >
+                        <strong>{item.title}</strong>
+                        <span>{item.description}</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <div className="custom-report-note">
+              <strong>Relatorio personalizado</strong>
+              <span>Monte livremente o periodo, escopo, acao, origem e agrupamento antes de investigar.</span>
+            </div>
+          )}
+        </Panel>
+      </section>
 
       <Panel title={reportTitle} subtitle={mode === "guided" ? scenario.focus : "Use filtros livres e gere um recorte reutilizavel."}>
         <form className="path-form report-form" onSubmit={submit}>
@@ -1972,44 +2110,52 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
               <option value="permission_changed">Permissao</option>
             </select>
           </label>
-          <label>
-            Host origem
-            <input value={filters.sourceHost} onChange={(event) => setFilters({ ...filters, sourceHost: event.target.value })} placeholder="NOTE-01" />
-          </label>
-          <label>
-            IP origem
-            <input value={filters.sourceIp} onChange={(event) => setFilters({ ...filters, sourceIp: event.target.value })} placeholder="192.168.2.10" />
-          </label>
-          <label>
-            Extensoes
-            <input value={filters.extension} onChange={(event) => setFilters({ ...filters, extension: event.target.value })} placeholder=".exe,.ps1,.bat" />
-          </label>
-          <label>
-            Resultado
-            <input value={filters.result} onChange={(event) => setFilters({ ...filters, result: event.target.value })} placeholder="success, denied..." />
-          </label>
-          <label>
-            Severidade
-            <select value={filters.severity} onChange={(event) => setFilters({ ...filters, severity: event.target.value })}>
-              <option value="">Todas</option>
-              <option value="info">Info</option>
-              <option value="warning">Warning</option>
-              <option value="critical">Critical</option>
-            </select>
-          </label>
-          <label>
-            Agrupar por
-            <select value={filters.groupBy} onChange={(event) => setFilters({ ...filters, groupBy: event.target.value as ReportGrouping })}>
-              <option value="action">Acao</option>
-              <option value="user">Usuario</option>
-              <option value="server">Servidor</option>
-              <option value="share">Compartilhamento</option>
-              <option value="sourceHost">Host origem</option>
-              <option value="path">Caminho</option>
-              <option value="extension">Extensao</option>
-              <option value="severity">Severidade</option>
-            </select>
-          </label>
+          <button className="text-button report-advanced-toggle" type="button" onClick={() => setShowAdvancedReportFilters((current) => !current)}>
+            <Plus size={16} />
+            {showAdvancedReportFilters ? "Ocultar filtros avançados" : "Filtros avançados"}
+          </button>
+          {showAdvancedReportFilters && (
+            <div className="report-advanced-grid">
+              <label>
+                Host origem
+                <input value={filters.sourceHost} onChange={(event) => setFilters({ ...filters, sourceHost: event.target.value })} placeholder="NOTE-01" />
+              </label>
+              <label>
+                IP origem
+                <input value={filters.sourceIp} onChange={(event) => setFilters({ ...filters, sourceIp: event.target.value })} placeholder="192.168.2.10" />
+              </label>
+              <label>
+                Extensoes
+                <input value={filters.extension} onChange={(event) => setFilters({ ...filters, extension: event.target.value })} placeholder=".exe,.ps1,.bat" />
+              </label>
+              <label>
+                Resultado
+                <input value={filters.result} onChange={(event) => setFilters({ ...filters, result: event.target.value })} placeholder="success, denied..." />
+              </label>
+              <label>
+                Severidade
+                <select value={filters.severity} onChange={(event) => setFilters({ ...filters, severity: event.target.value })}>
+                  <option value="">Todas</option>
+                  <option value="info">Info</option>
+                  <option value="warning">Warning</option>
+                  <option value="critical">Critical</option>
+                </select>
+              </label>
+              <label>
+                Agrupar por
+                <select value={filters.groupBy} onChange={(event) => setFilters({ ...filters, groupBy: event.target.value as ReportGrouping })}>
+                  <option value="action">Acao</option>
+                  <option value="user">Usuario</option>
+                  <option value="server">Servidor</option>
+                  <option value="share">Compartilhamento</option>
+                  <option value="sourceHost">Host origem</option>
+                  <option value="path">Caminho</option>
+                  <option value="extension">Extensao</option>
+                  <option value="severity">Severidade</option>
+                </select>
+              </label>
+            </div>
+          )}
           <div className="report-actions">
             <button className="text-button" type="submit" disabled={loading}>
               <Search size={16} />
@@ -2019,7 +2165,7 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
               <Download size={16} />
               Exportar CSV
             </button>
-            <button className="text-button" type="button" onClick={generateReport}>
+            <button className="text-button" type="button" onClick={generateReport} disabled={loading}>
               <ClipboardList size={16} />
               Gerar relatorio
             </button>
@@ -2029,60 +2175,132 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
 
       {error && <div className="error-banner">{error}</div>}
 
-      <section className="report-results-stack">
-        <Panel title="Resumo por agrupamento" subtitle={`Top ${labelForReportGroup(filters.groupBy).toLowerCase()} no recorte investigado.`}>
-          {groupedRows.length > 0 ? <ReportGroupList rows={groupedRows} total={events.length} /> : <EmptyState text="Consulte um recorte para gerar o resumo." />}
-        </Panel>
-        <Panel title="Linha do Tempo do Relatorio" subtitle="Eventos correlacionados pelo Core, prontos para validar antes da geracao.">
-          {searched ? (
-            <InvestigationTable
-              events={visibleEvents}
-              pagination={{
-                page: safePage,
-                totalPages,
-                pageItems: visibleEvents.length,
-                totalItems: events.length,
-                onPrevious: () => setPage((current) => Math.max(1, current - 1)),
-                onNext: () => setPage((current) => Math.min(totalPages, current + 1))
-              }}
-            />
-          ) : (
-            <EmptyState text="Escolha um relatorio, ajuste os filtros e clique em Investigar." />
-          )}
-        </Panel>
-      </section>
-
-      {generatedReport && (
-        <Panel title="Previa do relatorio" subtitle="Texto pronto para revisao, impressao ou salvamento em PDF pelo navegador.">
-          <div className="report-preview">
-            <div className="report-preview-head">
-              <div>
-                <strong>{generatedReport.title}</strong>
-                <span>Gerado em {formatDate(generatedReport.generatedAt)}</span>
-              </div>
-              <button className="text-button" type="button" onClick={() => window.print()}>
-                <Download size={16} />
-                Imprimir / salvar PDF
-              </button>
-            </div>
-            <p>{generatedReport.filtersSummary || "Sem filtros adicionais."}</p>
-            <div className="report-preview-metrics">
-              <span>{generatedReport.events.length.toLocaleString("pt-BR")} evento(s)</span>
-              <span>{uniqueUsers.toLocaleString("pt-BR")} usuario(s)</span>
-              <span>{affectedPaths.toLocaleString("pt-BR")} caminho(s)</span>
-            </div>
-            <ol className="report-preview-events">
-              {generatedReport.events.slice(0, 20).map((item) => (
-                <li key={item.id}>
-                  <strong>{item.displayAction ?? item.action}</strong>
-                  <span>{formatDate(item.timestampUtc)} · {item.user} · {item.path}</span>
-                </li>
-              ))}
-            </ol>
-            {generatedReport.events.length > 20 && <small>Mostrando os 20 eventos mais recentes na previa. Use o CSV para a lista completa.</small>}
+      <Panel
+        title={generatedReport ? `Resultado: ${generatedReport.title}` : "Resultado da investigação"}
+        subtitle={generatedReport ? "Relatório gerado com o mesmo recorte investigado." : "Consulte um recorte para liberar resumo, linha do tempo e agrupamentos."}
+      >
+        <div className="report-result-shell">
+          <div className="report-result-tabs">
+            <button className={activeReportResultTab === "summary" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("summary")}>
+              Resumo
+            </button>
+            <button className={activeReportResultTab === "timeline" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("timeline")}>
+              Linha do tempo
+            </button>
+            <button className={activeReportResultTab === "groups" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("groups")}>
+              Agrupamentos
+            </button>
           </div>
-        </Panel>
-      )}
+
+          {activeReportResultTab === "summary" && (
+            generatedReport ? (
+              <div className="report-preview">
+                <div className="report-preview-head">
+                  <div>
+                    <strong>{generatedReport.title}</strong>
+                    <span>Gerado em {formatDate(generatedReport.generatedAt)}</span>
+                  </div>
+                  <button className="text-button" type="button" onClick={() => window.print()}>
+                    <Download size={16} />
+                    Imprimir / salvar PDF
+                  </button>
+                </div>
+                <p>{generatedReport.filtersSummary || "Sem filtros adicionais."}</p>
+                <div className="report-preview-metrics">
+                  <span>{generatedReport.events.length.toLocaleString("pt-BR")} evento(s)</span>
+                  <span>{new Set(generatedReport.events.map((event) => event.user).filter(Boolean)).size.toLocaleString("pt-BR")} usuario(s)</span>
+                  <span>{new Set(generatedReport.events.map((event) => event.path).filter(Boolean)).size.toLocaleString("pt-BR")} caminho(s)</span>
+                </div>
+                <div className="report-qbr-grid">
+                  <article className="report-qbr-hero">
+                    <span className="inventory-kicker">Resumo executivo</span>
+                    <strong>{generatedReport.title}</strong>
+                    <p>{generatedReport.executiveSummary}</p>
+                  </article>
+                  <div className="report-qbr-cards">
+                    <ReportTextList title="Destaques do recorte" items={generatedReport.highlights} emptyText="Sem destaque relevante no recorte." />
+                    <ReportTextList title="Pontos de atencao" items={generatedReport.risks} emptyText="Sem ponto de atencao relevante no recorte." />
+                    <ReportTextList title="Proximos passos" items={generatedReport.nextSteps} emptyText="Sem proximo passo sugerido automaticamente." />
+                  </div>
+                </div>
+                <div className="report-qbr-sections">
+                  {generatedReport.sections.map((section) => (
+                    <article key={section.title} className="report-qbr-section">
+                      <div className="report-qbr-section-head">
+                        <span className="inventory-kicker">Seção</span>
+                        <strong>{section.title}</strong>
+                      </div>
+                      {section.items.length === 0 ? (
+                        <p>Sem observações relevantes para esta seção no recorte atual.</p>
+                      ) : (
+                        <ul>
+                          {section.items.map((item) => (
+                            <li key={`${section.title}-${item}`}>{item}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </article>
+                  ))}
+                </div>
+                {generatedReport.inventorySummary && (
+                  <div className="report-preview-metrics">
+                    <span>{generatedReport.inventorySummary.share ?? "Inventario"} · {formatBytes(generatedReport.inventorySummary.totalBytes)}</span>
+                    <span>{generatedReport.inventorySummary.fileCount.toLocaleString("pt-BR")} arquivo(s)</span>
+                    <span>{generatedReport.inventorySummary.recommendations.length.toLocaleString("pt-BR")} recomendacao(oes)</span>
+                    <span>score {generatedReport.inventorySummary.insight.score}</span>
+                    <span>snapshot {generatedReport.inventorySummary.finishedUtc ? formatDate(generatedReport.inventorySummary.finishedUtc) : "em andamento"}</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="report-empty-summary">
+                <ClipboardList size={28} />
+                <strong>Nenhum relatório gerado ainda</strong>
+                <p>Use Investigar para validar os eventos e depois clique em Gerar relatório. O resumo aparecerá aqui, separado dos modelos guiados.</p>
+              </div>
+            )
+          )}
+
+          {activeReportResultTab === "timeline" && (
+            searched ? (
+              <InvestigationTable
+                events={visibleEvents}
+                pagination={{
+                  page: safePage,
+                  totalPages,
+                  pageItems: visibleEvents.length,
+                  totalItems: events.length,
+                  onPrevious: () => setPage((current) => Math.max(1, current - 1)),
+                  onNext: () => setPage((current) => Math.min(totalPages, current + 1))
+                }}
+              />
+            ) : (
+              <EmptyState text="Escolha um relatório, ajuste os filtros e clique em Investigar." />
+            )
+          )}
+
+          {activeReportResultTab === "groups" && (
+            <div className="report-group-layout">
+              <Panel title="Resumo por agrupamento" subtitle={`Top ${labelForReportGroup(filters.groupBy).toLowerCase()} no recorte investigado.`}>
+                {groupedRows.length > 0 ? <ReportGroupList rows={groupedRows} total={events.length} /> : <EmptyState text="Consulte um recorte para gerar o resumo." />}
+              </Panel>
+              {generatedReport && (
+                <>
+                  <Panel title="Top ações" subtitle="Distribuição dominante no recorte consultado.">
+                    <ReportGroupList rows={generatedReport.topActions} total={generatedReport.events.length} />
+                  </Panel>
+                  <Panel title="Top usuários" subtitle="Principais atores envolvidos no período.">
+                    <ReportGroupList rows={generatedReport.topUsers} total={generatedReport.events.length} />
+                  </Panel>
+                  <Panel title="Top caminhos" subtitle="Áreas mais impactadas no recorte.">
+                    <ReportGroupList rows={generatedReport.topPaths} total={generatedReport.events.length} />
+                  </Panel>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </Panel>
     </div>
   );
 }
@@ -2786,6 +3004,7 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
   const [loadingInvestigation, setLoadingInvestigation] = useState(false);
   const [loading, setLoading] = useState(false);
   const [requestingScan, setRequestingScan] = useState(false);
+  const [activeInventoryTab, setActiveInventoryTab] = useState<"overview" | "capacity" | "cleanup" | "risk" | "activity" | "snapshots">("overview");
 
   async function loadInventory() {
     setLoading(true);
@@ -2868,13 +3087,132 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
     );
   }
 
+  const cycleStatusLabel = summary.insight?.trend === "improved"
+    ? "Melhorou"
+    : summary.insight?.trend === "worsened"
+      ? "Piorou"
+      : "Manteve";
+  const storageShareItems = summary.topFolders
+    .filter((item) => item.totalBytes > 0)
+    .slice(0, 5)
+    .map((item) => ({
+      label: item.path,
+      value: formatBytes(item.totalBytes),
+      detail: `${formatPercent((item.totalBytes / Math.max(summary.totalBytes, 1)) * 100)} do volume monitorado`,
+      percent: (item.totalBytes / Math.max(summary.totalBytes, 1)) * 100,
+      tone: "navy" as const
+    }));
+  const governanceRatioItems = [
+    {
+      label: "Volume frio +365 dias",
+      value: formatBytes(summary.governance.inactive365DaysBytes),
+      detail: `${summary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} arquivo(s)`,
+      percent: (summary.governance.inactive365DaysBytes / Math.max(summary.totalBytes, 1)) * 100,
+      tone: "amber" as const
+    },
+    {
+      label: "Sem acesso observado",
+      value: formatBytes(summary.governance.neverAccessedBytes),
+      detail: `${summary.governance.neverAccessedFileCount.toLocaleString("pt-BR")} arquivo(s)`,
+      percent: (summary.governance.neverAccessedBytes / Math.max(summary.totalBytes, 1)) * 100,
+      tone: "blue" as const
+    },
+    {
+      label: "Executáveis e scripts",
+      value: summary.governance.executableFileCount.toLocaleString("pt-BR"),
+      detail: formatBytes(summary.governance.executableFileBytes),
+      percent: Math.min(100, (summary.governance.executableFileCount / Math.max(summary.fileCount, 1)) * 100),
+      tone: "danger" as const
+    },
+    {
+      label: "Arquivos acima de 1 GB",
+      value: summary.governance.largeFileCount.toLocaleString("pt-BR"),
+      detail: formatBytes(summary.governance.largeFileBytes),
+      percent: Math.min(100, (summary.governance.largeFileCount / Math.max(summary.fileCount, 1)) * 100),
+      tone: "green" as const
+    }
+  ];
+  const largestFolder = summary.topFolders[0];
+  const mostActiveFolder = summary.observedActivity.topFolders[0];
+  const mostActiveUser = summary.observedActivity.topUsers[0];
+  const summarySnapshot = snapshots.find((snapshot) => snapshot.id === summary.snapshotId);
+  const latestCompletedSnapshot = snapshots.find((snapshot) => snapshot.status === "completed" || snapshot.status === "completed_with_errors");
+  const ignoredLatestSnapshot = latestCompletedSnapshot && latestCompletedSnapshot.id !== summary.snapshotId
+    ? latestCompletedSnapshot
+    : null;
+  const coldVolumePercent = (summary.governance.inactive365DaysBytes / Math.max(summary.totalBytes, 1)) * 100;
+  const neverAccessedPercent = (summary.governance.neverAccessedBytes / Math.max(summary.totalBytes, 1)) * 100;
+  const capacityHotspotPercent = largestFolder ? (largestFolder.totalBytes / Math.max(summary.totalBytes, 1)) * 100 : 0;
+  const decisionLanes = [
+    {
+      title: "Capacidade",
+      label: largestFolder ? largestFolder.path : "Sem pasta dominante",
+      value: largestFolder ? formatBytes(largestFolder.totalBytes) : "0 B",
+      detail: largestFolder
+        ? `${formatPercent(capacityHotspotPercent)} do volume no maior ponto de concentração`
+        : "Execute um scan para formar ranking de capacidade.",
+      tone: capacityHotspotPercent >= 40 ? "amber" : "blue",
+      progress: capacityHotspotPercent
+    },
+    {
+      title: "Limpeza",
+      label: "Arquivos frios e sem acesso",
+      value: formatBytes(summary.governance.inactive365DaysBytes + summary.governance.neverAccessedBytes),
+      detail: `${summary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} frio(s) + ${summary.governance.neverAccessedFileCount.toLocaleString("pt-BR")} sem acesso observado`,
+      tone: coldVolumePercent + neverAccessedPercent >= 35 ? "danger" : coldVolumePercent + neverAccessedPercent > 0 ? "amber" : "green",
+      progress: Math.min(100, coldVolumePercent + neverAccessedPercent)
+    },
+    {
+      title: "Risco",
+      label: "Executáveis, scripts e erros",
+      value: (summary.governance.executableFileCount + summary.errorCount).toLocaleString("pt-BR"),
+      detail: `${formatBytes(summary.governance.executableFileBytes)} em itens executáveis · ${summary.errorCount.toLocaleString("pt-BR")} erro(s) de scan`,
+      tone: summary.governance.executableFileCount > 0 || summary.errorCount > 0 ? "danger" : "green",
+      progress: Math.min(100, ((summary.governance.executableFileCount + summary.errorCount) / Math.max(summary.fileCount + summary.folderCount, 1)) * 100)
+    },
+    {
+      title: "Uso",
+      label: mostActiveFolder ? mostActiveFolder.path : "Sem atividade recente",
+      value: summary.observedActivity.totalEvents.toLocaleString("pt-BR"),
+      detail: mostActiveUser
+        ? `${mostActiveUser.user} lidera com ${mostActiveUser.eventCount.toLocaleString("pt-BR")} evento(s)`
+        : "Sem atividade correlacionada no período observado.",
+      tone: summary.observedActivity.totalEvents > 0 ? "blue" : "green",
+      progress: mostActiveFolder ? Math.min(100, (mostActiveFolder.eventCount / Math.max(summary.observedActivity.totalEvents, 1)) * 100) : 0
+    }
+  ] as const;
+
   return (
     <div className="inventory-workspace">
       <section className="inventory-overview" aria-label="Resumo do inventário">
-        <div className="inventory-overview-title">
-          <span className="inventory-kicker"><HardDrive size={16} /> Compartilhamento monitorado</span>
-          <h2>{summary.share ?? "Inventário de arquivos"}</h2>
-          <p>{summary.rootPath ?? "Raiz não informada"}</p>
+        <div className="inventory-overview-main">
+          <div className="inventory-overview-title">
+            <span className="inventory-kicker"><HardDrive size={16} /> Compartilhamento monitorado</span>
+            <h2>{summary.share ?? "Inventário de arquivos"}</h2>
+            <p>{summary.rootPath ?? "Raiz não informada"}</p>
+          </div>
+          <div className="inventory-overview-badges">
+            <span className="badge info"><Server size={14} /> {summary.server ?? "Servidor não informado"}</span>
+            <span className={`badge ${summary.errorCount > 0 ? "warning" : "success"}`}>
+              {summary.errorCount > 0 ? `${summary.errorCount} erro(s) no scan` : "Leitura sem erros"}
+            </span>
+            {ignoredLatestSnapshot && (
+              <span className="badge warning" title={`Scan de ${formatDate(ignoredLatestSnapshot.startedUtc)} tinha ${ignoredLatestSnapshot.fileCount.toLocaleString("pt-BR")} arquivo(s) e ${formatBytes(ignoredLatestSnapshot.totalBytes)}.`}>
+                Snapshot vazio ignorado
+              </span>
+            )}
+            <span className={`badge ${summary.growth.totalBytesDelta > 0 ? "warning" : "success"}`}>
+              {summary.growth.totalBytesDelta > 0 ? `Crescimento ${formatSignedBytes(summary.growth.totalBytesDelta)}` : `Variação ${formatSignedBytes(summary.growth.totalBytesDelta)}`}
+            </span>
+          </div>
+          <div className="inventory-snapshot-note">
+            <CheckCircle2 size={15} />
+            <span>
+              Inventário usando snapshot de {summary.finishedUtc ? formatDate(summary.finishedUtc) : "scan em andamento"}
+              {summarySnapshot ? ` · ${summarySnapshot.fileCount.toLocaleString("pt-BR")} arquivo(s), ${summarySnapshot.folderCount.toLocaleString("pt-BR")} pasta(s)` : ""}.
+              {ignoredLatestSnapshot ? ` O scan mais recente (${formatDate(ignoredLatestSnapshot.startedUtc)}) foi ignorado por não ter conteúdo suficiente para leitura gerencial.` : ""}
+            </span>
+          </div>
           <div className="inventory-overview-actions">
             <button className="text-button" type="button" onClick={loadInventory} disabled={loading}>
               <RefreshCcw size={16} />
@@ -2899,218 +3237,524 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
             <dd>{summary.finishedUtc ? formatDate(summary.finishedUtc) : "Em andamento"}</dd>
           </div>
           <div>
-            <dt>Servidor</dt>
-            <dd>{summary.server ?? "Não informado"}</dd>
+            <dt>Snapshot atual</dt>
+            <dd>{summary.snapshotId ? summary.snapshotId.slice(0, 8).toUpperCase() : "-"}</dd>
           </div>
           <div>
-            <dt>Leitura</dt>
-            <dd className={summary.errorCount > 0 ? "warning-text" : "success-text"}>{summary.errorCount > 0 ? `${summary.errorCount} erro(s)` : "Sem erros"}</dd>
+            <dt>Status</dt>
+            <dd>{summary.status === "ready" ? "Catálogo disponível" : summary.status}</dd>
           </div>
           <div>
-            <dt>Crescimento</dt>
-            <dd className={summary.growth.totalBytesDelta > 0 ? "warning-text" : "success-text"}>{formatSignedBytes(summary.growth.totalBytesDelta)}</dd>
+            <dt>Atividade observada</dt>
+            <dd>{summary.observedActivity.totalEvents.toLocaleString("pt-BR")} eventos</dd>
           </div>
         </dl>
       </section>
 
-      <section className="inventory-action-strip" aria-label="Pontos de atenção">
-        <InventoryActionMetric icon={<FileClock size={19} />} label="Arquivos frios" value={summary.governance.inactive365DaysFileCount} detail={`${formatBytes(summary.governance.inactive365DaysBytes)} sem alteração há mais de um ano`} tone="warning" />
-        <InventoryActionMetric icon={<Clock3 size={19} />} label="Sem registro de acesso" value={summary.governance.neverAccessedFileCount} detail={formatBytes(summary.governance.neverAccessedBytes)} tone="neutral" />
-        <InventoryActionMetric icon={<Files size={19} />} label="Arquivos grandes" value={summary.governance.largeFileCount} detail={`${formatBytes(summary.governance.largeFileBytes)} acima de 1 GB`} tone="warning" />
-        <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
+      <div className="inventory-tabs" role="tablist" aria-label="Navegação do inventário">
+        {[
+          ["overview", "Visão geral"],
+          ["capacity", "Capacidade"],
+          ["cleanup", "Limpeza"],
+          ["risk", "Risco"],
+          ["activity", "Atividade"],
+          ["snapshots", "Snapshots"]
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            className={activeInventoryTab === id ? "active" : ""}
+            type="button"
+            onClick={() => setActiveInventoryTab(id as typeof activeInventoryTab)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className={`inventory-tabbed-content inventory-tab-${activeInventoryTab}`}>
+      <section className="inventory-section inventory-pane-overview" aria-label="Leitura executiva qbr">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Leitura executiva</span>
+            <h3>Quadro para acompanhar evolução, concentração e governança</h3>
+          </div>
+          <p>Essa camada é pensada para gestão contínua: volume, risco, concentração e ação prioritária numa leitura única.</p>
+        </div>
+
+        <div className="inventory-qbr-grid">
+          <article className={`inventory-hero-card ${summary.insight.tone}`}>
+            <div className="inventory-hero-head">
+              <span className="inventory-kicker">QBR contínuo</span>
+              <span className={`status ${summary.insight.trend === "worsened" ? "critical" : summary.insight.trend === "improved" ? "ok" : "attention"}`}>{cycleStatusLabel}</span>
+            </div>
+            <strong>{summary.insight.score}</strong>
+            <p>
+              {summary.insight.score >= 85
+                ? "Ambiente bem organizado, com leitura operacional saudável e pouca pressão de revisão."
+                : summary.insight.score >= 65
+                  ? "Ambiente sob controle, mas já com sinais claros de limpeza, revisão ou endurecimento."
+                  : "Ambiente pedindo ação mais rápida para evitar crescimento desordenado ou risco operacional."}
+            </p>
+            <div className="inventory-hero-points">
+              {summary.executiveOverview.headlines.slice(0, 3).map((headline) => (
+                <div key={headline}>
+                  <CheckCircle2 size={15} />
+                  <span>{headline}</span>
+                </div>
+              ))}
+            </div>
+          </article>
+
+          <Panel title="Concentração do volume" subtitle="Onde o armazenamento está mais concentrado dentro do recorte atual.">
+            <InventoryRatioList items={storageShareItems} />
+          </Panel>
+
+          <Panel title="Pressão de governança" subtitle="Quanto do ambiente já sinaliza frio, baixa rastreabilidade ou itens sensíveis.">
+            <InventoryRatioList items={governanceRatioItems} />
+          </Panel>
+        </div>
       </section>
 
-      <div className="inventory-analysis-grid">
-        <Panel title="Composição do armazenamento" subtitle="Tipos de conteúdo que mais ocupam espaço.">
-          <InventoryCategoryChart items={summary.contentCategories} />
-        </Panel>
-        <Panel title="Ciclo de vida dos arquivos" subtitle="Distribuição pela última modificação conhecida.">
-          <InventoryAgeChart buckets={summary.ageBuckets} />
-        </Panel>
-        <Panel title="Atividade observada" subtitle="Ações correlacionadas nos últimos 30 dias.">
-          <div className="inventory-activity-total">
-            <Activity size={20} />
-            <strong>{summary.observedActivity.totalEvents.toLocaleString("pt-BR")}</strong>
-            <span>eventos reais</span>
+      <section className="inventory-section inventory-pane-overview" aria-label="Matriz de decisão gerencial">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Matriz de decisão</span>
+            <h3>O que atacar, acompanhar ou levar para o próximo ciclo</h3>
           </div>
-          <InventoryRanking
-            items={summary.observedActivity.topFolders}
-            getKey={(item) => item.path}
-            renderLabel={(item) => item.path}
-            renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
-            renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
-            maxValue={Math.max(...summary.observedActivity.topFolders.map((item) => item.eventCount), 1)}
-            getBarValue={(item) => item.eventCount}
-          />
-        </Panel>
-      </div>
+          <p>Quatro leituras rápidas para transformar inventário em plano de ação: capacidade, limpeza, risco e uso real.</p>
+        </div>
 
-      <Panel title="Recomendações para revisão" subtitle="Sinais do último snapshot para orientar limpeza, arquivamento e ajustes de acesso.">
-        {summary.recommendations.length === 0 ? (
-          <EmptyState text="Sem recomendação gerencial para o snapshot atual." />
-        ) : (
-          <div className="inventory-recommendations">
-            {summary.recommendations.map((item) => (
-              <article key={`${item.title}-${item.detail}`} className={item.severity === "warning" ? "warning" : "info"}>
-                {item.severity === "warning" ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
-                <div>
-                  <strong>{item.title}</strong>
-                  <p>{item.detail}</p>
-                </div>
-              </article>
-            ))}
-          </div>
-        )}
-      </Panel>
-
-      <div className="inventory-details-grid">
-        <Panel title="Pastas com maior consumo" subtitle="Priorize as maiores áreas para revisão de capacidade.">
-          <InventoryRanking
-            items={summary.topFolders}
-            getKey={(item) => item.path}
-            renderLabel={(item) => item.path}
-            renderValue={(item) => formatBytes(item.totalBytes)}
-            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivos · ${item.folderCount.toLocaleString("pt-BR")} pastas`}
-            maxValue={Math.max(...summary.topFolders.map((item) => item.totalBytes), 1)}
-          />
-        </Panel>
-        <Panel title="Usuários mais ativos" subtitle="Atividade real observada no mesmo período.">
-          <InventoryRanking
-            items={summary.observedActivity.topUsers}
-            getKey={(item) => item.user}
-            renderLabel={(item) => item.user}
-            renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
-            renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
-            maxValue={Math.max(...summary.observedActivity.topUsers.map((item) => item.eventCount), 1)}
-            getBarValue={(item) => item.eventCount}
-          />
-        </Panel>
-      </div>
-
-      <Panel title="Investigar achados" subtitle="Revise itens do último snapshot sem executar uma nova varredura.">
-        <div className="toolbar">
-          {[
-            ["executable", "Executáveis/scripts"],
-            ["large", "Arquivos grandes"],
-            ["inactive365", "Inativos +365d"],
-            ["errors", "Erros de leitura"]
-          ].map(([kind, label]) => (
-            <button
-              key={kind}
-              className={investigationKind === kind ? "primary-button compact" : "text-button"}
-              type="button"
-              onClick={() => loadInventoryItems(kind)}
-              disabled={loadingInvestigation}
-            >
-              <Search size={16} />
-              {label}
-            </button>
+        <div className="inventory-decision-grid">
+          {decisionLanes.map((item) => (
+            <article key={item.title} className={`inventory-decision-card ${item.tone}`}>
+              <div className="inventory-decision-head">
+                <span>{item.title}</span>
+                <strong>{item.value}</strong>
+              </div>
+              <p title={item.label}>{item.label}</p>
+              <small>{item.detail}</small>
+              <div className="inventory-decision-bar" aria-hidden="true">
+                <i style={{ width: `${Math.max(4, Math.min(100, item.progress))}%` }} />
+              </div>
+            </article>
           ))}
         </div>
-        {loadingInvestigation ? (
-          <EmptyState text="Carregando achados do inventário..." />
-        ) : investigationItems.length === 0 ? (
-          <EmptyState text="Escolha um tipo de achado para listar até 100 itens do último scan." />
-        ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Nome</th>
-                  <th>Tipo</th>
-                  <th>Tamanho</th>
-                  <th>Modificado</th>
-                  <th>Acessado</th>
-                  <th>Status</th>
-                  <th>Caminho</th>
-                </tr>
-              </thead>
-              <tbody>
-                {investigationItems.map((item) => (
-                  <tr key={item.id}>
-                    <td>{item.name}</td>
-                    <td>{item.extension || item.itemType}</td>
-                    <td>{formatBytes(item.sizeBytes)}</td>
-                    <td>{item.modifiedUtc ? formatDate(item.modifiedUtc) : "-"}</td>
-                    <td>{item.accessedUtc ? formatDate(item.accessedUtc) : "-"}</td>
-                    <td>
-                      <span className={`status ${item.status === "active" ? "ok" : "attention"}`}>
-                        {item.status === "active" ? "ativo" : item.status}
-                      </span>
-                    </td>
-                    <td title={item.path}>{item.path}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      </section>
+
+      <section className="inventory-section inventory-pane-overview" aria-label="Panorama executivo">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Panorama executivo</span>
+            <h3>Leitura rápida do ambiente monitorado</h3>
           </div>
-        )}
-      </Panel>
+          <p>Um retrato do tamanho, atividade e sinais de atenção do compartilhamento.</p>
+        </div>
+        <div className="inventory-kpi-grid">
+          <InventoryKpiCard
+            icon={<Database size={18} />}
+            label="Dados catalogados"
+            value={formatBytes(summary.totalBytes)}
+            detail={`${summary.topFolders.length.toLocaleString("pt-BR")} áreas no ranking principal`}
+            tone="navy"
+          />
+          <InventoryKpiCard
+            icon={<Files size={18} />}
+            label="Arquivos monitorados"
+            value={summary.fileCount.toLocaleString("pt-BR")}
+            detail={`${summary.folderCount.toLocaleString("pt-BR")} pastas registradas`}
+            tone="blue"
+          />
+          <InventoryKpiCard
+            icon={<BarChart3 size={18} />}
+            label="Crescimento recente"
+            value={formatSignedBytes(summary.growth.totalBytesDelta)}
+            detail={`${formatSignedNumber(summary.growth.fileCountDelta)} arquivo(s) vs. snapshot anterior`}
+            tone={summary.growth.totalBytesDelta > 0 ? "amber" : "green"}
+          />
+          <InventoryKpiCard
+            icon={<Activity size={18} />}
+            label="Atividade observada"
+            value={summary.observedActivity.totalEvents.toLocaleString("pt-BR")}
+            detail="Eventos reais cruzados com a timeline persistida"
+            tone="green"
+          />
+          <InventoryKpiCard
+            icon={<ClipboardList size={18} />}
+            label="Recomendações abertas"
+            value={summary.recommendations.length.toLocaleString("pt-BR")}
+            detail="Achados prontos para revisão ou limpeza"
+            tone={summary.recommendations.length > 0 ? "amber" : "green"}
+          />
+          <InventoryKpiCard
+            icon={<ShieldAlert size={18} />}
+            label="Itens sensíveis à revisão"
+            value={(summary.governance.executableFileCount + summary.governance.largeFileCount).toLocaleString("pt-BR")}
+            detail="Executáveis, scripts e arquivos grandes"
+            tone="danger"
+          />
+        </div>
+      </section>
 
-      <Panel title="Pastas que mais cresceram" subtitle="Comparação entre o snapshot atual e o anterior do mesmo compartilhamento.">
-        <InventoryRanking
-          items={summary.growth.topGrowingFolders}
-          getKey={(item) => item.path}
-          renderLabel={(item) => item.path}
-          renderValue={(item) => formatSignedBytes(item.totalBytesDelta)}
-          renderDetail={(item) => `${formatSignedNumber(item.fileCountDelta)} arquivo(s) · ${formatSignedNumber(item.folderCountDelta)} pasta(s)`}
-          maxValue={Math.max(...summary.growth.topGrowingFolders.map((item) => item.totalBytesDelta), 1)}
-          getBarValue={(item) => item.totalBytesDelta}
-        />
-      </Panel>
+      <section className="inventory-section inventory-pane-overview inventory-pane-activity" aria-label="Painel gerencial contínuo">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Painel gerencial contínuo</span>
+            <h3>Resumo executivo pronto para acompanhamento recorrente</h3>
+          </div>
+          <p>Uma leitura mais próxima de QBR contínuo: onde está o volume, onde está a atividade e o que entrou na fila de decisão.</p>
+        </div>
 
-      <div className="inventory-details-grid">
-        <Panel title="Maiores arquivos" subtitle="Candidatos para revisão de consumo, arquivamento ou política de retenção.">
+        <div className="inventory-headline-strip">
+          {summary.executiveOverview.headlines.length === 0 ? (
+            <EmptyState text="Sem destaques executivos suficientes no snapshot atual." />
+          ) : (
+            summary.executiveOverview.headlines.map((headline) => (
+              <article key={headline} className="inventory-headline-pill">
+                <CheckCircle2 size={16} />
+                <span>{headline}</span>
+              </article>
+            ))
+          )}
+        </div>
+
+        <div className="inventory-executive-grid">
+          <Panel title="Hotspots de armazenamento" subtitle="Áreas que mais concentram dados no compartilhamento.">
+            <InventoryExecutiveList
+              items={summary.executiveOverview.storageHotspots}
+              getKey={(item) => item.path}
+              renderTitle={(item) => item.label}
+              renderValue={(item) => item.primaryText}
+              renderDetail={(item) => item.secondaryText}
+            />
+          </Panel>
+
+          <Panel title="Hotspots de atividade" subtitle="Pastas que mais puxaram eventos reais no período recente.">
+            <InventoryExecutiveList
+              items={summary.executiveOverview.activityHotspots}
+              getKey={(item) => item.path}
+              renderTitle={(item) => item.label}
+              renderValue={(item) => item.primaryText}
+              renderDetail={(item) => item.secondaryText}
+            />
+          </Panel>
+
+          <Panel title="Usuários mais ativos" subtitle="Atores que mais apareceram na atividade correlacionada.">
+            <InventoryExecutiveList
+              items={summary.executiveOverview.userHotspots}
+              getKey={(item) => item.user}
+              renderTitle={(item) => item.user}
+              renderValue={(item) => item.primaryText}
+              renderDetail={(item) => item.secondaryText}
+            />
+          </Panel>
+        </div>
+
+        <Panel title="Fila gerencial de decisão" subtitle="Recomendações prontas para virar plano de ação no próximo ciclo.">
+          {summary.executiveOverview.priorities.length === 0 ? (
+            <EmptyState text="Sem prioridades abertas no snapshot atual." />
+          ) : (
+            <div className="inventory-priority-list">
+              {summary.executiveOverview.priorities.map((item) => (
+                <article key={`${item.title}-${item.detail}`} className={`inventory-priority-item ${item.tone}`}>
+                  <div className="inventory-priority-head">
+                    <strong>{item.title}</strong>
+                    <span className={`status ${item.severity === "warning" ? "critical" : "attention"}`}>{item.severity}</span>
+                  </div>
+                  <p>{item.detail}</p>
+                </article>
+              ))}
+            </div>
+          )}
+        </Panel>
+      </section>
+
+      <section className="inventory-section inventory-pane-overview" aria-label="Leitura do ciclo">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Leitura do ciclo</span>
+            <h3>Como o compartilhamento está se comportando agora</h3>
+          </div>
+          <p>Uma leitura curta para dizer se o ambiente melhorou, se manteve ou se pede reação mais rápida.</p>
+        </div>
+        <div className="inventory-cycle-grid">
+          <InventorySignalCard
+            title="Score de higiene"
+            value={`${summary.insight?.score ?? 0}`}
+            caption={summary.insight?.score && summary.insight.score >= 85 ? "ambiente bem organizado" : summary.insight?.score && summary.insight.score >= 65 ? "atenção gerenciável" : "prioridade de revisão"}
+            tone={summary.insight?.tone ?? "green"}
+            bullets={[
+              `${formatPercent((summary.governance.inactive365DaysBytes / Math.max(summary.totalBytes, 1)) * 100)} do volume está frio há +365 dias`,
+              `${formatPercent((summary.governance.neverAccessedBytes / Math.max(summary.totalBytes, 1)) * 100)} sem acesso observado`,
+              `${summary.recommendations.length.toLocaleString("pt-BR")} recomendação(ões) em aberto`
+            ]}
+          />
+          <InventorySignalCard
+            title="Comparação do ciclo"
+            value={cycleStatusLabel}
+            caption={summary.comparison.previousStartedUtc ? `Comparado ao snapshot de ${formatDate(summary.comparison.previousStartedUtc)}` : "Sem ciclo anterior para comparar"}
+            tone={summary.insight?.trend === "improved" ? "green" : summary.insight?.trend === "worsened" ? "danger" : "blue"}
+            bullets={[
+              summary.comparison.previousStartedUtc ? `Variação de volume: ${formatPercent(summary.comparison.totalBytesGrowthPercent)}` : "Primeiro ciclo comparável ainda não disponível",
+              `Delta de arquivos: ${formatSignedNumber(summary.growth.fileCountDelta)}`,
+              `Delta de pastas: ${formatSignedNumber(summary.growth.folderCountDelta)}`
+            ]}
+          />
+          <InventorySignalCard
+            title="Melhorou"
+            value={`${summary.insight?.positives.length ?? 0}`}
+            caption="Sinais positivos identificados"
+            tone="green"
+            bullets={summary.insight?.positives.length ? summary.insight.positives.slice(0, 3) : ["Sem destaque positivo neste ciclo."]}
+          />
+          <InventorySignalCard
+            title="Manteve"
+            value={`${summary.insight?.stables.length ?? 0}`}
+            caption="Aspectos sem mudança brusca"
+            tone="blue"
+            bullets={summary.insight?.stables.length ? summary.insight.stables.slice(0, 3) : ["Nenhum sinal estável destacado neste ciclo."]}
+          />
+          <InventorySignalCard
+            title="Piorou"
+            value={`${summary.insight?.attentions.length ?? 0}`}
+            caption="Pontos que pedem intervenção"
+            tone="danger"
+            bullets={summary.insight?.attentions.length ? summary.insight.attentions.slice(0, 3) : ["Nenhum agravamento relevante percebido neste ciclo."]}
+          />
+        </div>
+      </section>
+
+      <section className="inventory-section inventory-pane-cleanup inventory-pane-risk inventory-pane-activity" aria-label="Risco e uso">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Risco e uso</span>
+            <h3>Onde o ambiente pede atenção primeiro</h3>
+          </div>
+          <p>Os blocos abaixo ajudam a separar volume, idade, uso real e sinais de governança.</p>
+        </div>
+
+        <section className="inventory-action-strip" aria-label="Pontos de atenção">
+          <InventoryActionMetric icon={<FileClock size={19} />} label="Arquivos frios" value={summary.governance.inactive365DaysFileCount} detail={`${formatBytes(summary.governance.inactive365DaysBytes)} sem alteração há mais de um ano`} tone="warning" />
+          <InventoryActionMetric icon={<Clock3 size={19} />} label="Sem registro de acesso" value={summary.governance.neverAccessedFileCount} detail={formatBytes(summary.governance.neverAccessedBytes)} tone="neutral" />
+          <InventoryActionMetric icon={<Files size={19} />} label="Arquivos grandes" value={summary.governance.largeFileCount} detail={`${formatBytes(summary.governance.largeFileBytes)} acima de 1 GB`} tone="warning" />
+          <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
+        </section>
+
+        <div className="inventory-analysis-grid">
+          <Panel title="Composição do armazenamento" subtitle="Tipos de conteúdo que mais ocupam espaço.">
+            <InventoryCategoryChart items={summary.contentCategories} />
+          </Panel>
+          <Panel title="Ciclo de vida dos arquivos" subtitle="Distribuição pela última modificação conhecida.">
+            <InventoryAgeChart buckets={summary.ageBuckets} />
+          </Panel>
+          <Panel title="Atividade observada" subtitle="Ações correlacionadas nos últimos 30 dias.">
+            <div className="inventory-activity-total">
+              <Activity size={20} />
+              <strong>{summary.observedActivity.totalEvents.toLocaleString("pt-BR")}</strong>
+              <span>eventos reais</span>
+            </div>
+            <InventoryRanking
+              items={summary.observedActivity.topFolders}
+              getKey={(item) => item.path}
+              renderLabel={(item) => item.path}
+              renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
+              renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
+              maxValue={Math.max(...summary.observedActivity.topFolders.map((item) => item.eventCount), 1)}
+              getBarValue={(item) => item.eventCount}
+            />
+          </Panel>
+        </div>
+      </section>
+
+      <section className="inventory-section inventory-pane-cleanup inventory-pane-risk" aria-label="Prioridades de revisão">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Prioridades de revisão</span>
+            <h3>Capacidade, atividade e recomendações em contexto</h3>
+          </div>
+          <p>Uma leitura prática do que está ocupando espaço, quem mais movimenta a área e o que vale atacar antes.</p>
+        </div>
+
+        <div className="inventory-details-grid inventory-details-grid--priority">
+          <Panel title="Recomendações para revisão" subtitle="Sinais do último snapshot para orientar limpeza, arquivamento e ajustes de acesso.">
+            {summary.recommendations.length === 0 ? (
+              <EmptyState text="Sem recomendação gerencial para o snapshot atual." />
+            ) : (
+              <div className="inventory-recommendations">
+                {summary.recommendations.map((item) => (
+                  <article key={`${item.title}-${item.detail}`} className={item.severity === "warning" ? "warning" : "info"}>
+                    {item.severity === "warning" ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
+                    <div>
+                      <strong>{item.title}</strong>
+                      <p>{item.detail}</p>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </Panel>
+
+          <Panel title="Pastas com maior consumo" subtitle="Priorize as maiores áreas para revisão de capacidade.">
+            <InventoryRanking
+              items={summary.topFolders}
+              getKey={(item) => item.path}
+              renderLabel={(item) => item.path}
+              renderValue={(item) => formatBytes(item.totalBytes)}
+              renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivos · ${item.folderCount.toLocaleString("pt-BR")} pastas`}
+              maxValue={Math.max(...summary.topFolders.map((item) => item.totalBytes), 1)}
+            />
+          </Panel>
+
+          <Panel title="Usuários mais ativos" subtitle="Atividade real observada no mesmo período.">
+            <InventoryRanking
+              items={summary.observedActivity.topUsers}
+              getKey={(item) => item.user}
+              renderLabel={(item) => item.user}
+              renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
+              renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
+              maxValue={Math.max(...summary.observedActivity.topUsers.map((item) => item.eventCount), 1)}
+              getBarValue={(item) => item.eventCount}
+            />
+          </Panel>
+        </div>
+      </section>
+
+      <section className="inventory-section inventory-pane-capacity inventory-pane-cleanup inventory-pane-risk" aria-label="Exploração detalhada">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Exploração detalhada</span>
+            <h3>Achados, crescimento e itens que merecem auditoria fina</h3>
+          </div>
+          <p>Essa camada é útil para a equipe aprofundar a análise sem sair do inventário.</p>
+        </div>
+
+        <Panel title="Investigar achados" subtitle="Revise itens do último snapshot sem executar uma nova varredura.">
+          <div className="toolbar">
+            {[
+              ["executable", "Executáveis/scripts"],
+              ["large", "Arquivos grandes"],
+              ["inactive365", "Inativos +365d"],
+              ["errors", "Erros de leitura"]
+            ].map(([kind, label]) => (
+              <button
+                key={kind}
+                className={investigationKind === kind ? "primary-button compact" : "text-button"}
+                type="button"
+                onClick={() => loadInventoryItems(kind)}
+                disabled={loadingInvestigation}
+              >
+                <Search size={16} />
+                {label}
+              </button>
+            ))}
+          </div>
+          {loadingInvestigation ? (
+            <EmptyState text="Carregando achados do inventário..." />
+          ) : investigationItems.length === 0 ? (
+            <EmptyState text="Escolha um tipo de achado para listar até 100 itens do último scan." />
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Nome</th>
+                    <th>Tipo</th>
+                    <th>Tamanho</th>
+                    <th>Modificado</th>
+                    <th>Acessado</th>
+                    <th>Status</th>
+                    <th>Caminho</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {investigationItems.map((item) => (
+                    <tr key={item.id}>
+                      <td>{item.name}</td>
+                      <td>{item.extension || item.itemType}</td>
+                      <td>{formatBytes(item.sizeBytes)}</td>
+                      <td>{item.modifiedUtc ? formatDate(item.modifiedUtc) : "-"}</td>
+                      <td>{item.accessedUtc ? formatDate(item.accessedUtc) : "-"}</td>
+                      <td>
+                        <span className={`status ${item.status === "active" ? "ok" : "attention"}`}>
+                          {item.status === "active" ? "ativo" : item.status}
+                        </span>
+                      </td>
+                      <td title={item.path}>{item.path}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Pastas que mais cresceram" subtitle="Comparação entre o snapshot atual e o anterior do mesmo compartilhamento.">
           <InventoryRanking
-            items={summary.topLargeFiles}
+            items={summary.growth.topGrowingFolders}
             getKey={(item) => item.path}
-            renderLabel={(item) => item.name}
-            renderValue={(item) => formatBytes(item.sizeBytes)}
-            renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
-            maxValue={Math.max(...summary.topLargeFiles.map((item) => item.sizeBytes), 1)}
-            getBarValue={(item) => item.sizeBytes}
+            renderLabel={(item) => item.path}
+            renderValue={(item) => formatSignedBytes(item.totalBytesDelta)}
+            renderDetail={(item) => `${formatSignedNumber(item.fileCountDelta)} arquivo(s) · ${formatSignedNumber(item.folderCountDelta)} pasta(s)`}
+            maxValue={Math.max(...summary.growth.topGrowingFolders.map((item) => item.totalBytesDelta), 1)}
+            getBarValue={(item) => item.totalBytesDelta}
           />
         </Panel>
 
-        <Panel title="Arquivos antigos" subtitle="Itens com modificação mais antiga no snapshot atual.">
-          <InventoryRanking
-            items={summary.topInactiveFiles}
-            getKey={(item) => item.path}
-            renderLabel={(item) => item.name}
-            renderValue={(item) => item.ageDays === null || item.ageDays === undefined ? "sem idade" : `${item.ageDays.toLocaleString("pt-BR")} dia(s)`}
-            renderDetail={(item) => `${formatBytes(item.sizeBytes)} · ${item.path}`}
-            maxValue={Math.max(...summary.topInactiveFiles.map((item) => item.ageDays ?? 0), 1)}
-            getBarValue={(item) => item.ageDays ?? 0}
-          />
-        </Panel>
+        <div className="inventory-details-grid">
+          <Panel title="Maiores arquivos" subtitle="Candidatos para revisão de consumo, arquivamento ou política de retenção.">
+            <InventoryRanking
+              items={summary.topLargeFiles}
+              getKey={(item) => item.path}
+              renderLabel={(item) => item.name}
+              renderValue={(item) => formatBytes(item.sizeBytes)}
+              renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
+              maxValue={Math.max(...summary.topLargeFiles.map((item) => item.sizeBytes), 1)}
+              getBarValue={(item) => item.sizeBytes}
+            />
+          </Panel>
+
+          <Panel title="Arquivos antigos" subtitle="Itens com modificação mais antiga no snapshot atual.">
+            <InventoryRanking
+              items={summary.topInactiveFiles}
+              getKey={(item) => item.path}
+              renderLabel={(item) => item.name}
+              renderValue={(item) => item.ageDays === null || item.ageDays === undefined ? "sem idade" : `${item.ageDays.toLocaleString("pt-BR")} dia(s)`}
+              renderDetail={(item) => `${formatBytes(item.sizeBytes)} · ${item.path}`}
+              maxValue={Math.max(...summary.topInactiveFiles.map((item) => item.ageDays ?? 0), 1)}
+              getBarValue={(item) => item.ageDays ?? 0}
+            />
+          </Panel>
+        </div>
+
+        <div className="inventory-details-grid">
+          <Panel title="Executáveis e scripts encontrados" subtitle="Arquivos que merecem revisão rápida em compartilhamentos corporativos.">
+            <InventoryRanking
+              items={summary.topExecutableFiles}
+              getKey={(item) => item.path}
+              renderLabel={(item) => item.name}
+              renderValue={(item) => `${item.extension ?? "(sem extensão)"} · ${formatBytes(item.sizeBytes)}`}
+              renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
+              maxValue={Math.max(...summary.topExecutableFiles.map((item) => item.sizeBytes), 1)}
+              getBarValue={(item) => item.sizeBytes}
+            />
+          </Panel>
+
+          <Panel title="Top extensões por tamanho" subtitle="Ajuda a encontrar arquivos de mídia, backup, PST, ISO e outros consumidores.">
+            <InventoryRanking
+              items={summary.topExtensions}
+              getKey={(item) => item.extension}
+              renderLabel={(item) => item.extension}
+              renderValue={(item) => formatBytes(item.totalBytes)}
+              renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s)`}
+              maxValue={Math.max(...summary.topExtensions.map((item) => item.totalBytes), 1)}
+            />
+          </Panel>
+        </div>
+      </section>
+
+      <div className="inventory-pane-snapshots">
+        <InventorySnapshotsPanel snapshots={snapshots} />
       </div>
-
-      <Panel title="Executáveis e scripts encontrados" subtitle="Arquivos que merecem revisão rápida em compartilhamentos corporativos.">
-        <InventoryRanking
-          items={summary.topExecutableFiles}
-          getKey={(item) => item.path}
-          renderLabel={(item) => item.name}
-          renderValue={(item) => `${item.extension ?? "(sem extensão)"} · ${formatBytes(item.sizeBytes)}`}
-          renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
-          maxValue={Math.max(...summary.topExecutableFiles.map((item) => item.sizeBytes), 1)}
-          getBarValue={(item) => item.sizeBytes}
-        />
-      </Panel>
-
-      <div className="inventory-details-grid">
-        <Panel title="Top extensões por tamanho" subtitle="Ajuda a encontrar arquivos de mídia, backup, PST, ISO e outros consumidores.">
-          <InventoryRanking
-            items={summary.topExtensions}
-            getKey={(item) => item.extension}
-            renderLabel={(item) => item.extension}
-            renderValue={(item) => formatBytes(item.totalBytes)}
-            renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s)`}
-            maxValue={Math.max(...summary.topExtensions.map((item) => item.totalBytes), 1)}
-          />
-        </Panel>
       </div>
-
-      <InventorySnapshotsPanel snapshots={snapshots} />
     </div>
   );
 }
@@ -3207,6 +3851,129 @@ function InventoryActionMetric({
         <small>{detail}</small>
       </div>
     </article>
+  );
+}
+
+function InventoryKpiCard({
+  icon,
+  label,
+  value,
+  detail,
+  tone
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  tone: "navy" | "blue" | "green" | "amber" | "danger";
+}) {
+  return (
+    <article className={`inventory-kpi-card ${tone}`}>
+      <div className="inventory-kpi-head">
+        <span className="inventory-kpi-icon">{icon}</span>
+        <span className="inventory-kpi-label">{label}</span>
+      </div>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
+function InventorySignalCard({
+  title,
+  value,
+  caption,
+  bullets,
+  tone
+}: {
+  title: string;
+  value: string;
+  caption: string;
+  bullets: string[];
+  tone: "green" | "blue" | "amber" | "danger";
+}) {
+  return (
+    <article className={`inventory-signal-card ${tone}`}>
+      <div className="inventory-signal-head">
+        <span>{title}</span>
+        <strong>{value}</strong>
+      </div>
+      <p>{caption}</p>
+      <ul>
+        {bullets.map((item) => (
+          <li key={`${title}-${item}`}>{item}</li>
+        ))}
+      </ul>
+    </article>
+  );
+}
+
+function InventoryExecutiveList<T>({
+  items,
+  getKey,
+  renderTitle,
+  renderValue,
+  renderDetail
+}: {
+  items: T[];
+  getKey: (item: T) => string;
+  renderTitle: (item: T) => string;
+  renderValue: (item: T) => string;
+  renderDetail: (item: T) => string;
+}) {
+  if (items.length === 0) {
+    return <EmptyState text="Sem dados suficientes para esse recorte." />;
+  }
+
+  return (
+    <div className="inventory-executive-list">
+      {items.map((item, index) => (
+        <article key={getKey(item)} className="inventory-executive-item">
+          <span className="inventory-executive-rank">{String(index + 1).padStart(2, "0")}</span>
+          <div className="inventory-executive-copy">
+            <strong title={renderTitle(item)}>{renderTitle(item)}</strong>
+            <small>{renderDetail(item)}</small>
+          </div>
+          <span className="inventory-executive-value">{renderValue(item)}</span>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function InventoryRatioList({
+  items
+}: {
+  items: Array<{
+    label: string;
+    value: string;
+    detail: string;
+    percent: number;
+    tone: "navy" | "blue" | "green" | "amber" | "danger";
+  }>;
+}) {
+  if (items.length === 0) {
+    return <EmptyState text="Sem leitura suficiente para esse comparativo." />;
+  }
+
+  return (
+    <div className="inventory-ratio-list">
+      {items.map((item) => {
+        const width = Math.max(4, Math.min(100, Math.round(item.percent)));
+        return (
+          <article key={`${item.label}-${item.value}`} className={`inventory-ratio-item ${item.tone}`}>
+            <div className="inventory-ratio-head">
+              <strong title={item.label}>{item.label}</strong>
+              <span>{item.value}</span>
+            </div>
+            <div className="inventory-ratio-bar" aria-hidden="true">
+              <i style={{ width: `${width}%` }} />
+            </div>
+            <small>{item.detail}</small>
+          </article>
+        );
+      })}
+    </div>
   );
 }
 
@@ -3312,6 +4079,10 @@ function InventoryRanking<T>({
       })}
     </div>
   );
+}
+
+function formatPercent(value: number) {
+  return `${value.toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`;
 }
 
 function DatabaseCapacityView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
@@ -3797,6 +4568,31 @@ function ReportGroupList({ rows, total }: { rows: Array<{ label: string; count: 
   );
 }
 
+function ReportTextList({
+  title,
+  items,
+  emptyText
+}: {
+  title: string;
+  items: string[];
+  emptyText: string;
+}) {
+  return (
+    <article className="report-text-card">
+      <strong>{title}</strong>
+      {items.length === 0 ? (
+        <p>{emptyText}</p>
+      ) : (
+        <ul>
+          {items.map((item) => (
+            <li key={`${title}-${item}`}>{item}</li>
+          ))}
+        </ul>
+      )}
+    </article>
+  );
+}
+
 function FeedbackBanner({
   tone,
   message,
@@ -3816,10 +4612,14 @@ function FeedbackBanner({
   );
 }
 
-async function fetchJson<T>(path: string): Promise<T> {
+async function fetchJson<T>(path: string, options: { timeoutMs?: number } = {}): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
+
   const response = await fetch(`${apiBaseUrl}${path}`, {
-    headers: buildHeaders()
-  });
+    headers: buildHeaders(),
+    signal: controller.signal
+  }).finally(() => window.clearTimeout(timeout));
 
   if (!response.ok) {
     throw new Error(await readErrorMessage(response, `${response.status} ao chamar ${path}`));
@@ -3963,6 +4763,34 @@ function buildInvestigationUrl(filters: InvestigationFilters) {
 function buildReportEventsUrl(filters: ReportFilters, take = 5000) {
   const params = buildReportQueryParams(filters, take);
   return `/api/events/timeline?${params.toString()}`;
+}
+
+function getReportEventTake(scenarioId: ReportScenarioId | null) {
+  if (scenarioId === "executive-qbr" || scenarioId === "capacity-cleanup" || scenarioId === "cold-data") {
+    return 3000;
+  }
+
+  return 10000;
+}
+
+async function fetchInventorySummaryForReport(filters: ReportFilters) {
+  const params = new URLSearchParams();
+
+  if (filters.server.trim()) {
+    params.set("server", filters.server.trim());
+  }
+
+  if (filters.share.trim()) {
+    params.set("share", filters.share.trim());
+  }
+
+  if (filters.path.trim()) {
+    params.set("rootPath", filters.path.trim());
+  }
+
+  params.set("top", "5");
+
+  return fetchJson<InventorySummary>(`/api/inventory/summary?${params.toString()}`);
 }
 
 function buildReportExportUrl(filters: ReportFilters, take = 20000) {
@@ -4583,6 +5411,163 @@ function buildReportGroups(events: DisplayEvent[], groupBy: ReportGrouping) {
     .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label, "pt-BR"));
 }
 
+function buildGeneratedReport(
+  title: string,
+  filters: ReportFilters,
+  events: DisplayEvent[],
+  inventorySummary: InventorySummary | null
+): GeneratedReport {
+  const topActions = buildReportGroups(events, "action").slice(0, 5);
+  const topUsers = buildReportGroups(events, "user").slice(0, 5);
+  const topPaths = buildReportGroups(events, "path").slice(0, 5);
+  const deletedCount = events.filter((event) => event.action === "deleted").length;
+  const renamedCount = events.filter((event) => event.action === "renamed").length;
+  const movedCount = events.filter((event) => event.action === "moved").length;
+  const deniedCount = events.filter((event) => (event.result ?? "").toLowerCase() === "denied").length;
+  const dominantAction = topActions[0]?.label ?? "sem predominio";
+  const uniqueUsers = new Set(events.map((event) => event.user).filter(Boolean)).size;
+  const uniquePaths = new Set(events.map((event) => event.path).filter(Boolean)).size;
+  const criticalCount = events.filter((event) => (event.severity ?? "").toLowerCase() === "critical").length;
+  const warningCount = events.filter((event) => (event.severity ?? "").toLowerCase() === "warning").length;
+  const topHosts = buildReportGroups(events, "sourceHost").slice(0, 3);
+  const highlights: string[] = [];
+  const risks: string[] = [];
+  const nextSteps: string[] = [];
+
+  if (events.length > 0) {
+    highlights.push(`${events.length.toLocaleString("pt-BR")} evento(s) correlacionado(s) no recorte, com predominio de ${dominantAction.toLowerCase()}.`);
+  }
+
+  if (topUsers[0]) {
+    highlights.push(`Maior concentracao de atividade em ${topUsers[0].label}, com ${topUsers[0].count.toLocaleString("pt-BR")} acao(oes).`);
+  }
+
+  if (topPaths[0]) {
+    highlights.push(`Area mais impactada: ${topPaths[0].label} com ${topPaths[0].count.toLocaleString("pt-BR")} evento(s).`);
+  }
+
+  if (inventorySummary?.executiveOverview.headlines?.length) {
+    highlights.push(...inventorySummary.executiveOverview.headlines.slice(0, 2));
+  }
+
+  if (deletedCount > 0) {
+    risks.push(`${deletedCount.toLocaleString("pt-BR")} exclusao(oes) aparecem no periodo e merecem validacao de contexto e autoria.`);
+  }
+
+  if (renamedCount + movedCount > 0) {
+    risks.push(`${(renamedCount + movedCount).toLocaleString("pt-BR")} movimento(s) de rename ou deslocamento podem indicar reorganizacao ou alteracao em massa.`);
+  }
+
+  if (deniedCount > 0) {
+    risks.push(`${deniedCount.toLocaleString("pt-BR")} tentativa(s) negada(s) aparecem no recorte e pedem revisao de permissao ou origem.`);
+  }
+
+  if (inventorySummary?.recommendations?.length) {
+    risks.push(...inventorySummary.recommendations.slice(0, 2).map((item) => item.detail));
+  }
+
+  if (topPaths[0]) {
+    nextSteps.push(`Revisar a area ${topPaths[0].label} por concentrar o maior volume de eventos no recorte.`);
+  }
+
+  if (topUsers[0]) {
+    nextSteps.push(`Validar com ${topUsers[0].label} o contexto operacional das principais acoes observadas.`);
+  }
+
+  if (inventorySummary?.executiveOverview.priorities?.length) {
+    nextSteps.push(...inventorySummary.executiveOverview.priorities.slice(0, 2).map((item) => item.title));
+  }
+
+  const executiveSummaryParts = [
+    `${title} cobrindo ${summarizeReportFilters(filters) || "o recorte selecionado"}.`,
+    events.length > 0
+      ? `Foram observados ${events.length.toLocaleString("pt-BR")} evento(s), distribuido(s) por ${uniqueUsers.toLocaleString("pt-BR")} usuario(s) e ${uniquePaths.toLocaleString("pt-BR")} caminho(s).`
+      : "Nenhum evento foi encontrado para o recorte informado.",
+    inventorySummary
+      ? `O inventario associado aponta ${formatBytes(inventorySummary.totalBytes)} monitorados, score ${inventorySummary.insight.score} e ${inventorySummary.recommendations.length.toLocaleString("pt-BR")} recomendacao(oes) aberta(s).`
+      : "O resumo de inventario nao foi anexado a esta geracao."
+  ];
+
+  const sections = [
+    {
+      title: "Resumo executivo",
+      items: dedupeText([
+        `${events.length.toLocaleString("pt-BR")} evento(s) no periodo, com ${dominantAction.toLowerCase()} como comportamento dominante.`,
+        topUsers[0] ? `${topUsers[0].label} foi o principal ator do recorte com ${topUsers[0].count.toLocaleString("pt-BR")} acao(oes).` : "",
+        inventorySummary ? `O compartilhamento ${inventorySummary.share ?? "monitorado"} encerra o ciclo com score ${inventorySummary.insight.score} e tom ${inventorySummary.insight.tone}.` : ""
+      ]).slice(0, 4)
+    },
+    {
+      title: "Evolucao do ciclo",
+      items: dedupeText([
+        inventorySummary?.comparison.previousStartedUtc
+          ? `Comparado ao snapshot de ${formatDate(inventorySummary.comparison.previousStartedUtc)}, o volume variou ${formatPercent(inventorySummary.comparison.totalBytesGrowthPercent)}.`
+          : "Ainda nao ha snapshot anterior para comparacao formal do ciclo.",
+        inventorySummary ? `Delta de arquivos: ${formatSignedNumber(inventorySummary.growth.fileCountDelta)} e delta de pastas: ${formatSignedNumber(inventorySummary.growth.folderCountDelta)}.` : "",
+        criticalCount > 0 ? `${criticalCount.toLocaleString("pt-BR")} evento(s) chegaram com severidade critica no recorte.` : "",
+        warningCount > 0 ? `${warningCount.toLocaleString("pt-BR")} evento(s) chegaram com severidade de atencao.` : ""
+      ]).slice(0, 4)
+    },
+    {
+      title: "Capacidade e limpeza",
+      items: dedupeText([
+        inventorySummary?.topFolders[0]
+          ? `Maior area por volume: ${inventorySummary.topFolders[0].path} com ${formatBytes(inventorySummary.topFolders[0].totalBytes)}.`
+          : "",
+        inventorySummary?.growth.topGrowingFolders[0]
+          ? `Maior crescimento recente: ${inventorySummary.growth.topGrowingFolders[0].path} com ${formatSignedBytes(inventorySummary.growth.topGrowingFolders[0].totalBytesDelta)}.`
+          : "",
+        inventorySummary?.topInactiveFiles[0]
+          ? `Arquivo mais antigo em destaque: ${inventorySummary.topInactiveFiles[0].name}, com ${formatInventoryFileAge(inventorySummary.topInactiveFiles[0])}.`
+          : "",
+        inventorySummary
+          ? `${formatBytes(inventorySummary.governance.inactive365DaysBytes)} estao sem modificacao ha mais de 365 dias.`
+          : ""
+      ]).slice(0, 4)
+    },
+    {
+      title: "Hotspots operacionais",
+      items: dedupeText([
+        topPaths[0] ? `O caminho ${topPaths[0].label} concentrou ${topPaths[0].count.toLocaleString("pt-BR")} evento(s).` : "",
+        topActions[0] ? `A acao ${topActions[0].label.toLowerCase()} liderou a distribuicao do periodo.` : "",
+        topHosts[0] ? `O host ${topHosts[0].label} aparece como principal origem com ${topHosts[0].count.toLocaleString("pt-BR")} ocorrencia(s).` : "",
+        inventorySummary?.executiveOverview.storageHotspots[0]
+          ? `A maior concentracao de dados segue em ${inventorySummary.executiveOverview.storageHotspots[0].label}.`
+          : ""
+      ]).slice(0, 4)
+    },
+    {
+      title: "Risco e governanca",
+      items: dedupeText([
+        deletedCount > 0 ? `${deletedCount.toLocaleString("pt-BR")} exclusao(oes) aparecem no recorte.` : "",
+        deniedCount > 0 ? `${deniedCount.toLocaleString("pt-BR")} tentativa(s) negada(s) exigem revisao de permissao ou origem.` : "",
+        inventorySummary ? `${inventorySummary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} arquivo(s) estao frios ha mais de 365 dias.` : "",
+        inventorySummary ? `${inventorySummary.governance.executableFileCount.toLocaleString("pt-BR")} executavel(is) ou script(s) seguem expostos no inventario.` : ""
+      ]).slice(0, 4)
+    },
+    {
+      title: "Plano de acao sugerido",
+      items: dedupeText(nextSteps).slice(0, 5)
+    }
+  ];
+
+  return {
+    title,
+    generatedAt: new Date().toISOString(),
+    filtersSummary: summarizeReportFilters(filters),
+    events,
+    executiveSummary: executiveSummaryParts.join(" "),
+    highlights: dedupeText(highlights).slice(0, 5),
+    risks: dedupeText(risks).slice(0, 5),
+    nextSteps: dedupeText(nextSteps).slice(0, 5),
+    topActions,
+    topUsers,
+    topPaths,
+    sections,
+    inventorySummary
+  };
+}
+
 function getReportGroupValue(event: DisplayEvent, groupBy: ReportGrouping) {
   switch (groupBy) {
     case "action":
@@ -4619,6 +5604,40 @@ function labelForReportGroup(groupBy: ReportGrouping) {
   };
 
   return labels[groupBy];
+}
+
+function groupReportScenariosByCategory(scenarios: ReportScenario[]) {
+  const orderedCategories = ["Executivo", "Governança", "Incidente", "Investigação"];
+  const groups = new Map<string, ReportScenario[]>();
+
+  for (const scenario of scenarios) {
+    const category = getReportScenarioCategory(scenario.id);
+    groups.set(category, [...(groups.get(category) ?? []), scenario]);
+  }
+
+  return orderedCategories
+    .filter((category) => groups.has(category))
+    .map((category) => ({ category, items: groups.get(category) ?? [] }));
+}
+
+function getReportScenarioCategory(id: ReportScenarioId) {
+  if (id === "executive-qbr" || id === "capacity-cleanup" || id === "hot-folder") {
+    return "Executivo";
+  }
+
+  if (id === "cold-data" || id === "permission-changes" || id === "executable-creation" || id === "after-hours-activity") {
+    return "Governança";
+  }
+
+  if (id === "mass-delete" || id === "mass-rename" || id === "mass-move" || id === "recurrent-denied-access" || id === "suspicious-remote-access") {
+    return "Incidente";
+  }
+
+  return "Investigação";
+}
+
+function dedupeText(items: string[]) {
+  return [...new Set(items.filter(Boolean))];
 }
 
 function getDirectoryName(path: string) {

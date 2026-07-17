@@ -10,8 +10,12 @@ import {
 } from "./report-definitions.ts";
 
 test("defines the guided report scenarios expected by operations", () => {
-  assert.equal(reportScenarios.length, 11);
+  assert.equal(reportScenarios.length, 17);
   assert.deepEqual(reportScenarios.map((scenario) => scenario.id), [
+    "executive-qbr",
+    "capacity-cleanup",
+    "cold-data",
+    "hot-folder",
     "folder-activity",
     "user-activity",
     "server-activity",
@@ -20,7 +24,9 @@ test("defines the guided report scenarios expected by operations", () => {
     "recurrent-denied-access",
     "permission-changes",
     "mass-rename",
+    "mass-move",
     "executable-creation",
+    "after-hours-activity",
     "source-host-activity",
     "suspicious-remote-access"
   ]);
@@ -29,7 +35,15 @@ test("defines the guided report scenarios expected by operations", () => {
 test("uses narrow presets for high-volume incident reports", () => {
   assert.equal(createFiltersForScenario("mass-delete").action, "deleted");
   assert.equal(createFiltersForScenario("mass-rename").action, "renamed");
+  assert.equal(createFiltersForScenario("mass-move").action, "moved");
   assert.equal(createFiltersForScenario("read-without-change").action, "accessed");
+});
+
+test("adds managerial QBR presets without forcing narrow event filters", () => {
+  assert.equal(createFiltersForScenario("executive-qbr").periodHours, "720");
+  assert.equal(createFiltersForScenario("capacity-cleanup").groupBy, "path");
+  assert.equal(createFiltersForScenario("cold-data").periodHours, "720");
+  assert.equal(createFiltersForScenario("hot-folder").periodHours, "168");
 });
 
 test("tracks executable and script creation with a multi-extension filter", () => {

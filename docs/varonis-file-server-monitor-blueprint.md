@@ -1,114 +1,142 @@
 # Blueprint Inspirado no Varonis para o File Server Monitor
 
-Este documento consolida os pontos mais aproveitaveis do material `Varonis Quarterly Business Review - TCE-AL (Q2 2023)` para evoluir o File Server Monitor sem copiar a ferramenta original. A ideia e aproveitar a logica de valor entregue ao gestor e ao time operacional, adaptando para o que ja existe no produto: coleta de eventos, correlacao no Core, alertas, inventario gerencial e relatorios.
+Este documento consolida os pontos mais aproveitaveis do material `Varonis Quarterly Business Review - TCE-AL (Q2 2023)` para evoluir o File Server Monitor sem tentar copiar a ferramenta original. A proposta aqui e aproveitar a logica de valor entregue ao gestor e ao time operacional, adaptando para o que o produto ja tem: coleta de eventos, correlacao no Core, alertas, inventario por snapshot e relatorios.
 
-## Leitura do material
+## O que o QBR do Varonis realmente mostra
 
-O material do Varonis mistura quatro camadas:
+Ao destrinchar o deck, a parte aproveitavel para File Server se organiza em quatro blocos bem claros:
 
-1. inventario e crescimento do ambiente;
-2. exposicao e risco de dados;
-3. deteccao de comportamento suspeito;
-4. acompanhamento de maturidade e valor ao longo do tempo.
+1. crescimento e forma do ambiente;
+2. exposicao e governanca;
+3. comportamento anomalo e investigacao;
+4. maturidade e evolucao ao longo do tempo.
 
-Para o File Server Monitor, as duas primeiras fases ja estao parcialmente preparadas:
+Os slides mais uteis para inspirar o produto foram:
 
-- eventos e timeline correlacionada;
+- `slide 8`: crescimento do numero de arquivos, pastas e volume;
+- `slide 9`: blast radius, risco de leitura ampla e modificacao ampla;
+- `slide 10`: open access, broken permissions e stale data;
+- `slides 12 a 15`: dados sensiveis, stale sensitive files e exposicao por regra;
+- `slide 16`: alertas, investigacoes e plataformas mais impactadas;
+- `slides 42 a 47`: plano operacional, dashboards recorrentes e revisao continua.
+
+O mais importante aqui nao e o visual da apresentacao. E a forma como ela transforma dados tecnicos em perguntas gerenciais que a lideranca consegue responder em poucos minutos.
+
+## O que o produto ja tem hoje e pode reaproveitar
+
+O File Server Monitor ja tem uma base melhor do que parece para seguir nessa direcao:
+
+- timeline correlacionada no Core;
 - monitoramento de agentes, API e banco;
+- alertas operacionais;
+- inventario gerencial com snapshot;
 - relatorios guiados e personalizados;
-- inventario gerencial com snapshot.
+- persistencia de timeline para consulta posterior.
 
-O maior ganho agora e transformar esses blocos em visao historica e gerencial.
+Isso significa que o salto agora nao e "inventar um modulo". O salto e encaixar a leitura gerencial por cima do que ja existe.
 
-## O que vale reaproveitar
+## Mapeamento Varonis -> File Server Monitor
 
-### 1. Inventario executivo do ambiente
+### 1. Data Growth -> Inventario Executivo
 
-Os slides de visibilidade e crescimento mostram que o gestor entende rapidamente:
+No Varonis, o slide de crescimento e simples e poderoso: total de arquivos, total de pastas, total de dados e delta do periodo.
 
-- total de dados monitorados;
-- quantidade de arquivos;
-- quantidade de pastas;
-- crescimento no periodo;
-- tendencia de expansao.
+No File Server Monitor, isso deve virar o primeiro bloco do painel de inventario.
 
-Isso deve existir no File Server Monitor como painel fixo de inventario executivo.
+#### KPIs recomendados
 
-#### Indicadores recomendados
+- total de bytes monitorados;
+- total de arquivos;
+- total de pastas;
+- crescimento em bytes no periodo;
+- crescimento de arquivos e pastas;
+- ranking de compartilhamentos por tamanho;
+- ranking de pastas por tamanho;
+- ranking de pastas por quantidade de arquivos.
 
-- total de bytes por compartilhamento;
-- total de arquivos e pastas;
-- crescimento diario, semanal e mensal;
-- top pastas por tamanho;
-- top pastas por quantidade de arquivos;
-- distribuicao por extensao;
-- distribuicao por faixa de idade;
-- variacao entre snapshots.
+#### Visuais recomendados
 
-### 2. Governanca e risco da estrutura
+- cards com delta em relacao ao snapshot anterior;
+- serie temporal de crescimento por snapshot;
+- barras de top areas por tamanho;
+- participacao por extensao;
+- distribuicao por idade.
 
-Os slides de `Data Protection` do Varonis tem forte aderencia com a realidade de file server. Mesmo sem classificar conteudo ainda, da para entregar muito valor com governanca basica.
+### 2. Blast Radius / Open Access -> Governanca e Exposicao
 
-#### Indicadores recomendados
+O conceito mais valioso do Varonis para File Server e o de `blast radius`: quanto do ambiente esta aberto demais, exposto demais ou com chance alta de propagacao de dano.
 
-- pastas com acesso amplo;
+No File Server Monitor isso deve ser traduzido para uma camada de governanca.
+
+#### Achados recomendados
+
+- pastas com permissao ampla;
 - pastas com heranca quebrada;
-- areas sem dono claro;
-- pastas com crescimento alto e pouca atividade;
-- arquivos frios sem acesso ha 90/180/365 dias;
-- arquivos nunca acessados;
-- executaveis e scripts em areas de negocio;
-- concentracao de dados por area.
+- pastas sem dono claro;
+- pastas que concentram muitos arquivos e muitos usuarios;
+- areas com dados frios e alta ocupacao;
+- areas com executaveis e scripts fora da area tecnica;
+- caminhos com muito acesso negado;
+- caminhos com muita mudanca em curto periodo.
 
-#### Recomendacoes automaticas sugeridas
+#### Perguntas que o painel deve responder
 
-- "Area X concentra Y GB sem acesso ha 365 dias."
-- "Area Y possui heranca quebrada em Z subpastas."
-- "Area Z concentra scripts/executaveis fora da area tecnica."
-- "Compartilhamento A cresceu B% no periodo com pouca leitura observada."
+- "Se um usuario de negocio for comprometido, qual area tem maior raio de impacto?"
+- "Quais pastas estao grandes, frias e caras para manter?"
+- "Onde temos acumulacao de dados sem leitura observada?"
+- "Onde scripts e executaveis estao aparecendo fora do lugar esperado?"
 
-### 3. Comportamento e ameacas operacionais
+### 3. Threat Detection & Response -> Alertas e Investigacao
 
-O slide de `Threat Detection & Response` mostra uma direcao boa para o File Server Monitor: nao mostrar so eventos, mas mostrar anomalias e padroes de risco.
+O slide de alertas do Varonis reforca algo que faz muito sentido para o File Server Monitor: nao basta mostrar evento, e preciso mostrar padrao.
 
-#### Casos de uso recomendados
+Casos com aderencia direta:
 
 - exclusao em massa;
 - renomeacao em massa;
 - movimentacao em massa;
-- leitura sem alteracao em volume alto;
-- acessos negados recorrentes;
+- leitura em massa sem alteracao;
 - atividade fora do horario;
-- atividade intensa por host de origem;
-- picos por usuario, pasta ou compartilhamento;
-- processos com maior volume de eventos.
+- acessos negados recorrentes;
+- picos por usuario;
+- picos por host de origem;
+- picos por pasta;
+- combinacao de rename + move + delete em janela curta.
 
-Esses casos se encaixam em duas areas do produto:
+#### Saidas recomendadas
 
-- alertas operacionais;
-- relatorios gerenciais recorrentes.
+- cards de anomalia no dashboard;
+- alertas priorizados por severidade;
+- relatorios guiados focados em investigacao;
+- comparativo do comportamento atual contra baseline recente.
 
-### 4. Evolucao e valor entregue
+### 4. Operational Plan / QBR -> Evolucao e valor entregue
 
-O diferencial do material do Varonis nao e so a fotografia do ambiente, mas a comparacao entre periodos.
+O material do Varonis e forte porque mostra linha de evolucao, nao so fotografia.
 
-O File Server Monitor deve fazer o mesmo em relatorios mensais e trimestrais:
+No File Server Monitor isso deve aparecer em duas frentes:
 
-- risco subiu ou caiu;
-- volume cresceu ou estabilizou;
-- areas mais ativas mudaram;
-- usuarios mais ativos mudaram;
-- anomalias reduziram ou pioraram;
-- recomendacoes abertas vs tratadas.
+- dashboard executivo com comparacao entre periodos;
+- relatorio mensal/trimestral com progresso, piora e pendencias.
 
-## Painel recomendado para o produto
+#### Comparacoes recomendadas
+
+- crescimento de volume;
+- crescimento de areas frias;
+- reducao ou aumento de acessos negados;
+- reducao ou aumento de alertas de massa;
+- mudanca nos usuarios mais ativos;
+- mudanca nas areas mais ativas;
+- itens tratados vs itens ainda pendentes.
+
+## Dashboards recomendados
 
 ### Painel 1. Operacional
 
-Voltado para quem responde rapido:
+Foco em resposta rapida e respiracao do ambiente.
 
 - saude da API, banco e agente;
-- fila e backlog;
+- heartbeat e backlog;
 - eventos recentes;
 - alertas abertos;
 - top usuarios do dia;
@@ -117,121 +145,174 @@ Voltado para quem responde rapido:
 
 ### Painel 2. Inventario Gerencial
 
-Voltado para capacidade e organizacao:
+Foco em capacidade, ciclo de vida e uso.
 
 - total de dados monitorados;
-- crescimento por periodo;
-- composicao do armazenamento;
-- ciclo de vida dos arquivos;
+- crescimento por snapshot;
+- distribuicao por extensao;
+- distribuicao por idade;
 - top pastas por tamanho;
-- top pastas por volume de arquivos;
+- top pastas por quantidade de arquivos;
 - top areas por atividade observada;
 - top usuarios por atividade observada.
 
 ### Painel 3. Risco e Governanca
 
-Voltado para revisao de exposicao:
+Foco em limpeza, exposicao e racionalizacao.
 
 - areas com acesso amplo;
-- areas com permissao quebrada;
-- dados frios;
+- areas com heranca quebrada;
+- dados frios por faixa;
 - arquivos nunca acessados;
-- executaveis e scripts em areas sensiveis;
+- executaveis e scripts em area de negocio;
 - acessos negados recorrentes;
-- areas com atividade fora do horario.
+- atividades fora do horario;
+- areas com crescimento alto e baixa leitura.
 
-### Painel 4. Evolucao executiva
+### Painel 4. Evolucao Executiva
 
-Voltado para reuniao mensal ou trimestral:
+Foco em reuniao mensal ou trimestral.
 
 - crescimento do ambiente;
-- total de eventos por periodo;
+- total de eventos correlacionados por periodo;
 - total de alertas por periodo;
 - principais anomalias;
 - areas mais afetadas;
 - tendencia de risco;
 - pendencias de governanca;
-- recomendacoes priorizadas.
+- recomendacoes priorizadas;
+- comparativo com o ciclo anterior.
 
 ## Relatorios guiados novos sugeridos
 
-Os relatorios atuais cobrem investigacao operacional. O material do Varonis inspira alguns guiados novos, mais gerenciais.
+Os relatorios atuais cobrem bem investigacao operacional. O QBR inspira relatorios guiados mais gerenciais e recorrentes.
 
-### Sugestoes para a aba Relatorios
+### Sugestoes
 
 1. `Crescimento por compartilhamento`
-   - foca em inventario e crescimento entre snapshots.
+   - compara snapshots e mostra deltas por share, pasta e extensao.
 
 2. `Dados frios e sem acesso`
-   - lista areas com arquivos sem uso ha 90/180/365 dias.
+   - lista areas com arquivos sem uso ha 90, 180 e 365 dias.
 
 3. `Pastas mais ativas`
-   - mostra top caminhos por evento no periodo.
+   - top caminhos por volume de evento no periodo.
 
 4. `Usuarios mais ativos`
-   - mostra top usuarios por quantidade de acoes e area impactada.
+   - top usuarios por acoes, area impactada e horario.
 
 5. `Movimentacao em massa`
-   - semelhante ao de exclusao e renomeacao, mas focado em move.
+   - recorte gerencial de move com top caminhos e top usuarios.
 
 6. `Atividade fora do horario`
-   - focado em criacoes, exclusoes, renomes e moves fora da janela definida.
+   - foca em criacao, exclusao, rename e move fora da janela esperada.
 
 7. `Executaveis e scripts em area de negocio`
-   - combina criacao, alteracao e movimentacao de extensoes sensiveis.
+   - cruza inventario, criacao e alteracao de extensoes sensiveis.
 
 8. `Acesso negado por area`
-   - agrupa negacoes por caminho, usuario e host.
+   - agrupa negacoes por caminho, usuario, host e horario.
+
+9. `Pasta quente`
+   - combina tamanho, numero de arquivos e atividade recente para achar areas problematica de uso intenso.
+
+10. `Capacidade e limpeza`
+   - mistura top pastas por tamanho com arquivos frios e recomendacao de arquivamento.
+
+## Ideias que valem muito para a nossa realidade
+
+### 1. Semaforo gerencial por compartilhamento
+
+Cada compartilhamento recebe um resumo:
+
+- `verde`: crescimento controlado, sem exposicao relevante e sem anomalia importante;
+- `amarelo`: crescimento acelerado, dados frios altos ou acessos negados recorrentes;
+- `vermelho`: exposicao ampla, picos de exclusao/rename/move, backlog ou erro de coleta.
+
+### 2. Score de higiene da area
+
+Um score simples de 0 a 100 por compartilhamento ou pasta raiz, formado por:
+
+- exposicao;
+- quantidade de dados frios;
+- arquivos suspeitos;
+- acessos negados;
+- eventos de massa;
+- tendencia de crescimento desorganizado.
+
+Isso ajuda muito em reuniao com area de negocio porque evita cair no detalhe tecnico cedo demais.
+
+### 3. Recomendacoes automaticas de alto valor
+
+Exemplos:
+
+- "Financeiro concentra 312 GB sem acesso ha 365 dias."
+- "RH tem 48 arquivos `.ps1` fora da area tecnica."
+- "Compartilhamento Corporativo cresceu 18% no mes, puxado por 3 subpastas."
+- "DTI teve aumento de 240% em renomeacoes no periodo."
+- "Area X tem heranca quebrada em 27 subpastas e sem dono definido."
+
+### 4. Linha historica de maturidade
+
+Nao precisa ser um score de marketing. Pode ser um historico simples com:
+
+- volume total;
+- percentual frio;
+- total de alertas;
+- total de negacoes;
+- total de areas criticas;
+- recomendacoes abertas;
+- recomendacoes resolvidas.
 
 ## O que nao vale reproduzir agora
 
-Alguns pontos do Varonis nao devem virar backlog imediato:
+Alguns pontos do deck nao devem virar backlog imediato:
 
 - classificacao profunda de conteudo sem motor dedicado;
-- metricas muito especificas de AD sem beneficio direto ao file server;
-- camadas comerciais e de servicos;
-- dashboards amplos demais antes de amadurecer os dados-base.
+- metricas puramente de AD sem impacto no file server;
+- camadas comerciais e servicos do fabricante;
+- dashboards bonitos demais antes de amadurecer o dado base;
+- automacao pesada de remediacao antes de consolidar leitura e recomendacao.
 
-## Roadmap recomendado
+## Ordem recomendada de implementacao
 
-### Fase 1. Consolidar o que ja existe
+### Fase 1. Consolidar base operacional
 
-- estabilizar coleta e correlacao em cenarios mistos;
-- finalizar inventario gerencial atual;
-- consolidar historico por snapshot;
-- manter relatorios usando timeline persistida.
+- continuar a exaustao de correlacao;
+- manter timeline persistida como fonte oficial de relatorios;
+- estabilizar fila, backlog e saude do agente em carga mais alta;
+- garantir consistencia entre API, relatorio e frontend.
 
-### Fase 2. Subir o nivel gerencial
+### Fase 2. Subir o nivel do inventario
 
-- crescimento por compartilhamento;
-- top areas por atividade;
-- usuarios mais ativos;
-- dados frios;
-- recomendacoes automaticas de limpeza e revisao.
+- historico de snapshots mais exploravel;
+- crescimento por compartilhamento e por pasta;
+- ranking de top areas por tamanho e crescimento;
+- dados frios por faixa;
+- recomendacoes automaticas de limpeza.
 
-### Fase 3. Subir o nivel de risco
+### Fase 3. Subir o nivel de governanca
 
-- permissoes amplas;
+- leitura opcional de ACL;
+- deteccao de permissao ampla;
 - heranca quebrada;
-- arquivos sensiveis por extensao/area;
-- atividade fora do horario;
-- combinacao de alertas com inventario.
+- dono da area;
+- score de higiene.
 
-### Fase 4. Fechar o ciclo executivo
+### Fase 4. Subir o nivel executivo
 
-- dashboard trimestral;
-- comparacao entre snapshots;
-- tendencia de risco;
-- relatorio QBR nativo do produto;
-- exportacao pronta para reunioes gerenciais.
+- dashboard de evolucao mensal/trimestral;
+- recortes prontos para QBR;
+- exportacao executiva em texto/PDF;
+- comparacao entre ciclos com `melhorou`, `manteve`, `piorou`.
 
 ## Decisao de produto
 
-O File Server Monitor nao deve tentar "virar Varonis". O caminho mais forte e:
+O File Server Monitor nao deve tentar "virar Varonis". O melhor caminho e:
 
 - manter profundidade em auditoria e timeline;
-- ganhar maturidade em inventario e governanca;
+- crescer em inventario e governanca de forma pragmatica;
 - apresentar evolucao historica;
-- transformar eventos tecnicos em sinais gerenciais.
+- transformar sinais tecnicos em visao gerencial acionavel.
 
-Esse e o melhor equilibrio entre valor entregue, custo de implementacao e clareza para o usuario final.
+Esse e o equilibrio mais forte entre valor entregue, custo de implementacao e clareza para o usuario final.
