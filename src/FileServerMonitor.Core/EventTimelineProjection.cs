@@ -918,8 +918,28 @@ public sealed class EventTimelineProjector
             || path.EndsWith("\\pending-events.ndjson", StringComparison.Ordinal)
             || path.Contains("\\logs\\", StringComparison.Ordinal)
             || path.EndsWith("\\logs", StringComparison.Ordinal)
+            || IsAgentSelfAccess(item)
             || IsTransientArtifactPath(item.Path)
             || (IsTransientArtifactPath(previousPath) && !officeMaterialization);
+    }
+
+    private static bool IsAgentSelfAccess(FileAuditEvent item)
+    {
+        return item.Action == "accessed"
+            && item.Source.Contains("windows-security-log", StringComparison.OrdinalIgnoreCase)
+            && IsAgentProcess(item.ProcessName);
+    }
+
+    private static bool IsAgentProcess(string? processName)
+    {
+        if (string.IsNullOrWhiteSpace(processName))
+        {
+            return false;
+        }
+
+        var normalized = processName.Replace('/', '\\').Trim();
+        return normalized.Equals("FileServerMonitor.Agent.exe", StringComparison.OrdinalIgnoreCase)
+            || normalized.EndsWith("\\FileServerMonitor.Agent.exe", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsTransientRenameNoise(FileAuditEvent current, IReadOnlyCollection<ClusterItem> cluster)

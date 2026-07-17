@@ -28,6 +28,7 @@ var tests = new (string Name, Action Test)[]
     ("nao cruza planilhas provisorias repetidas", DoesNotCrossCorrelateRepeatedExcelProvisionals),
     ("timeline colapsa acessos repetidos ao mesmo arquivo", TimelineCollapsesRepeatedFileAccess),
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
+    ("timeline remove acesso gerado pelo proprio agente", TimelineSuppressesAgentSelfAccessNoise),
     ("timeline preserva criacao de pastas com arquivos filhos", TimelineKeepsFolderCreatesWithChildFiles),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove criacao tardia de pasta quando a arvore foi excluida", TimelineSuppressesLateFolderCreateEchoAroundDelete),
@@ -981,6 +982,25 @@ static void TimelineKeepsDistinctFolderAccess()
 
     Assert(display.Length == 2, "Acessos em pastas diferentes nao deveriam ser colapsados como ruido.");
     Assert(display.All(item => item.Action == "accessed"), "Eventos de pasta deveriam continuar como acesso.");
+}
+
+static void TimelineSuppressesAgentSelfAccessNoise()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var projector = new EventTimelineProjector();
+    var agentProcess = @"C:\Program Files\FileServerMonitor\agent-dotnet\publish\FileServerMonitor.Agent.exe";
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "accessed", @"C:\Corporativo\Example folder", objectType: "folder", source: "windows-security-log", user: @"WORKGROUP\FILESERVER$", processName: agentProcess),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "accessed", @"C:\Corporativo\RH\manual.pdf", source: "windows-security-log", user: @"FILESERVER\AnphibiO", processName: "explorer.exe")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.Action}|{item.User}|{item.ProcessName}|{item.Path}"));
+
+    Assert(display.Length == 1, $"Acesso do proprio agente deveria ser removido sem esconder acesso real. Atual: {debug}");
+    Assert(display[0].Action == "accessed", "Acesso real de usuario deveria continuar como acesso.");
+    Assert(display[0].Path == @"C:\Corporativo\RH\manual.pdf", "Acesso real deveria permanecer na timeline.");
 }
 
 static void TimelineKeepsFolderCreatesWithChildFiles()
@@ -2104,7 +2124,8 @@ static FileAuditEvent BuildTimelineEvent(
     string? previousPath = null,
     string objectType = "file",
     string source = "usn-journal+security-log",
-    string user = @"FILESERVER\AnphibiO")
+    string user = @"FILESERVER\AnphibiO",
+    string processName = "explorer.exe")
 {
     return new FileAuditEvent(
         Id: Guid.NewGuid(),
@@ -2119,7 +2140,7 @@ static FileAuditEvent BuildTimelineEvent(
         Sid: null,
         SourceHost: null,
         SourceIp: null,
-        ProcessName: "explorer.exe",
+        ProcessName: processName,
         FileSizeBytes: null,
         Extension: Path.GetExtension(path),
         Result: "success",
