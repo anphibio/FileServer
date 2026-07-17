@@ -121,6 +121,7 @@ public sealed class EventTimelineProjector
             .Where(item =>
                 !IsTransientDisplayNoise(item)
                 && !IsRedundantDisplayPermissionEcho(item, promotedCreations)
+                && !IsPermissionEchoDuringDelete(item, promotedCreations)
                 && !IsRedundantDisplayDeleted(item, promotedCreations)
                 && !IsRedundantDisplayDeletedDuplicate(item, promotedCreations)
                 && !IsRedundantDisplayProvisionalDelete(item, promotedCreations)
@@ -688,6 +689,11 @@ public sealed class EventTimelineProjector
         }
 
         var previousPath = current.PreviousPath;
+        if (PathsReferToSameItem(previousPath, current.Path))
+        {
+            return null;
+        }
+
         var isFileTransition = IsFileLikePath(current.Path) && IsFileLikePath(previousPath);
         var isFolderTransition = IsLikelyFolderPath(current.Path) && IsLikelyFolderPath(previousPath);
         if (!isFileTransition && !isFolderTransition)
@@ -1061,6 +1067,11 @@ public sealed class EventTimelineProjector
                 return false;
             }
 
+            if (PathsReferToSameItem(candidate.PreviousPath, candidate.Path))
+            {
+                return false;
+            }
+
             var delta = (candidate.TimestampUtc - current.TimestampUtc).Duration();
             if (delta > TimeSpan.FromSeconds(3))
             {
@@ -1316,6 +1327,21 @@ public sealed class EventTimelineProjector
         });
     }
 
+    private static bool IsPermissionEchoDuringDelete(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
+    {
+        if (item.Action != "permission_changed")
+        {
+            return false;
+        }
+
+        return all.Any(candidate =>
+            candidate.Id != item.Id
+            && candidate.Action == "deleted"
+            && PathsReferToSameItem(candidate.Path, item.Path)
+            && NormalizeUser(candidate.User) == NormalizeUser(item.User)
+            && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromMilliseconds(1500));
+    }
+
     private static bool IsRedundantDisplayDeleted(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
     {
         if (item.Action != "deleted")
@@ -1352,6 +1378,7 @@ public sealed class EventTimelineProjector
             candidate.Id != item.Id
             && candidate.Action is "renamed" or "moved"
             && !IsTransientArtifactPath(candidate.Path)
+            && !PathsReferToSameItem(candidate.PreviousPath, candidate.Path)
             && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(15)
             && PathsReferToSameItem(candidate.PreviousPath, item.Path));
     }

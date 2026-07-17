@@ -65,6 +65,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva permissao de arquivo antes de rename e move da pasta pai", TimelineKeepsChildPermissionChangeBeforeFolderRenameAndMove),
     ("timeline preserva permissao em arquivo ja realocado para o caminho final", TimelineKeepsPermissionChangeAfterFolderMoveAtFinalPath),
     ("timeline preserva permissao alterada mesmo quando exclusao vem logo depois", TimelineKeepsPermissionChangeBeforeDeleteOnSamePath),
+    ("timeline remove permissao ecoada durante exclusao", TimelineSuppressesPermissionEchoDuringDelete),
     ("timeline preserva lote misto paralelo sem ruido cruzado", TimelineKeepsLongMixedParallelBatchStable),
     ("timeline preserva contagem em lote misto de maior volume", TimelineKeepsMassMixedBatchCountsStable),
     ("timeline remove modified imediato depois de criacao confirmada", TimelineSuppressesImmediateSecurityModifyAfterConfirmedCreate),
@@ -1843,6 +1844,28 @@ static void TimelineKeepsPermissionChangeBeforeDeleteOnSamePath()
     Assert(display.Count(item => item.Action == "permission_changed") == 1, $"Permissao alterada deveria continuar visivel antes da exclusao. Atual: {debug}");
     Assert(display.Count(item => item.Action == "deleted") == 1, $"Exclusao final deveria continuar visivel. Atual: {debug}");
     Assert(display.Count(item => item.Action == "accessed") == 0, $"Acessos tecnicos ao redor da ACL/delete nao deveriam sobreviver. Atual: {debug}");
+}
+
+static void TimelineSuppressesPermissionEchoDuringDelete()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-17T14:36:26Z");
+    var first = @"C:\Corporativo\codex-client-check-01.txt";
+    var second = @"C:\Corporativo\codex-client-check-02.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "permission_changed", first, source: "usn-journal", user: @"FILESERVER\AnphibiO", processName: "fsutil.exe"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(987), "deleted", first, source: "windows-security-log", user: @"FILESERVER\AnphibiO"),
+        BuildTimelineEvent(timestamp, "permission_changed", second, source: "usn-journal", user: @"FILESERVER\AnphibiO", processName: "fsutil.exe"),
+        BuildTimelineEvent(timestamp, "renamed", second, previousPath: second, source: "usn-journal", user: @"FILESERVER\AnphibiO", processName: "fsutil.exe"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(987), "deleted", second, source: "windows-security-log", user: @"FILESERVER\AnphibiO")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.Path).ThenBy(item => item.Action).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "deleted") == 2, $"As duas exclusoes deveriam permanecer. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "permission_changed") == 0, $"Permissao ecoada no mesmo instante da exclusao nao deveria aparecer. Atual: {debug}");
 }
 
 static void TimelineKeepsLongMixedParallelBatchStable()
