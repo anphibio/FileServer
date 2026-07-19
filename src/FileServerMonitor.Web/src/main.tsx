@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  ArchiveRestore,
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
@@ -141,6 +142,13 @@ type RetentionStatus = {
     archivedRecords: number;
     archivedBytes: number;
     lastArchiveUtc?: string | null;
+    backupAvailable: boolean;
+    backupRoot?: string | null;
+    cleanupEnabled: boolean;
+    primaryRetentionDays: number;
+    backedUpFiles: number;
+    pendingBackupFiles: number;
+    expiredPrimaryFiles: number;
     recentArchives: ColdArchiveManifest[];
   };
 };
@@ -155,6 +163,39 @@ type ColdArchiveManifest = {
   fileSizeBytes: number;
   sha256: string;
   createdUtc: string;
+  backupRelativePath?: string | null;
+  backupSha256?: string | null;
+  backedUpUtc?: string | null;
+  primaryDeletedUtc?: string | null;
+};
+
+type ColdArchiveLifecycleResult = {
+  enabled: boolean;
+  examinedFiles: number;
+  backedUpFiles: number;
+  expiredPrimaryFiles: number;
+  missingPrimaryFiles: number;
+  errorCount: number;
+  durationMs: number;
+  cleanupEnabled: boolean;
+  primaryRetentionDays: number;
+  errors: string[];
+  message?: string | null;
+};
+
+type ColdArchiveRestoreRun = {
+  restoreId: string;
+  archiveId: string;
+  status: string;
+  actor: string;
+  startedUtc: string;
+  completedUtc?: string | null;
+  recordsRead: number;
+  recordsRestored: number;
+  duplicatesSkipped: number;
+  durationMs: number;
+  hashVerified: boolean;
+  error?: string | null;
 };
 
 type InventoryScanConfig = {
@@ -1450,15 +1491,20 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
   const [status, setStatus] = useState<RetentionStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [restoringArchiveId, setRestoringArchiveId] = useState<string | null>(null);
+  const [restoreRuns, setRestoreRuns] = useState<ColdArchiveRestoreRun[]>([]);
+  const [runningLifecycle, setRunningLifecycle] = useState(false);
 
   useEffect(() => {
     Promise.all([
       fetchJson<RetentionConfig>("/api/retention/config"),
-      fetchJson<RetentionStatus>("/api/retention/status")
+      fetchJson<RetentionStatus>("/api/retention/status"),
+      fetchJson<ColdArchiveRestoreRun[]>("/api/retention/restores?take=10")
     ])
-      .then(([loadedConfig, loadedStatus]) => {
+      .then(([loadedConfig, loadedStatus, loadedRestoreRuns]) => {
         setConfig(loadedConfig);
         setStatus(loadedStatus);
+        setRestoreRuns(loadedRestoreRuns);
       })
       .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar retencao." }));
   }, [onNotify]);
@@ -1558,6 +1604,69 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
     }
   }
 
+  async function restoreArchive(archive: ColdArchiveManifest) {
+    const confirmed = window.confirm(
+      `Restaurar ${archive.recordCount.toLocaleString("pt-BR")} registro(s) de ${archive.dataset}?\n\n` +
+      "A retenção precisa permanecer desabilitada durante a análise. Registros já presentes serão ignorados."
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setRestoringArchiveId(archive.archiveId);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/retention/archives/${archive.archiveId}/restore`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel restaurar o arquivo frio."));
+      }
+
+      const result = (await response.json()) as ColdArchiveRestoreRun;
+      const [refreshedStatus, refreshedRuns] = await Promise.all([
+        fetchJson<RetentionStatus>("/api/retention/status"),
+        fetchJson<ColdArchiveRestoreRun[]>("/api/retention/restores?take=10")
+      ]);
+      setStatus(refreshedStatus);
+      setRestoreRuns(refreshedRuns);
+      onNotify({
+        tone: "success",
+        message: `${result.recordsRestored.toLocaleString("pt-BR")} registro(s) restaurado(s); ${result.duplicatesSkipped.toLocaleString("pt-BR")} já existente(s) ignorado(s).`
+      });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel restaurar o arquivo frio." });
+    } finally {
+      setRestoringArchiveId(null);
+    }
+  }
+
+  async function runArchiveLifecycle() {
+    setRunningLifecycle(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/retention/archives/lifecycle`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel executar o ciclo do arquivo frio."));
+      }
+
+      const result = (await response.json()) as ColdArchiveLifecycleResult;
+      setStatus(await fetchJson<RetentionStatus>("/api/retention/status"));
+      onNotify({
+        tone: result.errorCount > 0 ? "danger" : "success",
+        message: result.enabled
+          ? `${result.backedUpFiles.toLocaleString("pt-BR")} backup(s) verificado(s) e ${result.expiredPrimaryFiles.toLocaleString("pt-BR")} primário(s) expirado(s).`
+          : result.message || "O ciclo de backup está desabilitado."
+      });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel executar o ciclo do arquivo frio." });
+    } finally {
+      setRunningLifecycle(false);
+    }
+  }
+
   if (!config) {
     return <Panel title="Retenção de dados" subtitle="Carregando política de limpeza..." />;
   }
@@ -1584,6 +1693,7 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
           <StatusCard label="Estado" value={config.enabled ? "Ativa" : "Inativa"} detail={config.enabled ? "Limpeza automática em execução" : "Banco mantém os dados sem purga automática"} />
           <StatusCard label="Elegíveis agora" value={eligibleRows.toLocaleString("pt-BR")} detail="Brutos, timeline e alertas fora da janela configurada" />
           <StatusCard label="Arquivo frio" value={status?.archive.available ? formatBytes(status.archive.archivedBytes) : "Indisponível"} detail={status?.archive.available ? `${status.archive.archivedRecords.toLocaleString("pt-BR")} registros em ${status.archive.archiveFiles.toLocaleString("pt-BR")} arquivo(s)` : "A purga será bloqueada sem armazenamento persistente"} />
+          <StatusCard label="Backup verificado" value={status?.archive.backupAvailable ? `${status.archive.backedUpFiles.toLocaleString("pt-BR")} arquivo(s)` : "Desabilitado"} detail={status?.archive.backupAvailable ? `${status.archive.pendingBackupFiles.toLocaleString("pt-BR")} pendente(s); primário por ${status.archive.primaryRetentionDays} dias` : "Configure um segundo volume antes de habilitar a expiração"} />
           <StatusCard label="Última execução" value={latestStatusLabel} detail={latest ? `${lastDeleted.toLocaleString("pt-BR")} arquivados e removidos em ${formatDurationMs(latest.durationMs)}` : `Execução automática a cada ${config.intervalHours} h`} />
         </div>
 
@@ -1649,18 +1759,61 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
                   <div>
                     <strong>{archive.dataset === "events" ? "Eventos brutos" : archive.dataset === "timeline" ? "Linha do tempo" : "Alertas"}</strong>
                     <span>{archive.recordCount.toLocaleString("pt-BR")} registros · {formatBytes(archive.fileSizeBytes)} · {formatDate(archive.createdUtc)}</span>
-                    <code title={archive.sha256}>SHA-256 {archive.sha256.slice(0, 16)}…</code>
+                    <code title={archive.sha256}>SHA-256 {archive.sha256.slice(0, 16)}… · {archive.backedUpUtc ? "backup verificado" : "sem backup"}{archive.primaryDeletedUtc ? " · primário expirado" : ""}</code>
                   </div>
-                  <button className="icon-button" type="button" onClick={() => void downloadArchive(archive)} title="Baixar arquivo frio" aria-label="Baixar arquivo frio">
-                    <Download size={18} />
-                  </button>
+                  <div className="retention-archive-actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void restoreArchive(archive)}
+                      disabled={config.enabled || restoringArchiveId !== null}
+                      title={config.enabled ? "Desabilite e salve a retenção antes de restaurar" : "Restaurar no banco operacional"}
+                      aria-label="Restaurar arquivo frio"
+                    >
+                      <ArchiveRestore size={18} />
+                    </button>
+                    <button className="icon-button" type="button" onClick={() => void downloadArchive(archive)} title="Baixar arquivo frio" aria-label="Baixar arquivo frio">
+                      <Download size={18} />
+                    </button>
+                  </div>
                 </article>
               ))}
             </div>
           </section>
         ) : null}
 
+        {restoreRuns.length > 0 && (
+          <section className="retention-restore-history" aria-label="Restaurações recentes">
+            <div className="retention-archive-heading">
+              <div>
+                <span>RESTAURAÇÕES RECENTES</span>
+                <strong>Operações verificadas e auditadas</strong>
+              </div>
+              <small>Registros existentes são preservados sem duplicação</small>
+            </div>
+            <div className="retention-restore-list">
+              {restoreRuns.map((run) => (
+                <article key={run.restoreId}>
+                  <div>
+                    <strong>{run.status === "completed" ? "Concluída" : run.status === "failed" ? "Falhou" : "Em execução"}</strong>
+                    <span>{formatDate(run.startedUtc)} · {run.actor}</span>
+                  </div>
+                  <div className="retention-restore-result">
+                    <strong>{run.recordsRestored.toLocaleString("pt-BR")} restaurados</strong>
+                    <span>{run.duplicatesSkipped.toLocaleString("pt-BR")} duplicados · {formatDurationMs(run.durationMs)}</span>
+                    <small className={run.hashVerified ? "verified" : "unverified"}>{run.hashVerified ? "SHA-256 verificado" : "Integridade não confirmada"}</small>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
         <div className="form-actions">
+          <button className="secondary-button" type="button" onClick={runArchiveLifecycle} disabled={runningLifecycle || running || saving}>
+            <ShieldCheck size={18} />
+            {runningLifecycle ? "Verificando backup..." : "Verificar backup"}
+          </button>
           <button className="secondary-button" type="button" onClick={runNow} disabled={running || status?.running || saving}>
             <RefreshCcw size={18} />
             {running || status?.running ? "Arquivando..." : "Arquivar agora"}

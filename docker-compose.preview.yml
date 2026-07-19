@@ -48,5 +48,7 @@ services:
       Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
       Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
       Retention__MaxRowsPerRun: ${RETENTION_MAX_ROWS_PER_RUN:-500000}
+      Retention__ArchiveBackupEnabled: false
+      Retention__ArchiveCleanupEnabled: false
     ports:
       - "${PREVIEW_API_PORT:-8081}:8080"

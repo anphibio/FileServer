@@ -598,13 +598,28 @@ RETENTION_INTERVAL_HOURS=24
 RETENTION_PURGE_BATCH_SIZE=10000
 RETENTION_MAX_ROWS_PER_RUN=500000
 RETENTION_ARCHIVE_HOST_PATH=/srv/fileserver-monitor/archive
+RETENTION_ARCHIVE_BACKUP_ENABLED=false
+RETENTION_ARCHIVE_BACKUP_HOST_PATH=/srv/fileserver-monitor/archive-backup
+RETENTION_ARCHIVE_CLEANUP_ENABLED=false
+RETENTION_ARCHIVE_PRIMARY_RETENTION_DAYS=365
 ```
 
 A política arquiva dados em lotes e limita cada execução por conjunto de dados para não monopolizar o banco. Cada lote vira um arquivo `JSONL` compactado com GZip e hash SHA-256. O manifesto e a remoção dos IDs arquivados são confirmados na mesma transação; se o volume, a escrita ou o banco falhar, nenhuma linha daquele lote é removida.
 
 Administradores podem consultar a estimativa e o histórico em `GET /api/retention/status`, listar manifestos em `GET /api/retention/archives`, baixar uma evidência em `GET /api/retention/archives/{archiveId}/download` ou iniciar uma execução controlada em `POST /api/retention/run`.
 
-Quando habilitada, a API arquiva e remove eventos brutos, eventos correlacionados da linha do tempo e alertas antigos em lotes para reduzir impacto no SQL Server. O diretório indicado por `RETENTION_ARCHIVE_HOST_PATH` precisa estar em armazenamento persistente e entrar na política de backup. Ajuste os dias conforme política interna, LGPD, auditoria e capacidade do banco.
+A restauração controlada usa `POST /api/retention/archives/{archiveId}/restore`. A API exige retenção desabilitada, valida SHA-256 e contagem antes de confirmar uma transação e ignora registros já presentes. Cada tentativa fica registrada em `GET /api/retention/restores` com ator, duração, duplicados e resultado. O artefato frio não é apagado após a restauração.
+
+O segundo volume é propositalmente independente. `RETENTION_ARCHIVE_BACKUP_ENABLED=true` habilita cópia e verificação periódica; `POST /api/retention/archives/lifecycle` permite executar a checagem imediatamente. A expiração do volume primário só ocorre quando `RETENTION_ARCHIVE_CLEANUP_ENABLED=true`, o prazo foi atingido e existe backup com o mesmo SHA-256. A primeira versão nunca remove automaticamente a cópia de backup.
+
+Ordem segura de ativação:
+
+1. Monte `RETENTION_ARCHIVE_HOST_PATH` e `RETENTION_ARCHIVE_BACKUP_HOST_PATH` em dispositivos ou destinos distintos.
+2. Habilite apenas `RETENTION_ARCHIVE_BACKUP_ENABLED` e confirme que pendências chegam a zero.
+3. Teste download e restauração de uma evidência controlada.
+4. Defina o prazo interno e só então habilite `RETENTION_ARCHIVE_CLEANUP_ENABLED`.
+
+Quando habilitada, a API arquiva e remove eventos brutos, eventos correlacionados da linha do tempo e alertas antigos em lotes para reduzir impacto no SQL Server. Os dois diretórios precisam estar em armazenamento persistente; apontá-los para o mesmo dispositivo elimina a proteção contra falha física. Ajuste os dias conforme política interna, LGPD, auditoria e capacidade do banco.
 
 ## Interface Web
 

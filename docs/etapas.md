@@ -239,3 +239,6 @@ Observacoes:
 - Preview local ganhou script de checagem para aguardar subida, validar endpoints e opcionalmente popular a demo antes da revisao visual.
 - Stack principal ganhou scripts de start, check e stop em Docker, com fallback entre `docker compose` e `docker-compose`.
 - Aba de Alertas ganhou link para abrir a lista de operacoes relacionadas ao arquivo ou pasta impactada pelo alerta.
+- Arquivo frio ganhou leitura com validacao de SHA-256 e contagem antes de qualquer restauracao.
+- Restauracao administrativa e transacional passou a ignorar duplicados e registrar historico auditavel.
+- Ciclo de vida ganhou segundo volume, backup verificado e expiracao do primario bloqueada por padrao.

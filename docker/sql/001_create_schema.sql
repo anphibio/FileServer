@@ -649,6 +649,16 @@ BEGIN
 END;
 GO
 
+IF COL_LENGTH(N'dbo.RetentionArchives', N'BackupRelativePath') IS NULL
+    ALTER TABLE dbo.RetentionArchives ADD BackupRelativePath NVARCHAR(1024) NULL;
+IF COL_LENGTH(N'dbo.RetentionArchives', N'BackupSha256') IS NULL
+    ALTER TABLE dbo.RetentionArchives ADD BackupSha256 CHAR(64) NULL;
+IF COL_LENGTH(N'dbo.RetentionArchives', N'BackedUpUtc') IS NULL
+    ALTER TABLE dbo.RetentionArchives ADD BackedUpUtc DATETIME2(3) NULL;
+IF COL_LENGTH(N'dbo.RetentionArchives', N'PrimaryDeletedUtc') IS NULL
+    ALTER TABLE dbo.RetentionArchives ADD PrimaryDeletedUtc DATETIME2(3) NULL;
+GO
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionArchives_RunId' AND object_id = OBJECT_ID(N'dbo.RetentionArchives'))
 BEGIN
     CREATE INDEX IX_RetentionArchives_RunId ON dbo.RetentionArchives (RunId, DatasetName);
@@ -658,5 +668,32 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionArchives_CreatedUtc' AND object_id = OBJECT_ID(N'dbo.RetentionArchives'))
 BEGIN
     CREATE INDEX IX_RetentionArchives_CreatedUtc ON dbo.RetentionArchives (CreatedUtc DESC);
+END;
+GO
+
+IF OBJECT_ID(N'dbo.RetentionRestoreRuns', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RetentionRestoreRuns
+    (
+        RestoreId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionRestoreRuns PRIMARY KEY,
+        ArchiveId UNIQUEIDENTIFIER NOT NULL,
+        StatusName NVARCHAR(32) NOT NULL,
+        ActorName NVARCHAR(256) NOT NULL,
+        StartedUtc DATETIME2(3) NOT NULL,
+        CompletedUtc DATETIME2(3) NULL,
+        RecordsRead INT NOT NULL,
+        RecordsRestored INT NOT NULL,
+        DuplicatesSkipped INT NOT NULL,
+        DurationMs BIGINT NOT NULL,
+        HashVerified BIT NOT NULL,
+        ErrorMessage NVARCHAR(2048) NULL
+    );
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionRestoreRuns_Archive_Started' AND object_id = OBJECT_ID(N'dbo.RetentionRestoreRuns'))
+BEGIN
+    CREATE INDEX IX_RetentionRestoreRuns_Archive_Started
+        ON dbo.RetentionRestoreRuns (ArchiveId, StartedUtc DESC);
 END;
 GO

@@ -92,6 +92,8 @@ var tests = new (string Name, Action Test)[]
     ("fila duravel preserva lote quando o envio falha", DurableQueuePreservesUnsentBatchAfterFailure),
     ("fila duravel planeja drenagem pelo lote real da API", DurableQueuePlansDrainByApiBatch),
     ("arquivo frio compacta lote e registra hash verificavel", ColdArchiveWritesCompressedBatchWithVerifiableHash),
+    ("arquivo frio le lote somente quando manifesto confere", ColdArchiveReadsBatchWhenManifestMatches),
+    ("arquivo frio recusa restauracao quando hash diverge", ColdArchiveRejectsRestoreWhenHashDiffers),
     ("materializacao acumula janelas concorrentes em um unico trabalho", TimelineMaterializationCoalescesConcurrentWindows),
     ("materializacao devolve janela falha sem perder trabalho novo", TimelineMaterializationRetriesFailedWindowWithNewWork),
     ("materializacao mantem janelas distantes em trabalhos separados", TimelineMaterializationKeepsDistantWindowsSeparate),
@@ -228,6 +230,93 @@ static void ColdArchiveWritesCompressedBatchWithVerifiableHash()
         var actualHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(hashStream)).ToLowerInvariant();
         Assert(result.Sha256.Equals(actualHash, StringComparison.Ordinal), "O hash do manifesto deveria validar o arquivo compactado.");
         Assert(result.FileSizeBytes == new FileInfo(fullPath).Length, "O tamanho do manifesto deveria refletir o arquivo final.");
+    }
+    finally
+    {
+        if (Directory.Exists(archiveRoot))
+        {
+            Directory.Delete(archiveRoot, recursive: true);
+        }
+    }
+}
+
+static void ColdArchiveReadsBatchWhenManifestMatches()
+{
+    var archiveRoot = Path.Combine(Path.GetTempPath(), $"fileserver-monitor-archive-read-{Guid.NewGuid():N}");
+    var eventId = Guid.NewGuid();
+
+    try
+    {
+        var archive = ColdArchiveFileWriter.WriteAsync(
+            archiveRoot,
+            "events",
+            Guid.NewGuid(),
+            1,
+            new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["Id"] = eventId,
+                    ["TimestampUtc"] = DateTime.Parse("2026-01-02T03:04:05Z").ToUniversalTime(),
+                    ["FullPath"] = @"C:\Corporativo\arquivo-01.txt"
+                }
+            },
+            CancellationToken.None).GetAwaiter().GetResult();
+
+        var result = ColdArchiveFileReader.ReadAsync(
+            Path.Combine(archiveRoot, archive.RelativePath),
+            archive.Sha256,
+            archive.RecordCount,
+            CancellationToken.None).GetAwaiter().GetResult();
+
+        Assert(result.RecordCount == 1, "A leitura deveria preservar a contagem do manifesto.");
+        Assert(result.Records[0].GetProperty("Id").GetGuid() == eventId, "A leitura deveria preservar a evidencia arquivada.");
+    }
+    finally
+    {
+        if (Directory.Exists(archiveRoot))
+        {
+            Directory.Delete(archiveRoot, recursive: true);
+        }
+    }
+}
+
+static void ColdArchiveRejectsRestoreWhenHashDiffers()
+{
+    var archiveRoot = Path.Combine(Path.GetTempPath(), $"fileserver-monitor-archive-tamper-{Guid.NewGuid():N}");
+
+    try
+    {
+        var archive = ColdArchiveFileWriter.WriteAsync(
+            archiveRoot,
+            "events",
+            Guid.NewGuid(),
+            1,
+            new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["Id"] = Guid.NewGuid(),
+                    ["TimestampUtc"] = DateTime.Parse("2026-01-02T03:04:05Z").ToUniversalTime()
+                }
+            },
+            CancellationToken.None).GetAwaiter().GetResult();
+
+        var failed = false;
+        try
+        {
+            _ = ColdArchiveFileReader.ReadAsync(
+                Path.Combine(archiveRoot, archive.RelativePath),
+                new string('0', 64),
+                archive.RecordCount,
+                CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (InvalidDataException)
+        {
+            failed = true;
+        }
+
+        Assert(failed, "A restauracao deveria recusar um arquivo cujo hash diverge do manifesto.");
     }
     finally
     {

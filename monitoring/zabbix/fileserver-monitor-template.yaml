@@ -1080,6 +1080,92 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: 131299fc5c92464fbb562a64a83fbf27
+          name: 'FileServer Monitor: cold archive backup available'
+          type: DEPENDENT
+          key: fileserver.retention.archive_backup_available
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveBackupAvailable
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === true || value === "true" ? 1 : 0;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 4426bad04a884014ac7b4f83b47b7cc7
+          name: 'FileServer Monitor: cold archive pending backup files'
+          type: DEPENDENT
+          key: fileserver.retention.archive_pending_backup_files
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archivePendingBackupFiles
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 5164816b973e44eeb90ad636dc043f1c
+          name: 'FileServer Monitor: cold archive backed up files'
+          type: DEPENDENT
+          key: fileserver.retention.archive_backed_up_files
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveBackedUpFiles
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: ea99e340838144f983e37cd4ff2b3a52
+          name: 'FileServer Monitor: cold archive expired primary files'
+          type: DEPENDENT
+          key: fileserver.retention.archive_expired_primary_files
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveExpiredPrimaryFiles
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: c1ea0f4fb3184019965c873231c6a3f0
+          name: 'FileServer Monitor: cold archive cleanup enabled'
+          type: DEPENDENT
+          key: fileserver.retention.archive_cleanup_enabled
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveCleanupEnabled
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === true || value === "true" ? 1 : 0;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
         - uuid: da04cdf6a3ea46f88707886a07af0313
           name: 'FileServer Monitor: retention last duration'
           type: DEPENDENT
@@ -1274,3 +1360,7 @@ zabbix_export:
       expression: 'last(/Template App FileServer Monitor/fileserver.retention.enabled)=1 and last(/Template App FileServer Monitor/fileserver.retention.archive_available)=0'
       name: 'FileServer Monitor: retencao ativa sem arquivo frio disponivel'
       priority: HIGH
+    - uuid: 345477fe102645728aca65ee8ec9a7b7
+      expression: 'last(/Template App FileServer Monitor/fileserver.retention.archive_backup_available)=1 and min(/Template App FileServer Monitor/fileserver.retention.archive_pending_backup_files,7h)>0'
+      name: 'FileServer Monitor: arquivos frios aguardando backup ha mais de 7 horas'
+      priority: WARNING

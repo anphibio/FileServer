@@ -64,9 +64,15 @@ services:
       Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
       Retention__MaxRowsPerRun: ${RETENTION_MAX_ROWS_PER_RUN:-500000}
       Retention__ArchivePath: /var/lib/fileserver-monitor/archive
+      Retention__ArchiveBackupEnabled: ${RETENTION_ARCHIVE_BACKUP_ENABLED:-false}
+      Retention__ArchiveBackupPath: /var/lib/fileserver-monitor/archive-backup
+      Retention__ArchiveCleanupEnabled: ${RETENTION_ARCHIVE_CLEANUP_ENABLED:-false}
+      Retention__ArchivePrimaryRetentionDays: ${RETENTION_ARCHIVE_PRIMARY_RETENTION_DAYS:-365}
     volumes:
       - ${RETENTION_ARCHIVE_HOST_PATH:-retention-archive-data}:/var/lib/fileserver-monitor/archive
+      - ${RETENTION_ARCHIVE_BACKUP_HOST_PATH:-retention-archive-backup-data}:/var/lib/fileserver-monitor/archive-backup
     restart: unless-stopped
 
 volumes:
   retention-archive-data:
+  retention-archive-backup-data:

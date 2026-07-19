@@ -31,6 +31,7 @@ builder.Services.AddSingleton<RetentionSettingsStore>();
 builder.Services.AddSingleton<RetentionRunStore>();
 builder.Services.AddSingleton<ColdArchiveStore>();
 builder.Services.AddSingleton<RetentionCoordinator>();
+builder.Services.AddHostedService<ArchiveLifecycleWorker>();
 builder.Services.AddSingleton<InventoryScanSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
 builder.Services.AddSingleton<TimelineMaterializationCoordinator>();
@@ -1230,7 +1231,7 @@ app.MapGet("/api/retention/archives/{archiveId:guid}/download", async (
         return Results.NotFound(new ErrorResponse("Arquivo frio nao encontrado."));
     }
 
-    var fullPath = archiveStore.ResolveFullPath(archive.RelativePath);
+    var fullPath = archiveStore.ResolveAvailablePath(archive);
     if (!File.Exists(fullPath))
     {
         return Results.NotFound(new ErrorResponse("O manifesto existe, mas o arquivo frio nao esta disponivel no volume."));
@@ -1241,6 +1242,76 @@ app.MapGet("/api/retention/archives/{archiveId:guid}/download", async (
         "application/gzip",
         Path.GetFileName(fullPath),
         enableRangeProcessing: true);
+});
+
+app.MapGet("/api/retention/restores", async (
+    int? take,
+    ColdArchiveStore archiveStore,
+    CancellationToken cancellationToken) =>
+{
+    return Results.Ok(await archiveStore.GetRestoreRunsAsync(Math.Clamp(take ?? 50, 1, 200), cancellationToken));
+});
+
+app.MapPost("/api/retention/archives/lifecycle", async (
+    ColdArchiveStore archiveStore,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var result = await archiveStore.RunLifecycleAsync(cancellationToken);
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "retention.archive.lifecycle",
+        EntityType: "retention_archive",
+        EntityId: "lifecycle",
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: result), cancellationToken);
+    return Results.Ok(result);
+});
+
+app.MapPost("/api/retention/archives/{archiveId:guid}/restore", async (
+    Guid archiveId,
+    RetentionSettingsStore settingsStore,
+    RetentionCoordinator coordinator,
+    ColdArchiveStore archiveStore,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await settingsStore.GetAsync(cancellationToken);
+    if (settings.Enabled || coordinator.IsRunning)
+    {
+        return Results.Conflict(new ErrorResponse(
+            "Desabilite a retencao e aguarde a execucao atual terminar antes de restaurar. Isso evita o rearquivamento imediato dos dados."));
+    }
+
+    try
+    {
+        var actor = AdminAuditHelpers.GetActor(httpContext);
+        var result = await archiveStore.RestoreAsync(archiveId, actor, cancellationToken);
+        if (result is null)
+        {
+            return Results.NotFound(new ErrorResponse("Arquivo frio nao encontrado."));
+        }
+
+        await adminAudit.AddAsync(AdminAuditEntry.Create(
+            Action: "retention.archive.restore",
+            EntityType: "retention_archive",
+            EntityId: archiveId.ToString(),
+            Actor: actor,
+            SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+            Details: result), cancellationToken);
+
+        return Results.Ok(result);
+    }
+    catch (InvalidDataException exception)
+    {
+        return Results.UnprocessableEntity(new ErrorResponse(exception.Message));
+    }
+    catch (FileNotFoundException exception)
+    {
+        return Results.NotFound(new ErrorResponse(exception.Message));
+    }
 });
 
 app.MapPost("/api/retention/run", async (
@@ -10655,10 +10726,16 @@ internal sealed class RetentionRunStore
 internal sealed class ColdArchiveStore
 {
     private readonly string _archiveRoot;
+    private readonly string? _backupRoot;
+    private readonly bool _backupEnabled;
+    private readonly bool _cleanupEnabled;
+    private readonly int _primaryRetentionDays;
 #if SQLSERVER
     private readonly string? _connectionString;
     private readonly bool _available;
     private readonly SemaphoreSlim _schemaGate = new(1, 1);
+    private readonly SemaphoreSlim _restoreGate = new(1, 1);
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private bool _schemaEnsured;
 #endif
 
@@ -10667,6 +10744,16 @@ internal sealed class ColdArchiveStore
         _archiveRoot = Path.GetFullPath(configuration.GetValue(
             "Retention:ArchivePath",
             "/var/lib/fileserver-monitor/archive"));
+        var configuredBackupRoot = configuration.GetValue<string>("Retention:ArchiveBackupPath");
+        _backupRoot = string.IsNullOrWhiteSpace(configuredBackupRoot)
+            ? null
+            : Path.GetFullPath(configuredBackupRoot);
+        _backupEnabled = configuration.GetValue("Retention:ArchiveBackupEnabled", false);
+        _cleanupEnabled = configuration.GetValue("Retention:ArchiveCleanupEnabled", false);
+        _primaryRetentionDays = Math.Clamp(
+            configuration.GetValue("Retention:ArchivePrimaryRetentionDays", 365),
+            30,
+            3650);
 #if SQLSERVER
         _available = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
             .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
@@ -10675,6 +10762,8 @@ internal sealed class ColdArchiveStore
     }
 
     public string ArchiveRoot => _archiveRoot;
+
+    public bool BackupAvailable => _backupEnabled && !string.IsNullOrWhiteSpace(_backupRoot);
 
     public bool IsAvailable
     {
@@ -10802,12 +10891,16 @@ internal sealed class ColdArchiveStore
                 COUNT_BIG(1) AS ArchiveFiles,
                 COALESCE(SUM(CONVERT(BIGINT, RecordCount)), 0) AS ArchivedRecords,
                 COALESCE(SUM(FileSizeBytes), 0) AS ArchivedBytes,
-                MAX(CreatedUtc) AS LastArchiveUtc
+                MAX(CreatedUtc) AS LastArchiveUtc,
+                COALESCE(SUM(CASE WHEN BackedUpUtc IS NOT NULL THEN CONVERT(BIGINT, 1) ELSE 0 END), 0) AS BackedUpFiles,
+                COALESCE(SUM(CASE WHEN BackedUpUtc IS NULL THEN CONVERT(BIGINT, 1) ELSE 0 END), 0) AS PendingBackupFiles,
+                COALESCE(SUM(CASE WHEN PrimaryDeletedUtc IS NOT NULL THEN CONVERT(BIGINT, 1) ELSE 0 END), 0) AS ExpiredPrimaryFiles
             FROM dbo.RetentionArchives;
 
             SELECT TOP (@Take)
                 ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
-                RecordCount, FileSizeBytes, Sha256, CreatedUtc
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc,
+                BackupRelativePath, BackupSha256, BackedUpUtc, PrimaryDeletedUtc
             FROM dbo.RetentionArchives
             WHERE @Take > 0
             ORDER BY CreatedUtc DESC;
@@ -10822,6 +10915,9 @@ internal sealed class ColdArchiveStore
         var lastArchiveUtc = reader["LastArchiveUtc"] == DBNull.Value
             ? (DateTimeOffset?)null
             : ReadUtc((DateTime)reader["LastArchiveUtc"]);
+        var backedUpFiles = Convert.ToInt64(reader["BackedUpFiles"]);
+        var pendingBackupFiles = Convert.ToInt64(reader["PendingBackupFiles"]);
+        var expiredPrimaryFiles = Convert.ToInt64(reader["ExpiredPrimaryFiles"]);
 
         await reader.NextResultAsync(cancellationToken);
         var recent = new List<ColdArchiveManifest>();
@@ -10837,6 +10933,13 @@ internal sealed class ColdArchiveStore
             archivedRecords,
             archivedBytes,
             lastArchiveUtc,
+            BackupAvailable,
+            _backupRoot,
+            _cleanupEnabled,
+            _primaryRetentionDays,
+            backedUpFiles,
+            pendingBackupFiles,
+            expiredPrimaryFiles,
             recent);
 #else
         await Task.CompletedTask;
@@ -10859,7 +10962,8 @@ internal sealed class ColdArchiveStore
         command.CommandText = """
             SELECT TOP (1)
                 ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
-                RecordCount, FileSizeBytes, Sha256, CreatedUtc
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc,
+                BackupRelativePath, BackupSha256, BackedUpUtc, PrimaryDeletedUtc
             FROM dbo.RetentionArchives
             WHERE ArchiveId = @ArchiveId;
             """;
@@ -10872,6 +10976,262 @@ internal sealed class ColdArchiveStore
 #endif
     }
 
+    public async Task<IReadOnlyCollection<ColdArchiveRestoreRun>> GetRestoreRunsAsync(
+        int take,
+        CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            return Array.Empty<ColdArchiveRestoreRun>();
+        }
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (@Take)
+                RestoreId, ArchiveId, StatusName, ActorName, StartedUtc, CompletedUtc,
+                RecordsRead, RecordsRestored, DuplicatesSkipped, DurationMs,
+                HashVerified, ErrorMessage
+            FROM dbo.RetentionRestoreRuns
+            ORDER BY StartedUtc DESC;
+            """;
+        command.Parameters.AddWithValue("@Take", Math.Clamp(take, 1, 200));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var runs = new List<ColdArchiveRestoreRun>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            runs.Add(ReadRestoreRun(reader));
+        }
+
+        return runs;
+#else
+        await Task.CompletedTask;
+        return Array.Empty<ColdArchiveRestoreRun>();
+#endif
+    }
+
+    public async Task<ColdArchiveRestoreRun?> RestoreAsync(
+        Guid archiveId,
+        string actor,
+        CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            throw new InvalidOperationException("A restauracao exige o provedor SQL Server.");
+        }
+
+        await _restoreGate.WaitAsync(cancellationToken);
+        try
+        {
+            var archive = await FindAsync(archiveId, cancellationToken);
+            if (archive is null)
+            {
+                return null;
+            }
+
+            var fullPath = ResolveAvailablePath(archive);
+            var restoreId = Guid.NewGuid();
+            var startedUtc = DateTimeOffset.UtcNow;
+            var stopwatch = Stopwatch.StartNew();
+
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await InsertRestoreRunAsync(connection, restoreId, archiveId, actor, startedUtc, cancellationToken);
+
+            var recordsRead = 0;
+            var recordsRestored = 0;
+            var hashVerified = false;
+
+            try
+            {
+                await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+                await foreach (var batch in ColdArchiveFileReader.ReadBatchesAsync(
+                    fullPath,
+                    archive.Sha256,
+                    archive.RecordCount,
+                    1_000,
+                    cancellationToken))
+                {
+                    hashVerified = true;
+                    recordsRead += batch.Count;
+                    recordsRestored += await InsertRestoredBatchAsync(
+                        connection,
+                        transaction,
+                        archive.Dataset,
+                        batch,
+                        cancellationToken);
+                }
+
+                if (archive.RecordCount == 0)
+                {
+                    hashVerified = true;
+                }
+
+                await transaction.CommitAsync(cancellationToken);
+                stopwatch.Stop();
+                var completed = new ColdArchiveRestoreRun(
+                    restoreId,
+                    archiveId,
+                    "completed",
+                    actor,
+                    startedUtc,
+                    DateTimeOffset.UtcNow,
+                    recordsRead,
+                    recordsRestored,
+                    recordsRead - recordsRestored,
+                    stopwatch.ElapsedMilliseconds,
+                    hashVerified,
+                    null);
+                await CompleteRestoreRunAsync(connection, completed, CancellationToken.None);
+                return completed;
+            }
+            catch (Exception exception)
+            {
+                stopwatch.Stop();
+                var failed = new ColdArchiveRestoreRun(
+                    restoreId,
+                    archiveId,
+                    "failed",
+                    actor,
+                    startedUtc,
+                    DateTimeOffset.UtcNow,
+                    recordsRead,
+                    0,
+                    0,
+                    stopwatch.ElapsedMilliseconds,
+                    hashVerified,
+                    exception.Message);
+                await CompleteRestoreRunAsync(connection, failed, CancellationToken.None);
+                throw;
+            }
+        }
+        finally
+        {
+            _restoreGate.Release();
+        }
+#else
+        await Task.CompletedTask;
+        throw new InvalidOperationException("A restauracao nao esta disponivel neste build.");
+#endif
+    }
+
+    public async Task<ColdArchiveLifecycleResult> RunLifecycleAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            throw new InvalidOperationException("O ciclo de vida exige o provedor SQL Server.");
+        }
+
+        if (!_backupEnabled)
+        {
+            return ColdArchiveLifecycleResult.Disabled("O backup do arquivo frio esta desabilitado.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_backupRoot))
+        {
+            return ColdArchiveLifecycleResult.Disabled("Retention:ArchiveBackupPath nao foi configurado.");
+        }
+
+        if (!await _lifecycleGate.WaitAsync(0, cancellationToken))
+        {
+            throw new InvalidOperationException("Ja existe um ciclo de backup do arquivo frio em andamento.");
+        }
+
+        var startedUtc = DateTimeOffset.UtcNow;
+        var stopwatch = Stopwatch.StartNew();
+        var backedUp = 0;
+        var expiredPrimary = 0;
+        var missingPrimary = 0;
+        var errors = new List<string>();
+
+        try
+        {
+            Directory.CreateDirectory(_backupRoot);
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            var archives = await ReadLifecycleCandidatesAsync(
+                connection,
+                _cleanupEnabled,
+                DateTimeOffset.UtcNow.AddDays(-_primaryRetentionDays),
+                cancellationToken);
+
+            foreach (var archive in archives)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var primaryPath = ResolveFullPath(archive.RelativePath);
+                    var hasVerifiedBackup = archive.BackedUpUtc is not null
+                        && archive.BackupSha256?.Equals(archive.Sha256, StringComparison.OrdinalIgnoreCase) == true
+                        && !string.IsNullOrWhiteSpace(archive.BackupRelativePath)
+                        && File.Exists(ResolvePathWithinRoot(_backupRoot, archive.BackupRelativePath));
+
+                    if (!hasVerifiedBackup)
+                    {
+                        if (!File.Exists(primaryPath))
+                        {
+                            missingPrimary++;
+                            continue;
+                        }
+
+                        var backupPath = ResolvePathWithinRoot(_backupRoot, archive.RelativePath);
+                        await CopyAndVerifyAsync(primaryPath, backupPath, archive.Sha256, cancellationToken);
+                        await MarkBackedUpAsync(connection, archive.ArchiveId, archive.RelativePath, archive.Sha256, cancellationToken);
+                        backedUp++;
+                        hasVerifiedBackup = true;
+                    }
+
+                    if (_cleanupEnabled
+                        && hasVerifiedBackup
+                        && archive.PrimaryDeletedUtc is null
+                        && archive.CreatedUtc < DateTimeOffset.UtcNow.AddDays(-_primaryRetentionDays)
+                        && File.Exists(primaryPath))
+                    {
+                        File.Delete(primaryPath);
+                        await MarkPrimaryDeletedAsync(connection, archive.ArchiveId, cancellationToken);
+                        expiredPrimary++;
+                    }
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    errors.Add($"{archive.ArchiveId}: {exception.Message}");
+                }
+            }
+
+            stopwatch.Stop();
+            return new ColdArchiveLifecycleResult(
+                true,
+                startedUtc,
+                DateTimeOffset.UtcNow,
+                archives.Count,
+                backedUp,
+                expiredPrimary,
+                missingPrimary,
+                errors.Count,
+                stopwatch.ElapsedMilliseconds,
+                _cleanupEnabled,
+                _primaryRetentionDays,
+                errors.Take(10).ToArray(),
+                errors.Count == 0 ? null : "Alguns arquivos exigem revisao; nenhuma copia nao verificada foi removida.");
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+#else
+        await Task.CompletedTask;
+        return ColdArchiveLifecycleResult.Disabled("O ciclo de vida nao esta disponivel neste build.");
+#endif
+    }
+
     public string ResolveFullPath(string relativePath)
     {
         var normalizedRelativePath = relativePath.Replace('/', Path.DirectorySeparatorChar);
@@ -10880,6 +11240,40 @@ internal sealed class ColdArchiveStore
         if (!fullPath.StartsWith(rootPrefix, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("O manifesto aponta para fora do volume de arquivamento.");
+        }
+
+        return fullPath;
+    }
+
+    public string ResolveAvailablePath(ColdArchiveManifest archive)
+    {
+        var primaryPath = ResolveFullPath(archive.RelativePath);
+        if (File.Exists(primaryPath))
+        {
+            return primaryPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(archive.BackupRelativePath) && !string.IsNullOrWhiteSpace(_backupRoot))
+        {
+            var backupPath = ResolvePathWithinRoot(_backupRoot, archive.BackupRelativePath);
+            if (File.Exists(backupPath))
+            {
+                return backupPath;
+            }
+        }
+
+        return primaryPath;
+    }
+
+    private static string ResolvePathWithinRoot(string root, string relativePath)
+    {
+        var normalizedRoot = Path.GetFullPath(root);
+        var normalizedRelativePath = relativePath.Replace('/', Path.DirectorySeparatorChar);
+        var fullPath = Path.GetFullPath(Path.Combine(normalizedRoot, normalizedRelativePath));
+        var rootPrefix = normalizedRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(rootPrefix, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("O manifesto aponta para fora do volume configurado.");
         }
 
         return fullPath;
@@ -10923,6 +11317,37 @@ internal sealed class ColdArchiveStore
 
                     CREATE INDEX IX_RetentionArchives_RunId ON dbo.RetentionArchives (RunId, DatasetName);
                     CREATE INDEX IX_RetentionArchives_CreatedUtc ON dbo.RetentionArchives (CreatedUtc DESC);
+                END;
+
+                IF COL_LENGTH(N'dbo.RetentionArchives', N'BackupRelativePath') IS NULL
+                    ALTER TABLE dbo.RetentionArchives ADD BackupRelativePath NVARCHAR(1024) NULL;
+                IF COL_LENGTH(N'dbo.RetentionArchives', N'BackupSha256') IS NULL
+                    ALTER TABLE dbo.RetentionArchives ADD BackupSha256 CHAR(64) NULL;
+                IF COL_LENGTH(N'dbo.RetentionArchives', N'BackedUpUtc') IS NULL
+                    ALTER TABLE dbo.RetentionArchives ADD BackedUpUtc DATETIME2(3) NULL;
+                IF COL_LENGTH(N'dbo.RetentionArchives', N'PrimaryDeletedUtc') IS NULL
+                    ALTER TABLE dbo.RetentionArchives ADD PrimaryDeletedUtc DATETIME2(3) NULL;
+
+                IF OBJECT_ID(N'dbo.RetentionRestoreRuns', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.RetentionRestoreRuns
+                    (
+                        RestoreId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionRestoreRuns PRIMARY KEY,
+                        ArchiveId UNIQUEIDENTIFIER NOT NULL,
+                        StatusName NVARCHAR(32) NOT NULL,
+                        ActorName NVARCHAR(256) NOT NULL,
+                        StartedUtc DATETIME2(3) NOT NULL,
+                        CompletedUtc DATETIME2(3) NULL,
+                        RecordsRead INT NOT NULL,
+                        RecordsRestored INT NOT NULL,
+                        DuplicatesSkipped INT NOT NULL,
+                        DurationMs BIGINT NOT NULL,
+                        HashVerified BIT NOT NULL,
+                        ErrorMessage NVARCHAR(2048) NULL
+                    );
+
+                    CREATE INDEX IX_RetentionRestoreRuns_Archive_Started
+                        ON dbo.RetentionRestoreRuns (ArchiveId, StartedUtc DESC);
                 END;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
@@ -11049,8 +11474,320 @@ internal sealed class ColdArchiveStore
             reader.GetInt32(reader.GetOrdinal("RecordCount")),
             reader.GetInt64(reader.GetOrdinal("FileSizeBytes")),
             reader.GetString(reader.GetOrdinal("Sha256")),
-            ReadUtc(reader.GetDateTime(reader.GetOrdinal("CreatedUtc"))));
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("CreatedUtc"))),
+            reader.IsDBNull(reader.GetOrdinal("BackupRelativePath")) ? null : reader.GetString(reader.GetOrdinal("BackupRelativePath")),
+            reader.IsDBNull(reader.GetOrdinal("BackupSha256")) ? null : reader.GetString(reader.GetOrdinal("BackupSha256")),
+            reader.IsDBNull(reader.GetOrdinal("BackedUpUtc")) ? null : ReadUtc(reader.GetDateTime(reader.GetOrdinal("BackedUpUtc"))),
+            reader.IsDBNull(reader.GetOrdinal("PrimaryDeletedUtc")) ? null : ReadUtc(reader.GetDateTime(reader.GetOrdinal("PrimaryDeletedUtc"))));
     }
+
+    private static async Task<IReadOnlyCollection<ColdArchiveManifest>> ReadLifecycleCandidatesAsync(
+        SqlConnection connection,
+        bool cleanupEnabled,
+        DateTimeOffset primaryCutoffUtc,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1000)
+                ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc,
+                BackupRelativePath, BackupSha256, BackedUpUtc, PrimaryDeletedUtc
+            FROM dbo.RetentionArchives
+            WHERE BackedUpUtc IS NULL
+               OR (@CleanupEnabled = 1 AND PrimaryDeletedUtc IS NULL AND CreatedUtc < @PrimaryCutoffUtc)
+            ORDER BY CASE WHEN BackedUpUtc IS NULL THEN 0 ELSE 1 END, CreatedUtc;
+            """;
+        command.Parameters.AddWithValue("@CleanupEnabled", cleanupEnabled);
+        command.Parameters.AddWithValue("@PrimaryCutoffUtc", primaryCutoffUtc.UtcDateTime);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var archives = new List<ColdArchiveManifest>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            archives.Add(ReadManifest(reader));
+        }
+
+        return archives;
+    }
+
+    private static async Task MarkBackedUpAsync(
+        SqlConnection connection,
+        Guid archiveId,
+        string relativePath,
+        string sha256,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE dbo.RetentionArchives
+            SET BackupRelativePath = @BackupRelativePath,
+                BackupSha256 = @BackupSha256,
+                BackedUpUtc = SYSUTCDATETIME()
+            WHERE ArchiveId = @ArchiveId;
+            """;
+        command.Parameters.AddWithValue("@ArchiveId", archiveId);
+        command.Parameters.AddWithValue("@BackupRelativePath", relativePath);
+        command.Parameters.AddWithValue("@BackupSha256", sha256);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task MarkPrimaryDeletedAsync(
+        SqlConnection connection,
+        Guid archiveId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE dbo.RetentionArchives
+            SET PrimaryDeletedUtc = SYSUTCDATETIME()
+            WHERE ArchiveId = @ArchiveId AND BackedUpUtc IS NOT NULL;
+            """;
+        command.Parameters.AddWithValue("@ArchiveId", archiveId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task CopyAndVerifyAsync(
+        string sourcePath,
+        string destinationPath,
+        string expectedSha256,
+        CancellationToken cancellationToken)
+    {
+        var directory = Path.GetDirectoryName(destinationPath)
+            ?? throw new InvalidOperationException("O destino de backup nao possui diretorio valido.");
+        Directory.CreateDirectory(directory);
+        var temporaryPath = destinationPath + ".part";
+
+        try
+        {
+            await using (var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, true))
+            await using (var destination = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, true))
+            {
+                await source.CopyToAsync(destination, 64 * 1024, cancellationToken);
+            }
+
+            await using var hashStream = new FileStream(temporaryPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, true);
+            var actualHash = Convert.ToHexString(await SHA256.HashDataAsync(hashStream, cancellationToken)).ToLowerInvariant();
+            if (!actualHash.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("A copia de backup diverge do SHA-256 do manifesto.");
+            }
+
+            File.Move(temporaryPath, destinationPath, overwrite: true);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(destinationPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+        }
+    }
+
+    private static async Task InsertRestoreRunAsync(
+        SqlConnection connection,
+        Guid restoreId,
+        Guid archiveId,
+        string actor,
+        DateTimeOffset startedUtc,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO dbo.RetentionRestoreRuns
+            (
+                RestoreId, ArchiveId, StatusName, ActorName, StartedUtc, CompletedUtc,
+                RecordsRead, RecordsRestored, DuplicatesSkipped, DurationMs,
+                HashVerified, ErrorMessage
+            )
+            VALUES
+            (
+                @RestoreId, @ArchiveId, N'running', @ActorName, @StartedUtc, NULL,
+                0, 0, 0, 0, 0, NULL
+            );
+            """;
+        command.Parameters.AddWithValue("@RestoreId", restoreId);
+        command.Parameters.AddWithValue("@ArchiveId", archiveId);
+        command.Parameters.AddWithValue("@ActorName", actor);
+        command.Parameters.AddWithValue("@StartedUtc", startedUtc.UtcDateTime);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task CompleteRestoreRunAsync(
+        SqlConnection connection,
+        ColdArchiveRestoreRun run,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE dbo.RetentionRestoreRuns
+            SET StatusName = @StatusName,
+                CompletedUtc = @CompletedUtc,
+                RecordsRead = @RecordsRead,
+                RecordsRestored = @RecordsRestored,
+                DuplicatesSkipped = @DuplicatesSkipped,
+                DurationMs = @DurationMs,
+                HashVerified = @HashVerified,
+                ErrorMessage = @ErrorMessage
+            WHERE RestoreId = @RestoreId;
+            """;
+        command.Parameters.AddWithValue("@RestoreId", run.RestoreId);
+        command.Parameters.AddWithValue("@StatusName", run.Status);
+        command.Parameters.AddWithValue("@CompletedUtc", run.CompletedUtc?.UtcDateTime ?? (object)DBNull.Value);
+        command.Parameters.AddWithValue("@RecordsRead", run.RecordsRead);
+        command.Parameters.AddWithValue("@RecordsRestored", run.RecordsRestored);
+        command.Parameters.AddWithValue("@DuplicatesSkipped", run.DuplicatesSkipped);
+        command.Parameters.AddWithValue("@DurationMs", run.DurationMs);
+        command.Parameters.AddWithValue("@HashVerified", run.HashVerified);
+        command.Parameters.AddWithValue("@ErrorMessage", run.Error ?? (object)DBNull.Value);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<int> InsertRestoredBatchAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string dataset,
+        IReadOnlyCollection<JsonElement> records,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = RestoreSql(dataset);
+        command.Parameters.Add(new SqlParameter("@Rows", SqlDbType.NVarChar, -1)
+        {
+            Value = JsonSerializer.Serialize(records)
+        });
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private static string RestoreSql(string dataset) => dataset.Trim().ToLowerInvariant() switch
+    {
+        "events" => RestoreEventsSql,
+        "timeline" => RestoreTimelineSql,
+        "alerts" => RestoreAlertsSql,
+        _ => throw new InvalidDataException($"O manifesto referencia o conjunto desconhecido '{dataset}'.")
+    };
+
+    private static ColdArchiveRestoreRun ReadRestoreRun(SqlDataReader reader)
+    {
+        return new ColdArchiveRestoreRun(
+            reader.GetGuid(reader.GetOrdinal("RestoreId")),
+            reader.GetGuid(reader.GetOrdinal("ArchiveId")),
+            reader.GetString(reader.GetOrdinal("StatusName")),
+            reader.GetString(reader.GetOrdinal("ActorName")),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("StartedUtc"))),
+            reader.IsDBNull(reader.GetOrdinal("CompletedUtc")) ? null : ReadUtc(reader.GetDateTime(reader.GetOrdinal("CompletedUtc"))),
+            reader.GetInt32(reader.GetOrdinal("RecordsRead")),
+            reader.GetInt32(reader.GetOrdinal("RecordsRestored")),
+            reader.GetInt32(reader.GetOrdinal("DuplicatesSkipped")),
+            reader.GetInt64(reader.GetOrdinal("DurationMs")),
+            reader.GetBoolean(reader.GetOrdinal("HashVerified")),
+            reader.IsDBNull(reader.GetOrdinal("ErrorMessage")) ? null : reader.GetString(reader.GetOrdinal("ErrorMessage")));
+    }
+
+    private const string RestoreEventsSql = """
+        SET QUOTED_IDENTIFIER ON;
+        INSERT INTO dbo.FileAuditEvents
+        (
+            Id, TimestampUtc, ServerName, ShareName, FullPath, PreviousPath, ObjectType,
+            ActionName, UserName, Sid, SourceHost, SourceIp, ProcessName, FileSizeBytes,
+            Extension, ResultName, Severity, SourceName, AgentId, SourceEventId, CursorType,
+            SourceRecordId, SourceUsn, SourceVolume, FileReferenceId, IngestedUtc
+        )
+        SELECT
+            source.Id, source.TimestampUtc, source.ServerName, source.ShareName, source.FullPath,
+            source.PreviousPath, source.ObjectType, source.ActionName, source.UserName, source.Sid,
+            source.SourceHost, source.SourceIp, source.ProcessName, source.FileSizeBytes, source.Extension,
+            source.ResultName, source.Severity, source.SourceName, source.AgentId, source.SourceEventId,
+            source.CursorType, source.SourceRecordId, source.SourceUsn, source.SourceVolume,
+            source.FileReferenceId, source.IngestedUtc
+        FROM OPENJSON(@Rows) WITH
+        (
+            Id UNIQUEIDENTIFIER '$.Id', TimestampUtc DATETIME2(3) '$.TimestampUtc',
+            ServerName NVARCHAR(128) '$.ServerName', ShareName NVARCHAR(256) '$.ShareName',
+            FullPath NVARCHAR(2048) '$.FullPath', PreviousPath NVARCHAR(2048) '$.PreviousPath',
+            ObjectType NVARCHAR(32) '$.ObjectType', ActionName NVARCHAR(64) '$.ActionName',
+            UserName NVARCHAR(256) '$.UserName', Sid NVARCHAR(256) '$.Sid',
+            SourceHost NVARCHAR(256) '$.SourceHost', SourceIp NVARCHAR(64) '$.SourceIp',
+            ProcessName NVARCHAR(256) '$.ProcessName', FileSizeBytes BIGINT '$.FileSizeBytes',
+            Extension NVARCHAR(64) '$.Extension', ResultName NVARCHAR(64) '$.ResultName',
+            Severity NVARCHAR(32) '$.Severity', SourceName NVARCHAR(128) '$.SourceName',
+            AgentId NVARCHAR(128) '$.AgentId', SourceEventId CHAR(64) '$.SourceEventId',
+            CursorType NVARCHAR(32) '$.CursorType', SourceRecordId BIGINT '$.SourceRecordId',
+            SourceUsn BIGINT '$.SourceUsn', SourceVolume NVARCHAR(32) '$.SourceVolume',
+            FileReferenceId NVARCHAR(128) '$.FileReferenceId', IngestedUtc DATETIME2(3) '$.IngestedUtc'
+        ) AS source
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.FileAuditEvents target WHERE target.Id = source.Id)
+          AND NOT EXISTS
+          (
+              SELECT 1 FROM dbo.FileAuditEvents target
+              WHERE source.AgentId IS NOT NULL AND source.SourceEventId IS NOT NULL
+                AND target.AgentId = source.AgentId AND target.SourceEventId = source.SourceEventId
+          );
+        SELECT @@ROWCOUNT;
+        """;
+
+    private const string RestoreTimelineSql = """
+        INSERT INTO dbo.FileAuditTimelineEvents
+        (
+            Id, TimestampUtc, ServerName, ShareName, FullPath, PreviousPath, ObjectType,
+            ActionName, UserName, Sid, SourceHost, SourceIp, ProcessName, FileSizeBytes,
+            Extension, ResultName, Severity, SourceName, DisplayAction, DisplayTarget,
+            CorrelationVersion, CorrelatedUtc
+        )
+        SELECT
+            source.Id, source.TimestampUtc, source.ServerName, source.ShareName, source.FullPath,
+            source.PreviousPath, source.ObjectType, source.ActionName, source.UserName, source.Sid,
+            source.SourceHost, source.SourceIp, source.ProcessName, source.FileSizeBytes, source.Extension,
+            source.ResultName, source.Severity, source.SourceName, source.DisplayAction,
+            source.DisplayTarget, source.CorrelationVersion, source.CorrelatedUtc
+        FROM OPENJSON(@Rows) WITH
+        (
+            Id UNIQUEIDENTIFIER '$.Id', TimestampUtc DATETIME2(3) '$.TimestampUtc',
+            ServerName NVARCHAR(128) '$.ServerName', ShareName NVARCHAR(256) '$.ShareName',
+            FullPath NVARCHAR(2048) '$.FullPath', PreviousPath NVARCHAR(2048) '$.PreviousPath',
+            ObjectType NVARCHAR(32) '$.ObjectType', ActionName NVARCHAR(64) '$.ActionName',
+            UserName NVARCHAR(256) '$.UserName', Sid NVARCHAR(256) '$.Sid',
+            SourceHost NVARCHAR(256) '$.SourceHost', SourceIp NVARCHAR(64) '$.SourceIp',
+            ProcessName NVARCHAR(256) '$.ProcessName', FileSizeBytes BIGINT '$.FileSizeBytes',
+            Extension NVARCHAR(64) '$.Extension', ResultName NVARCHAR(64) '$.ResultName',
+            Severity NVARCHAR(32) '$.Severity', SourceName NVARCHAR(128) '$.SourceName',
+            DisplayAction NVARCHAR(128) '$.DisplayAction', DisplayTarget NVARCHAR(512) '$.DisplayTarget',
+            CorrelationVersion NVARCHAR(64) '$.CorrelationVersion', CorrelatedUtc DATETIME2(3) '$.CorrelatedUtc'
+        ) AS source
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.FileAuditTimelineEvents target WHERE target.Id = source.Id);
+        SELECT @@ROWCOUNT;
+        """;
+
+    private const string RestoreAlertsSql = """
+        INSERT INTO dbo.FileServerAlerts
+        (
+            Id, RuleName, Severity, StatusName, Title, Description, ServerName, UserName,
+            EventCount, FirstEventUtc, LastEventUtc, CreatedUtc, AcknowledgedUtc,
+            SamplePathsJson, DedupKey
+        )
+        SELECT
+            source.Id, source.RuleName, source.Severity, source.StatusName, source.Title,
+            source.Description, source.ServerName, source.UserName, source.EventCount,
+            source.FirstEventUtc, source.LastEventUtc, source.CreatedUtc, source.AcknowledgedUtc,
+            source.SamplePathsJson, source.DedupKey
+        FROM OPENJSON(@Rows) WITH
+        (
+            Id UNIQUEIDENTIFIER '$.Id', RuleName NVARCHAR(128) '$.RuleName',
+            Severity NVARCHAR(32) '$.Severity', StatusName NVARCHAR(32) '$.StatusName',
+            Title NVARCHAR(256) '$.Title', Description NVARCHAR(1024) '$.Description',
+            ServerName NVARCHAR(128) '$.ServerName', UserName NVARCHAR(256) '$.UserName',
+            EventCount INT '$.EventCount', FirstEventUtc DATETIME2(3) '$.FirstEventUtc',
+            LastEventUtc DATETIME2(3) '$.LastEventUtc', CreatedUtc DATETIME2(3) '$.CreatedUtc',
+            AcknowledgedUtc DATETIME2(3) '$.AcknowledgedUtc',
+            SamplePathsJson NVARCHAR(MAX) '$.SamplePathsJson', DedupKey NVARCHAR(512) '$.DedupKey'
+        ) AS source
+        WHERE NOT EXISTS (SELECT 1 FROM dbo.FileServerAlerts target WHERE target.Id = source.Id);
+        SELECT @@ROWCOUNT;
+        """;
 
     private static ColdArchiveDataset ResolveDataset(string dataset) => dataset.Trim().ToLowerInvariant() switch
     {
@@ -11199,6 +11936,50 @@ internal sealed class RetentionCoordinator
         {
             _gate.Release();
         }
+    }
+}
+
+internal sealed class ArchiveLifecycleWorker : BackgroundService
+{
+    private readonly ColdArchiveStore _archiveStore;
+    private readonly ILogger<ArchiveLifecycleWorker> _logger;
+
+    public ArchiveLifecycleWorker(
+        ColdArchiveStore archiveStore,
+        ILogger<ArchiveLifecycleWorker> logger)
+    {
+        _archiveStore = archiveStore;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromHours(6));
+        do
+        {
+            try
+            {
+                var result = await _archiveStore.RunLifecycleAsync(stoppingToken);
+                if (result.Enabled && (result.BackedUpFiles > 0 || result.ExpiredPrimaryFiles > 0 || result.ErrorCount > 0))
+                {
+                    _logger.LogInformation(
+                        "Ciclo do arquivo frio: {BackedUp} backup(s), {Expired} primario(s) expirado(s), {Errors} erro(s), em {DurationMs} ms.",
+                        result.BackedUpFiles,
+                        result.ExpiredPrimaryFiles,
+                        result.ErrorCount,
+                        result.DurationMs);
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogError(exception, "Falha no ciclo automatico do arquivo frio.");
+            }
+        }
+        while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 }
 
@@ -12327,7 +13108,25 @@ internal sealed record ColdArchiveManifest(
     int RecordCount,
     long FileSizeBytes,
     string Sha256,
-    DateTimeOffset CreatedUtc);
+    DateTimeOffset CreatedUtc,
+    string? BackupRelativePath,
+    string? BackupSha256,
+    DateTimeOffset? BackedUpUtc,
+    DateTimeOffset? PrimaryDeletedUtc);
+
+internal sealed record ColdArchiveRestoreRun(
+    Guid RestoreId,
+    Guid ArchiveId,
+    string Status,
+    string Actor,
+    DateTimeOffset StartedUtc,
+    DateTimeOffset? CompletedUtc,
+    int RecordsRead,
+    int RecordsRestored,
+    int DuplicatesSkipped,
+    long DurationMs,
+    bool HashVerified,
+    string? Error);
 
 internal sealed record ColdArchiveSummary(
     bool Available,
@@ -12336,10 +13135,36 @@ internal sealed record ColdArchiveSummary(
     long ArchivedRecords,
     long ArchivedBytes,
     DateTimeOffset? LastArchiveUtc,
+    bool BackupAvailable,
+    string? BackupRoot,
+    bool CleanupEnabled,
+    int PrimaryRetentionDays,
+    long BackedUpFiles,
+    long PendingBackupFiles,
+    long ExpiredPrimaryFiles,
     IReadOnlyCollection<ColdArchiveManifest> RecentArchives)
 {
     public static ColdArchiveSummary Empty(bool available, string archiveRoot) =>
-        new(available, archiveRoot, 0, 0, 0, null, Array.Empty<ColdArchiveManifest>());
+        new(available, archiveRoot, 0, 0, 0, null, false, null, false, 365, 0, 0, 0, Array.Empty<ColdArchiveManifest>());
+}
+
+internal sealed record ColdArchiveLifecycleResult(
+    bool Enabled,
+    DateTimeOffset? StartedUtc,
+    DateTimeOffset? CompletedUtc,
+    int ExaminedFiles,
+    int BackedUpFiles,
+    int ExpiredPrimaryFiles,
+    int MissingPrimaryFiles,
+    int ErrorCount,
+    long DurationMs,
+    bool CleanupEnabled,
+    int PrimaryRetentionDays,
+    IReadOnlyCollection<string> Errors,
+    string? Message)
+{
+    public static ColdArchiveLifecycleResult Disabled(string message) =>
+        new(false, null, null, 0, 0, 0, 0, 0, 0, false, 365, Array.Empty<string>(), message);
 }
 
 internal sealed record RetentionStatusResponse(
@@ -13262,7 +14087,13 @@ internal sealed record RetentionMetrics(
     long ArchiveFiles,
     long ArchivedRecords,
     long ArchivedBytes,
-    DateTimeOffset? LastArchiveUtc)
+    DateTimeOffset? LastArchiveUtc,
+    bool ArchiveBackupAvailable,
+    bool ArchiveCleanupEnabled,
+    int ArchivePrimaryRetentionDays,
+    long ArchiveBackedUpFiles,
+    long ArchivePendingBackupFiles,
+    long ArchiveExpiredPrimaryFiles)
 {
     public static RetentionMetrics FromSettings(
         RetentionOptions settings,
@@ -13291,7 +14122,13 @@ internal sealed record RetentionMetrics(
             archive.ArchiveFiles,
             archive.ArchivedRecords,
             archive.ArchivedBytes,
-            archive.LastArchiveUtc);
+            archive.LastArchiveUtc,
+            archive.BackupAvailable,
+            archive.CleanupEnabled,
+            archive.PrimaryRetentionDays,
+            archive.BackedUpFiles,
+            archive.PendingBackupFiles,
+            archive.ExpiredPrimaryFiles);
     }
 }
 

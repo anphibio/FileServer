@@ -51,11 +51,16 @@ services:
       Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
       Retention__MaxRowsPerRun: ${RETENTION_MAX_ROWS_PER_RUN:-500000}
       Retention__ArchivePath: /var/lib/fileserver-monitor/archive
+      Retention__ArchiveBackupEnabled: ${RETENTION_ARCHIVE_BACKUP_ENABLED:-false}
+      Retention__ArchiveBackupPath: /var/lib/fileserver-monitor/archive-backup
+      Retention__ArchiveCleanupEnabled: ${RETENTION_ARCHIVE_CLEANUP_ENABLED:-false}
+      Retention__ArchivePrimaryRetentionDays: ${RETENTION_ARCHIVE_PRIMARY_RETENTION_DAYS:-365}
       ConnectionStrings__SqlServer: Server=sqlserver,1433;Database=FileServerMonitor;User Id=sa;Password=${SQLSERVER_SA_PASSWORD};TrustServerCertificate=True;
     ports:
       - "${APP_API_PORT:-8180}:8080"
     volumes:
       - ${RETENTION_ARCHIVE_HOST_PATH:-retention-archive-data}:/var/lib/fileserver-monitor/archive
+      - ${RETENTION_ARCHIVE_BACKUP_HOST_PATH:-retention-archive-backup-data}:/var/lib/fileserver-monitor/archive-backup
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -101,3 +106,4 @@ services:
 volumes:
   sqlserver-data:
   retention-archive-data:
+  retention-archive-backup-data:

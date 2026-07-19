@@ -5409,6 +5409,226 @@
       },
       "pluginVersion": "10.4.0",
       "description": "Quantidade de pacotes JSONL GZip disponíveis para auditoria."
+    },
+    {
+      "id": 60,
+      "title": "Backups verificados",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 95,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: cold archive backed up files"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "description": "Arquivos frios com copia independente e SHA-256 confirmado."
+    },
+    {
+      "id": 61,
+      "title": "Pendentes de backup",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 95,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: cold archive pending backup files"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "description": "Arquivos frios ainda sem copia verificada no segundo volume."
+    },
+    {
+      "id": 62,
+      "title": "Primarios expirados",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 95,
+        "w": 8,
+        "h": 5
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: cold archive expired primary files"
+          },
+          "refId": "A",
+          "resultFormat": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "description": "Arquivos removidos do volume primario somente depois de backup verificado."
     }
   ],
   "refresh": "30s",
@@ -5486,6 +5706,6 @@
   "timezone": "browser",
   "title": "FileServer Monitor",
   "uid": "fileserver-monitor",
-  "version": 5,
+  "version": 6,
   "weekStart": ""
 }
