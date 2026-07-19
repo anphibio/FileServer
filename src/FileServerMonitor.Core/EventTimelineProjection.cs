@@ -28,6 +28,11 @@ public sealed class EventTimelineProjector
 {
     private static readonly TimeSpan CorrelationWindow = TimeSpan.FromSeconds(15);
 
+    public static bool IsProvisionalDocumentPath(string path)
+    {
+        return IsProvisionalDocumentName(path);
+    }
+
     public IReadOnlyCollection<FileAuditDisplayEvent> BuildDisplayEvents(IReadOnlyCollection<FileAuditEvent> events)
     {
         var ordered = DeduplicateRawEvents(events)
@@ -73,7 +78,8 @@ public sealed class EventTimelineProjector
             var transition = TryBuildExplicitTransition(
                 current,
                 cluster.Where(item => !IsOperationalNoise(item.Event)).ToArray(),
-                clusterAll.Where(item => !IsOperationalNoise(item.Event)).ToArray())
+                clusterAll.Where(item => !IsOperationalNoise(item.Event)).ToArray(),
+                ordered)
                 ?? TryBuildSecurityLogRenameTransition(current, cluster);
             if (transition is not null)
             {
@@ -675,7 +681,8 @@ public sealed class EventTimelineProjector
     private static TransitionResult? TryBuildExplicitTransition(
         FileAuditEvent current,
         IReadOnlyCollection<ClusterItem> relevant,
-        IReadOnlyCollection<ClusterItem> evidenceCluster)
+        IReadOnlyCollection<ClusterItem> evidenceCluster,
+        IReadOnlyCollection<FileAuditEvent> history)
     {
         if (string.IsNullOrWhiteSpace(current.PreviousPath) || current.Action is not ("renamed" or "moved"))
         {
@@ -714,6 +721,7 @@ public sealed class EventTimelineProjector
                 || (isProvisionalFolderOrigin && !shouldPreserveProvisionalFolderRename))
             && !(HasNearbyCreationAtPath(evidenceCluster, previousPath, current.TimestampUtc)
                 && !isProvisionalFolderOrigin)
+            && !HasEstablishedItemAtPathBefore(history, previousPath, current.TimestampUtc)
             && !HasNearbyTransitionDestination(evidenceCluster, previousPath, current.TimestampUtc);
         var action = IsMove(previousPath, current.Path) ? "moved" : "renamed";
         var displayAction = isProvisionalOrigin ? "Criação" : action == "moved" ? "Movido" : "Renomeado";
@@ -2071,6 +2079,31 @@ public sealed class EventTimelineProjector
             && (NormalizePath(item.Path) == path || NormalizePath(item.PreviousPath) == path)
             && IsStrongLifecycleAction(item.Action)
             && !IsIgnorableEarlierRawLifecycle(item, path));
+    }
+
+    private static bool HasEstablishedItemAtPathBefore(
+        IEnumerable<FileAuditEvent> rawEvents,
+        string path,
+        DateTimeOffset timestampUtc)
+    {
+        var normalizedPath = NormalizePath(path);
+        var latestLifecycle = rawEvents
+            .Where(item => item.TimestampUtc < timestampUtc - CorrelationWindow)
+            .Where(item => IsStrongLifecycleAction(item.Action))
+            .Where(item => NormalizePath(item.Path) == normalizedPath
+                || NormalizePath(item.PreviousPath) == normalizedPath)
+            .OrderByDescending(item => item.TimestampUtc)
+            .FirstOrDefault();
+
+        if (latestLifecycle is null || latestLifecycle.Action == "deleted")
+        {
+            return false;
+        }
+
+        var movedAway = latestLifecycle.Action is "renamed" or "moved"
+            && NormalizePath(latestLifecycle.PreviousPath) == normalizedPath
+            && NormalizePath(latestLifecycle.Path) != normalizedPath;
+        return !movedAway;
     }
 
     private static bool HasEarlierNonDeletedStrongRawHistory(string path, DateTimeOffset timestampUtc, IEnumerable<FileAuditEvent> rawEvents)

@@ -1369,7 +1369,58 @@ static async Task<IReadOnlyCollection<FileAuditEvent>> QueryTimelineSourceEvents
         }
     }
 
+    await AppendKnownProvisionalTransitionContextAsync(events, repository, cancellationToken);
+
     return events;
+}
+
+static async Task AppendKnownProvisionalTransitionContextAsync(
+    List<FileAuditEvent> events,
+    IEventRepository repository,
+    CancellationToken cancellationToken)
+{
+    var transitions = events
+        .Where(item => item.Action == "renamed"
+            && !string.IsNullOrWhiteSpace(item.PreviousPath)
+            && FileServerMonitor.Core.EventTimelineProjector.IsProvisionalDocumentPath(item.PreviousPath))
+        .GroupBy(item => FileInventoryNormalizer.NormalizePath(item.PreviousPath!), StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.OrderBy(item => item.TimestampUtc).First())
+        .ToArray();
+    var seen = events.Select(item => item.Id).ToHashSet();
+
+    foreach (var transition in transitions)
+    {
+        var previousPath = transition.PreviousPath!;
+        var history = await repository.QueryAsync(
+            new EventQuery(
+                Server: transition.Server,
+                Share: transition.Share,
+                User: null,
+                Action: "created,created_or_appended,modified,changed,permission_changed,renamed,moved,deleted",
+                Path: previousPath,
+                SourceHost: null,
+                SourceIp: null,
+                Extension: null,
+                Result: null,
+                Severity: null,
+                Source: null,
+                FromUtc: null,
+                ToUtc: transition.TimestampUtc.AddTicks(-1),
+                Take: 50),
+            cancellationToken);
+        var normalizedPreviousPath = FileInventoryNormalizer.NormalizePath(previousPath);
+        var latestLifecycle = history
+            .Where(item => item.TimestampUtc < transition.TimestampUtc)
+            .Where(item => FileInventoryNormalizer.NormalizePath(item.Path) == normalizedPreviousPath
+                || FileInventoryNormalizer.NormalizePath(item.PreviousPath ?? "") == normalizedPreviousPath)
+            .OrderByDescending(item => item.TimestampUtc)
+            .FirstOrDefault();
+
+        if (latestLifecycle is not null && seen.Add(latestLifecycle.Id))
+        {
+            events.Add(latestLifecycle);
+        }
+    }
 }
 
 static IReadOnlyCollection<string> EnumerateAncestorPaths(string path)
@@ -9686,7 +9737,7 @@ internal sealed class TimelineMaterializer
 
         var fromWindow = fromUtc ?? rawEvents.Min(item => item.TimestampUtc).AddSeconds(-RebuildPaddingSeconds);
         var toWindow = toUtc ?? rawEvents.Max(item => item.TimestampUtc).AddSeconds(RebuildPaddingSeconds);
-        var contextEvents = await QueryKnownDescendantContextAsync(rawEvents, cancellationToken);
+        var contextEvents = await QueryKnownTransitionContextAsync(rawEvents, cancellationToken);
         var source = contextEvents.Count == 0
             ? rawEvents
             : rawEvents.Concat(contextEvents).ToArray();
@@ -9709,7 +9760,7 @@ internal sealed class TimelineMaterializer
             ToUtc: rawEvents.Max(item => item.TimestampUtc));
     }
 
-    private async Task<IReadOnlyCollection<FileAuditEvent>> QueryKnownDescendantContextAsync(
+    private async Task<IReadOnlyCollection<FileAuditEvent>> QueryKnownTransitionContextAsync(
         IReadOnlyCollection<FileAuditEvent> rawEvents,
         CancellationToken cancellationToken)
     {
@@ -9719,11 +9770,6 @@ internal sealed class TimelineMaterializer
                 && item.ObjectType is "folder" or "directory")
             .OrderBy(item => item.TimestampUtc)
             .ToArray();
-        if (transitions.Length == 0)
-        {
-            return Array.Empty<FileAuditEvent>();
-        }
-
         var context = new Dictionary<Guid, FileAuditEvent>();
         foreach (var transition in transitions)
         {
@@ -9736,6 +9782,50 @@ internal sealed class TimelineMaterializer
             foreach (var descendant in descendants)
             {
                 context.TryAdd(descendant.Id, ToAuditEvent(descendant));
+            }
+        }
+
+        var provisionalFileTransitions = rawEvents
+            .Where(item => item.Action == "renamed"
+                && !string.IsNullOrWhiteSpace(item.PreviousPath)
+                && FileServerMonitor.Core.EventTimelineProjector.IsProvisionalDocumentPath(item.PreviousPath))
+            .GroupBy(item => FileInventoryNormalizer.NormalizePath(item.PreviousPath!), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderBy(item => item.TimestampUtc).First())
+            .ToArray();
+
+        foreach (var transition in provisionalFileTransitions)
+        {
+            var previousPath = transition.PreviousPath!;
+            var history = await _timeline.QueryAsync(
+                new TimelineQuery(
+                    Server: transition.Server,
+                    Share: transition.Share,
+                    User: null,
+                    Action: null,
+                    Path: previousPath,
+                    SourceHost: null,
+                    SourceIp: null,
+                    Extension: null,
+                    Result: null,
+                    Severity: null,
+                    Source: null,
+                    FromUtc: null,
+                    ToUtc: transition.TimestampUtc.AddTicks(-1),
+                    Take: 50),
+                cancellationToken);
+            var normalizedPreviousPath = FileInventoryNormalizer.NormalizePath(previousPath);
+            var latestLifecycle = history
+                .Where(item => item.TimestampUtc < transition.TimestampUtc)
+                .Where(item => FileInventoryNormalizer.NormalizePath(item.Path) == normalizedPreviousPath
+                    || FileInventoryNormalizer.NormalizePath(item.PreviousPath ?? "") == normalizedPreviousPath)
+                .Where(item => item.Action is "created" or "created_or_appended" or "modified" or "changed"
+                    or "permission_changed" or "renamed" or "moved" or "deleted")
+                .OrderByDescending(item => item.TimestampUtc)
+                .FirstOrDefault();
+
+            if (latestLifecycle is not null)
+            {
+                context.TryAdd(latestLifecycle.Id, ToAuditEvent(latestLifecycle));
             }
         }
 

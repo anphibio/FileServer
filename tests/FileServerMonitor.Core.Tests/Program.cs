@@ -65,6 +65,8 @@ var tests = new (string Name, Action Test)[]
     ("timeline trata pasta provisoria numerada do windows como criacao final", TimelineTreatsNumberedProvisionalFolderRenameAsCreation),
     ("timeline preserva rename de pasta provisoria quando ja houve criacao explicita", TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
+    ("timeline trata rename isolado de nome padrao como criacao final", TimelineTreatsStandaloneWindowsDefaultRenameAsCreation),
+    ("timeline preserva rename tardio de arquivo com nome padrao ja criado", TimelineKeepsDelayedRenameOfCreatedWindowsDefaultFile),
     ("timeline remove acesso tecnico logo apos rename de arquivo", TimelineSuppressesAccessEchoAfterFileRename),
     ("timeline remove acesso tecnico junto da alteracao de permissao", TimelineSuppressesTechnicalAccessAroundPermissionChange),
     ("timeline remove acesso tecnico em pasta junto da alteracao de permissao", TimelineSuppressesTechnicalFolderAccessAroundPermissionChange),
@@ -2416,6 +2418,48 @@ static void TimelineKeepsRenameBetweenWindowsDefaultNames()
     Assert(renamed.Path == nextPath, "Rename deveria apontar para o novo nome.");
     Assert(renamed.PreviousPath == previousPath, "Rename deveria preservar o nome anterior.");
     Assert(display.All(item => item.Action != "created"), "Rename entre nomes padrao nao deveria virar criacao.");
+}
+
+static void TimelineKeepsDelayedRenameOfCreatedWindowsDefaultFile()
+{
+    var createdAt = DateTimeOffset.Parse("2026-07-19T11:24:55Z");
+    var previousPath = @"C:\Corporativo\DTI\Novo(a) Documento de Texto - Copia (0).txt";
+    var nextPath = @"C:\Corporativo\DTI\teste.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(createdAt, "created", previousPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(createdAt.AddSeconds(67), "renamed", nextPath, previousPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(createdAt.AddSeconds(67.3), "accessed", nextPath, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "created" && item.Path == previousPath) == 1, $"A criacao anterior deve continuar no nome em que ocorreu. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "renamed" && item.Path == nextPath && item.PreviousPath == previousPath) == 1, $"Rename tardio deve permanecer como rename. Atual: {debug}");
+    Assert(display.All(item => item.Action != "created" || item.Path != nextPath), $"Rename tardio nao deve virar nova criacao no destino. Atual: {debug}");
+    Assert(display.All(item => item.Action != "accessed"), $"Acesso tecnico imediatamente posterior ao rename deve ser suprimido. Atual: {debug}");
+}
+
+static void TimelineTreatsStandaloneWindowsDefaultRenameAsCreation()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T12:00:00Z");
+    var previousPath = @"C:\Corporativo\Novo(a) Documento de Texto.txt";
+    var nextPath = @"C:\Corporativo\contrato.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "renamed", nextPath, previousPath, source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddMilliseconds(300), "accessed", nextPath, source: "windows-security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Length == 1, $"Rename isolado de nome provisório deve produzir apenas a criação final. Atual: {debug}");
+    Assert(display[0].Action == "created" && display[0].Path == nextPath, $"Sem criação anterior conhecida, o destino deve aparecer como criação. Atual: {debug}");
+    Assert(display[0].PreviousPath is null, $"Criação final não deve expor o nome provisório. Atual: {debug}");
 }
 
 static void TimelineSuppressesAccessEchoAfterFileRename()
