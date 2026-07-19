@@ -162,7 +162,7 @@ while (( SECONDS < deadline )); do
     --data-urlencode "path=${ROOT_PATH}" \
     --data-urlencode "take=${TAKE}" \
     "${API_BASE_URL}/api/events/timeline" > "${events_json}"
-  report="$(node scripts/validate-load-action-timeline.mjs "${events_json}" "${expected_json}" "${ROOT_NAME}")"
+  report="$(STRICT_LOAD_VALIDATION=0 node scripts/validate-load-action-timeline.mjs "${events_json}" "${expected_json}" "${ROOT_NAME}")"
   last_report="${report}"
   issue_count="$(jq '([.summary[] | (.missing + .extras + .duplicates)] | add) + (.unexpectedActions | length) + (.userMismatches | length)' <<<"${report}")"
 

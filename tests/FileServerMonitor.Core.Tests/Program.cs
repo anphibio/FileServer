@@ -86,6 +86,8 @@ var tests = new (string Name, Action Test)[]
     ("materializacao devolve janela falha sem perder trabalho novo", TimelineMaterializationRetriesFailedWindowWithNewWork),
     ("materializacao mantem janelas distantes em trabalhos separados", TimelineMaterializationKeepsDistantWindowsSeparate),
     ("materializacao preserva sinal recebido depois do periodo silencioso", TimelineMaterializationPreservesSignalAfterQuietPeriod),
+    ("fila de materializacao seleciona cadeia sobreposta sem engolir janela distante", TimelineMaterializationLeaseSelectionKeepsDistantWorkPending),
+    ("fila de materializacao calcula janela de ingestao com margem", TimelineMaterializationBuildsIngestionWindowWithPadding),
     ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
     ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary),
     ("inventario cruza uso real observado por pasta e usuario", InventoryBuildsObservedActivitySummary),
@@ -322,6 +324,42 @@ static void TimelineMaterializationPreservesSignalAfterQuietPeriod()
     var secondClaim = coordinator.ClaimAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
 
     Assert(secondClaim == second, "O sinal posterior ao periodo silencioso nao pode ser consumido por uma espera abandonada.");
+}
+
+static void TimelineMaterializationLeaseSelectionKeepsDistantWorkPending()
+{
+    var start = new DateTimeOffset(2026, 7, 19, 6, 0, 0, TimeSpan.Zero);
+    var firstId = Guid.NewGuid();
+    var secondId = Guid.NewGuid();
+    var thirdId = Guid.NewGuid();
+    var distantId = Guid.NewGuid();
+    var jobs = new[]
+    {
+        new TimelineMaterializationJob(firstId, new TimelineMaterializationWindow(start, start.AddSeconds(30))),
+        new TimelineMaterializationJob(secondId, new TimelineMaterializationWindow(start.AddSeconds(20), start.AddMinutes(1))),
+        new TimelineMaterializationJob(thirdId, new TimelineMaterializationWindow(start.AddSeconds(50), start.AddMinutes(2))),
+        new TimelineMaterializationJob(distantId, new TimelineMaterializationWindow(start.AddMinutes(20), start.AddMinutes(21)))
+    };
+
+    var lease = TimelineMaterializationLease.Select(jobs)
+        ?? throw new InvalidOperationException("Uma fila com trabalhos pendentes deve produzir lease.");
+    Assert(lease.JobIds.SequenceEqual(new[] { firstId, secondId, thirdId }), "A selecao deve incorporar toda a cadeia de sobreposicao em ordem.");
+    Assert(lease.Window.FromUtc == start, "O lease deve preservar o menor inicio.");
+    Assert(lease.Window.ToUtc == start.AddMinutes(2), "O lease deve ampliar o fim ate a ultima janela conectada.");
+    Assert(!lease.JobIds.Contains(distantId), "Uma janela distante nao deve ampliar desnecessariamente o recorte de correlacao.");
+}
+
+static void TimelineMaterializationBuildsIngestionWindowWithPadding()
+{
+    var start = new DateTimeOffset(2026, 7, 19, 7, 0, 0, TimeSpan.Zero);
+    var window = TimelineMaterializationWindow.FromTimestamps(
+        new[] { start.AddSeconds(10), start.AddSeconds(40), start.AddSeconds(20) },
+        TimeSpan.FromSeconds(30))
+        ?? throw new InvalidOperationException("Eventos recebidos devem produzir uma janela.");
+    Assert(window.FromUtc == start.AddSeconds(-20), "A margem deve ser aplicada antes do primeiro evento.");
+    Assert(window.ToUtc == start.AddSeconds(70), "A margem deve ser aplicada depois do ultimo evento.");
+    Assert(TimelineMaterializationWindow.FromTimestamps(Array.Empty<DateTimeOffset>(), TimeSpan.FromSeconds(30)) is null,
+        "Uma ingestao vazia nao deve criar trabalho de materializacao.");
 }
 
 static void InventoryNormalizesFileAndFolderItems()

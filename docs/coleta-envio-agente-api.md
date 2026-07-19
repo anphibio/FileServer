@@ -518,7 +518,7 @@ flowchart TD
     J --> L["FileServerMonitor.Api"]
     K --> L
     L --> M["Persistencia imediata dos eventos brutos"]
-    M --> O["Fila de janelas da timeline"]
+    M --> O["Fila duravel de janelas da timeline"]
     O --> P["Worker de materializacao no Core"]
     P --> Q["Timeline correlacionada no SQL Server"]
     Q --> N["Web / Linha do Tempo / Relatorios"]
@@ -570,9 +570,11 @@ Se o ambiente auditar apenas escrita/exclusao, acesso de leitura pode nao aparec
 
 ### Separacao entre evento bruto e timeline limpa
 
-A API persiste o lote bruto antes de responder ao agente. Em seguida, agenda uma janela temporal para um worker em segundo plano materializar a timeline com as regras do Core.
+A API persiste o lote bruto e a janela temporal de materializacao na mesma transacao SQL antes de responder ao agente. Um worker em segundo plano reivindica esse trabalho com lease temporario e materializa a timeline com as regras do Core.
 
 As janelas sobrepostas sao acumuladas; janelas temporalmente distantes permanecem separadas. A materializacao aguarda um curto periodo para absorver rajadas, com espera maxima para nao ficar bloqueada por trafego continuo.
+
+No SQL Server, a fila fica em `dbo.TimelineMaterializationJobs`. Um trabalho concluido e removido; uma falha o devolve para `pending`. Se a API cair durante a correlacao, o lease expira e outra instancia ou o processo reiniciado retoma o trabalho automaticamente. Assim, nao existe uma janela entre gravar o evento bruto e registrar que a timeline precisa ser atualizada.
 
 Consequencias operacionais:
 
@@ -580,6 +582,7 @@ Consequencias operacionais:
 - a fila local volta a zero assim que a API aceita e persiste o lote;
 - eventos e relatorios servem o ultimo snapshot estavel enquanto a proxima janela converge;
 - a timeline pode ficar alguns segundos atras do evento bruto durante rajadas;
+- reiniciar ou encerrar abruptamente a API nao perde uma janela ja confirmada no banco;
 - falhas do worker devolvem a janela para nova tentativa sem descartar trabalho recebido durante a falha;
 - `POST /api/events/timeline/rebuild` permite reconstruir manualmente um periodo quando necessario.
 

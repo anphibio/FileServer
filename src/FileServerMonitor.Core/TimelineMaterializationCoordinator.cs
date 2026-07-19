@@ -6,6 +6,39 @@ public sealed record TimelineMaterializationWindow(
     DateTimeOffset FromUtc,
     DateTimeOffset ToUtc)
 {
+    public static TimelineMaterializationWindow? FromTimestamps(
+        IEnumerable<DateTimeOffset> timestamps,
+        TimeSpan padding)
+    {
+        if (padding < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(padding), "Timeline materialization padding cannot be negative.");
+        }
+
+        using var iterator = timestamps.GetEnumerator();
+        if (!iterator.MoveNext())
+        {
+            return null;
+        }
+
+        var fromUtc = iterator.Current;
+        var toUtc = iterator.Current;
+        while (iterator.MoveNext())
+        {
+            if (iterator.Current < fromUtc)
+            {
+                fromUtc = iterator.Current;
+            }
+
+            if (iterator.Current > toUtc)
+            {
+                toUtc = iterator.Current;
+            }
+        }
+
+        return new TimelineMaterializationWindow(fromUtc - padding, toUtc + padding);
+    }
+
     public TimelineMaterializationWindow Merge(TimelineMaterializationWindow other)
     {
         return new TimelineMaterializationWindow(
@@ -18,6 +51,54 @@ public sealed record TimelineMaterializationWindow(
         var effectiveFrom = fromUtc ?? DateTimeOffset.MinValue;
         var effectiveTo = toUtc ?? DateTimeOffset.MaxValue;
         return FromUtc <= effectiveTo && ToUtc >= effectiveFrom;
+    }
+}
+
+public sealed record TimelineMaterializationJob(
+    Guid Id,
+    TimelineMaterializationWindow Window);
+
+public sealed record TimelineMaterializationLease(
+    Guid LeaseId,
+    IReadOnlyList<Guid> JobIds,
+    TimelineMaterializationWindow Window)
+{
+    public static TimelineMaterializationLease? Select(
+        IEnumerable<TimelineMaterializationJob> pendingJobs,
+        Guid? leaseId = null)
+    {
+        var ordered = pendingJobs
+            .OrderBy(item => item.Window.FromUtc)
+            .ThenBy(item => item.Window.ToUtc)
+            .ToArray();
+        if (ordered.Length == 0)
+        {
+            return null;
+        }
+
+        var selectedIds = new List<Guid> { ordered[0].Id };
+        var merged = ordered[0].Window;
+        for (var index = 1; index < ordered.Length; index++)
+        {
+            var candidate = ordered[index];
+            if (candidate.Window.FromUtc > merged.ToUtc)
+            {
+                break;
+            }
+
+            if (!candidate.Window.Overlaps(merged.FromUtc, merged.ToUtc))
+            {
+                continue;
+            }
+
+            selectedIds.Add(candidate.Id);
+            merged = merged.Merge(candidate.Window);
+        }
+
+        return new TimelineMaterializationLease(
+            leaseId ?? Guid.NewGuid(),
+            selectedIds,
+            merged);
     }
 }
 

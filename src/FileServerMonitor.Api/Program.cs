@@ -66,11 +66,15 @@ var storageProvider = builder.Configuration.GetValue("Monitor:StorageProvider", 
 if (storageProvider.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
 {
 #if SQLSERVER
+    builder.Services.AddSingleton<SqlServerTimelineMaterializationQueue>();
+    builder.Services.AddSingleton<ITimelineMaterializationQueue>(services =>
+        services.GetRequiredService<SqlServerTimelineMaterializationQueue>());
     builder.Services.AddSingleton<IEventRepository, SqlServerEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, SqlServerTimelineRepository>();
     builder.Services.AddSingleton<IInventoryRepository, SqlServerInventoryRepository>();
 #else
     Console.Error.WriteLine("SQL Server desativado neste build. Usando armazenamento em memoria.");
+    builder.Services.AddSingleton<ITimelineMaterializationQueue, InMemoryTimelineMaterializationQueue>();
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
     builder.Services.AddSingleton<IInventoryRepository, InMemoryInventoryRepository>();
@@ -78,6 +82,7 @@ if (storageProvider.Equals("SqlServer", StringComparison.OrdinalIgnoreCase))
 }
 else
 {
+    builder.Services.AddSingleton<ITimelineMaterializationQueue, InMemoryTimelineMaterializationQueue>();
     builder.Services.AddSingleton<IEventRepository, InMemoryEventRepository>();
     builder.Services.AddSingleton<ITimelineRepository, InMemoryTimelineRepository>();
     builder.Services.AddSingleton<IInventoryRepository, InMemoryInventoryRepository>();
@@ -186,13 +191,11 @@ app.MapGet("/metrics", async (
 app.MapPost("/api/events", async (
     FileAuditEventRequest request,
     IEventRepository repository,
-    TimelineMaterializationCoordinator materialization,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
     var auditEvent = request.ToAuditEvent();
     await repository.AddAsync(auditEvent, cancellationToken);
-    QueueTimelineMaterialization(new[] { auditEvent }, materialization);
     var generatedAlerts = await alerts.AnalyzeAsync(new[] { auditEvent }, cancellationToken);
 
     return Results.Created($"/api/events/{auditEvent.Id}", new EventIngestResponse(auditEvent, generatedAlerts));
@@ -201,7 +204,6 @@ app.MapPost("/api/events", async (
 app.MapPost("/api/events/batch", async (
     FileAuditEventRequest[] requests,
     IEventRepository repository,
-    TimelineMaterializationCoordinator materialization,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
@@ -217,7 +219,6 @@ app.MapPost("/api/events/batch", async (
 
     var events = requests.Select(request => request.ToAuditEvent()).ToArray();
     await repository.AddBatchAsync(events, cancellationToken);
-    QueueTimelineMaterialization(events, materialization);
     var generatedAlerts = await alerts.AnalyzeAsync(events, cancellationToken);
 
     return Results.Accepted(value: new BatchIngestResponse(
@@ -1417,20 +1418,6 @@ static bool IsDirectTimelineAction(string? action)
     return action?.Trim().ToLowerInvariant() is "accessed" or "created" or "deleted" or "modified" or "permission_changed";
 }
 
-static void QueueTimelineMaterialization(
-    IReadOnlyCollection<FileAuditEvent> ingestedEvents,
-    TimelineMaterializationCoordinator materialization)
-{
-    if (ingestedEvents.Count == 0)
-    {
-        return;
-    }
-
-    var fromUtc = ingestedEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
-    var toUtc = ingestedEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
-    materialization.Enqueue(new TimelineMaterializationWindow(fromUtc, toUtc));
-}
-
 static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTimelineIfCoveredAsync(
     TimelineQuery query,
     ITimelineRepository timelineRepository,
@@ -2237,6 +2224,24 @@ internal interface IEventRepository
     Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(BaselineAnomalyQuery query, CancellationToken cancellationToken);
 
     Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
+}
+
+internal interface ITimelineMaterializationQueue
+{
+    Task EnqueueAsync(TimelineMaterializationWindow window, CancellationToken cancellationToken);
+
+    Task<TimelineMaterializationLease> ClaimAsync(
+        CancellationToken cancellationToken,
+        TimeSpan debounce,
+        TimeSpan maxDebounce);
+
+    Task CompleteAsync(TimelineMaterializationLease lease, CancellationToken cancellationToken);
+
+    Task RetryAsync(
+        TimelineMaterializationLease lease,
+        string? error,
+        TimeSpan retryDelay,
+        CancellationToken cancellationToken);
 }
 
 internal interface ITimelineRepository
@@ -4446,14 +4451,325 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
     private static object DbValue(object? value) => value ?? DBNull.Value;
 }
 
-internal sealed class SqlServerEventRepository : IEventRepository
+internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMaterializationQueue
 {
+    private const int CandidateLimit = 256;
+    private static readonly TimeSpan InitialDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
     private readonly string _connectionString;
+    private readonly SemaphoreSlim _schemaLock = new(1, 1);
+    private bool _schemaEnsured;
 
-    public SqlServerEventRepository(IConfiguration configuration)
+    public SqlServerTimelineMaterializationQueue(IConfiguration configuration)
     {
         _connectionString = configuration.GetConnectionString("SqlServer")
             ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+    }
+
+    public async Task EnqueueAsync(
+        TimelineMaterializationWindow window,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            await EnqueueAsync(connection, transaction, window, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    internal async Task EnqueueAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        TimelineMaterializationWindow window,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO dbo.TimelineMaterializationJobs
+            (
+                Id,
+                FromUtc,
+                ToUtc,
+                StatusName,
+                CreatedUtc,
+                AvailableUtc,
+                AttemptCount
+            )
+            VALUES
+            (
+                @Id,
+                @FromUtc,
+                @ToUtc,
+                N'pending',
+                SYSUTCDATETIME(),
+                DATEADD(MILLISECOND, @InitialDelayMs, SYSUTCDATETIME()),
+                0
+            );
+            """;
+        command.Parameters.AddWithValue("@Id", Guid.NewGuid());
+        command.Parameters.AddWithValue("@FromUtc", window.FromUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@ToUtc", window.ToUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@InitialDelayMs", (int)InitialDelay.TotalMilliseconds);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<TimelineMaterializationLease> ClaimAsync(
+        CancellationToken cancellationToken,
+        TimeSpan debounce,
+        TimeSpan maxDebounce)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var lease = await TryClaimAsync(cancellationToken);
+            if (lease is not null)
+            {
+                return lease;
+            }
+
+            await Task.Delay(PollInterval, cancellationToken);
+        }
+
+        throw new OperationCanceledException(cancellationToken);
+    }
+
+    public async Task CompleteAsync(
+        TimelineMaterializationLease lease,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            DELETE FROM dbo.TimelineMaterializationJobs
+            WHERE StatusName = N'processing' AND LeaseId = @LeaseId;
+            """;
+        command.Parameters.AddWithValue("@LeaseId", lease.LeaseId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task RetryAsync(
+        TimelineMaterializationLease lease,
+        string? error,
+        TimeSpan retryDelay,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            UPDATE dbo.TimelineMaterializationJobs
+            SET StatusName = N'pending',
+                AvailableUtc = DATEADD(MILLISECOND, @RetryDelayMs, SYSUTCDATETIME()),
+                LeaseId = NULL,
+                LeaseExpiresUtc = NULL,
+                LastError = @LastError
+            WHERE StatusName = N'processing' AND LeaseId = @LeaseId;
+            """;
+        command.Parameters.AddWithValue("@RetryDelayMs", Math.Max(0, (int)retryDelay.TotalMilliseconds));
+        command.Parameters.AddWithValue("@LastError", DbValue(Truncate(error, 1024)));
+        command.Parameters.AddWithValue("@LeaseId", lease.LeaseId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    internal async Task EnsureSchemaAsync(
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        if (_schemaEnsured)
+        {
+            return;
+        }
+
+        await _schemaLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (_schemaEnsured)
+            {
+                return;
+            }
+
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                IF OBJECT_ID(N'dbo.TimelineMaterializationJobs', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.TimelineMaterializationJobs
+                    (
+                        Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_TimelineMaterializationJobs PRIMARY KEY,
+                        FromUtc DATETIME2(3) NOT NULL,
+                        ToUtc DATETIME2(3) NOT NULL,
+                        StatusName NVARCHAR(16) NOT NULL,
+                        CreatedUtc DATETIME2(3) NOT NULL,
+                        AvailableUtc DATETIME2(3) NOT NULL,
+                        LeaseId UNIQUEIDENTIFIER NULL,
+                        LeaseExpiresUtc DATETIME2(3) NULL,
+                        AttemptCount INT NOT NULL,
+                        LastError NVARCHAR(1024) NULL
+                    );
+                END;
+
+                IF NOT EXISTS
+                (
+                    SELECT 1
+                    FROM sys.indexes
+                    WHERE name = N'IX_TimelineMaterializationJobs_Claim'
+                      AND object_id = OBJECT_ID(N'dbo.TimelineMaterializationJobs')
+                )
+                BEGIN
+                    CREATE INDEX IX_TimelineMaterializationJobs_Claim
+                        ON dbo.TimelineMaterializationJobs (StatusName, AvailableUtc, FromUtc)
+                        INCLUDE (ToUtc, LeaseExpiresUtc);
+                END;
+                """;
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            _schemaEnsured = true;
+        }
+        finally
+        {
+            _schemaLock.Release();
+        }
+    }
+
+    private async Task<TimelineMaterializationLease?> TryClaimAsync(
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            await RecoverExpiredLeasesAsync(connection, transaction, cancellationToken);
+
+            var candidates = new List<TimelineMaterializationJob>();
+            await using (var select = connection.CreateCommand())
+            {
+                select.Transaction = transaction;
+                select.CommandText = """
+                    SELECT TOP (@CandidateLimit) Id, FromUtc, ToUtc
+                    FROM dbo.TimelineMaterializationJobs WITH (UPDLOCK, READPAST, ROWLOCK)
+                    WHERE StatusName = N'pending' AND AvailableUtc <= SYSUTCDATETIME()
+                    ORDER BY FromUtc, ToUtc;
+                    """;
+                select.Parameters.AddWithValue("@CandidateLimit", CandidateLimit);
+                await using var reader = await select.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    candidates.Add(new TimelineMaterializationJob(
+                        reader.GetGuid(0),
+                        new TimelineMaterializationWindow(
+                            ReadUtc(reader.GetDateTime(1)),
+                            ReadUtc(reader.GetDateTime(2)))));
+                }
+            }
+
+            var lease = TimelineMaterializationLease.Select(candidates);
+            if (lease is null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return null;
+            }
+
+            await using (var claim = connection.CreateCommand())
+            {
+                claim.Transaction = transaction;
+                var idParameters = AddIdParameters(claim, lease.JobIds);
+                claim.CommandText = $"""
+                    UPDATE dbo.TimelineMaterializationJobs
+                    SET StatusName = N'processing',
+                        LeaseId = @LeaseId,
+                        LeaseExpiresUtc = DATEADD(SECOND, @LeaseSeconds, SYSUTCDATETIME()),
+                        AttemptCount = AttemptCount + 1,
+                        LastError = NULL
+                    WHERE StatusName = N'pending' AND Id IN ({idParameters});
+                    """;
+                claim.Parameters.AddWithValue("@LeaseId", lease.LeaseId);
+                claim.Parameters.AddWithValue("@LeaseSeconds", (int)LeaseDuration.TotalSeconds);
+                var claimed = await claim.ExecuteNonQueryAsync(cancellationToken);
+                if (claimed != lease.JobIds.Count)
+                {
+                    throw new InvalidOperationException("A fila de timeline mudou durante a obtencao do lease.");
+                }
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return lease;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    private static async Task RecoverExpiredLeasesAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE dbo.TimelineMaterializationJobs
+            SET StatusName = N'pending',
+                AvailableUtc = SYSUTCDATETIME(),
+                LeaseId = NULL,
+                LeaseExpiresUtc = NULL,
+                LastError = COALESCE(LastError, N'Lease expirado; trabalho retomado automaticamente.')
+            WHERE StatusName = N'processing'
+              AND LeaseExpiresUtc < SYSUTCDATETIME();
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static string AddIdParameters(SqlCommand command, IReadOnlyList<Guid> ids)
+    {
+        var names = new string[ids.Count];
+        for (var index = 0; index < ids.Count; index++)
+        {
+            names[index] = $"@JobId{index}";
+            command.Parameters.AddWithValue(names[index], ids[index]);
+        }
+
+        return string.Join(", ", names);
+    }
+
+    private static DateTimeOffset ReadUtc(DateTime value) =>
+        new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+
+    private static string? Truncate(string? value, int maxLength) =>
+        string.IsNullOrWhiteSpace(value)
+            ? null
+            : value.Length <= maxLength ? value : value[..maxLength];
+
+    private static object DbValue(object? value) => value ?? DBNull.Value;
+}
+
+internal sealed class SqlServerEventRepository : IEventRepository
+{
+    private static readonly TimeSpan MaterializationPadding = TimeSpan.FromSeconds(30);
+    private readonly string _connectionString;
+    private readonly SqlServerTimelineMaterializationQueue _timelineQueue;
+
+    public SqlServerEventRepository(
+        IConfiguration configuration,
+        SqlServerTimelineMaterializationQueue timelineQueue)
+    {
+        _connectionString = configuration.GetConnectionString("SqlServer")
+            ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+        _timelineQueue = timelineQueue;
     }
 
     public string ProviderName => "SqlServer";
@@ -4472,6 +4788,7 @@ internal sealed class SqlServerEventRepository : IEventRepository
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await _timelineQueue.EnsureSchemaAsync(connection, cancellationToken);
 
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
@@ -4528,6 +4845,18 @@ internal sealed class SqlServerEventRepository : IEventRepository
 
                 AddEventParameters(command, auditEvent);
                 await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            var materializationWindow = TimelineMaterializationWindow.FromTimestamps(
+                events.Select(item => item.TimestampUtc),
+                MaterializationPadding);
+            if (materializationWindow is not null)
+            {
+                await _timelineQueue.EnqueueAsync(
+                    connection,
+                    transaction,
+                    materializationWindow,
+                    cancellationToken);
             }
 
             await transaction.CommitAsync(cancellationToken);
@@ -5686,32 +6015,100 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
     }
 }
 
+internal sealed class InMemoryTimelineMaterializationQueue : ITimelineMaterializationQueue
+{
+    private readonly TimelineMaterializationCoordinator _coordinator;
+
+    public InMemoryTimelineMaterializationQueue(TimelineMaterializationCoordinator coordinator)
+    {
+        _coordinator = coordinator;
+    }
+
+    public Task EnqueueAsync(
+        TimelineMaterializationWindow window,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _coordinator.Enqueue(window);
+        return Task.CompletedTask;
+    }
+
+    public async Task<TimelineMaterializationLease> ClaimAsync(
+        CancellationToken cancellationToken,
+        TimeSpan debounce,
+        TimeSpan maxDebounce)
+    {
+        var window = await _coordinator.ClaimAsync(cancellationToken, debounce, maxDebounce);
+        return new TimelineMaterializationLease(
+            Guid.NewGuid(),
+            new[] { Guid.NewGuid() },
+            window);
+    }
+
+    public Task CompleteAsync(
+        TimelineMaterializationLease lease,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _coordinator.Complete(lease.Window);
+        return Task.CompletedTask;
+    }
+
+    public Task RetryAsync(
+        TimelineMaterializationLease lease,
+        string? error,
+        TimeSpan retryDelay,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _coordinator.Retry(lease.Window);
+        return Task.CompletedTask;
+    }
+}
+
 internal sealed class InMemoryEventRepository : IEventRepository
 {
+    private static readonly TimeSpan MaterializationPadding = TimeSpan.FromSeconds(30);
     private readonly ConcurrentQueue<FileAuditEvent> _events = new();
     private readonly int _maxEvents;
+    private readonly ITimelineMaterializationQueue _timelineQueue;
 
-    public InMemoryEventRepository(IConfiguration configuration)
+    public InMemoryEventRepository(
+        IConfiguration configuration,
+        ITimelineMaterializationQueue timelineQueue)
     {
         _maxEvents = configuration.GetValue("Monitor:InMemoryMaxEvents", 10_000);
+        _timelineQueue = timelineQueue;
     }
 
     public string ProviderName => "InMemory";
 
-    public Task AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
+    public async Task AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
     {
         Add(auditEvent);
-        return Task.CompletedTask;
+        await EnqueueTimelineAsync(new[] { auditEvent }, cancellationToken);
     }
 
-    public Task AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
+    public async Task AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
     {
         foreach (var auditEvent in events)
         {
             Add(auditEvent);
         }
 
-        return Task.CompletedTask;
+        await EnqueueTimelineAsync(events, cancellationToken);
+    }
+
+    private Task EnqueueTimelineAsync(
+        IReadOnlyCollection<FileAuditEvent> events,
+        CancellationToken cancellationToken)
+    {
+        var window = TimelineMaterializationWindow.FromTimestamps(
+            events.Select(item => item.TimestampUtc),
+            MaterializationPadding);
+        return window is null
+            ? Task.CompletedTask
+            : _timelineQueue.EnqueueAsync(window, cancellationToken);
     }
 
     public Task<FileAuditEvent?> FindAsync(Guid id, CancellationToken cancellationToken)
@@ -9264,16 +9661,16 @@ internal sealed class TimelineMaterializationWorker : BackgroundService
     private static readonly TimeSpan Debounce = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan MaxDebounce = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
-    private readonly TimelineMaterializationCoordinator _coordinator;
+    private readonly ITimelineMaterializationQueue _queue;
     private readonly TimelineMaterializer _materializer;
     private readonly ILogger<TimelineMaterializationWorker> _logger;
 
     public TimelineMaterializationWorker(
-        TimelineMaterializationCoordinator coordinator,
+        ITimelineMaterializationQueue queue,
         TimelineMaterializer materializer,
         ILogger<TimelineMaterializationWorker> logger)
     {
-        _coordinator = coordinator;
+        _queue = queue;
         _materializer = materializer;
         _logger = logger;
     }
@@ -9282,48 +9679,95 @@ internal sealed class TimelineMaterializationWorker : BackgroundService
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            TimelineMaterializationWindow window;
+            TimelineMaterializationLease lease;
             try
             {
-                window = await _coordinator.ClaimAsync(stoppingToken, Debounce, MaxDebounce);
+                lease = await _queue.ClaimAsync(stoppingToken, Debounce, MaxDebounce);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Falha ao obter trabalho pendente da fila de materializacao.");
+                await DelayAfterFailureAsync(stoppingToken);
+                continue;
             }
 
             var stopwatch = Stopwatch.StartNew();
             try
             {
                 var result = await _materializer.RebuildAsync(
-                    window.FromUtc,
-                    window.ToUtc,
+                    lease.Window.FromUtc,
+                    lease.Window.ToUtc,
                     50_000,
                     stoppingToken);
-                _coordinator.Complete(window);
+                await _queue.CompleteAsync(lease, stoppingToken);
                 _logger.LogInformation(
-                    "Timeline materializada em {ElapsedMs} ms. Janela {FromUtc:o} a {ToUtc:o}; brutos {RawEvents}; correlacionados {TimelineEvents}.",
+                    "Timeline materializada em {ElapsedMs} ms. Lease {LeaseId}; jobs {JobCount}; janela {FromUtc:o} a {ToUtc:o}; brutos {RawEvents}; correlacionados {TimelineEvents}.",
                     stopwatch.ElapsedMilliseconds,
-                    window.FromUtc,
-                    window.ToUtc,
+                    lease.LeaseId,
+                    lease.JobIds.Count,
+                    lease.Window.FromUtc,
+                    lease.Window.ToUtc,
                     result.RawEvents,
                     result.TimelineEvents);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                _coordinator.Retry(window);
+                try
+                {
+                    await _queue.RetryAsync(
+                        lease,
+                        "API interrompida durante a materializacao.",
+                        TimeSpan.Zero,
+                        CancellationToken.None);
+                }
+                catch (Exception retryException)
+                {
+                    _logger.LogWarning(retryException, "Nao foi possivel liberar o lease {LeaseId} durante o encerramento.", lease.LeaseId);
+                }
+
                 break;
             }
             catch (Exception ex)
             {
-                _coordinator.Retry(window);
+                try
+                {
+                    await _queue.RetryAsync(
+                        lease,
+                        ex.Message,
+                        RetryDelay,
+                        stoppingToken);
+                }
+                catch (Exception retryException)
+                {
+                    _logger.LogError(
+                        retryException,
+                        "Nao foi possivel devolver o lease {LeaseId}; ele sera recuperado quando expirar.",
+                        lease.LeaseId);
+                }
+
                 _logger.LogError(
                     ex,
-                    "Falha ao materializar timeline da janela {FromUtc:o} a {ToUtc:o}.",
-                    window.FromUtc,
-                    window.ToUtc);
-                await Task.Delay(RetryDelay, stoppingToken);
+                    "Falha ao materializar timeline do lease {LeaseId}, janela {FromUtc:o} a {ToUtc:o}.",
+                    lease.LeaseId,
+                    lease.Window.FromUtc,
+                    lease.Window.ToUtc);
+                await DelayAfterFailureAsync(stoppingToken);
             }
+        }
+    }
+
+    private static async Task DelayAfterFailureAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            await Task.Delay(RetryDelay, stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
         }
     }
 }

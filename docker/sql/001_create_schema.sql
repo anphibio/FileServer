@@ -176,6 +176,32 @@ BEGIN
 END;
 GO
 
+IF OBJECT_ID(N'dbo.TimelineMaterializationJobs', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.TimelineMaterializationJobs
+    (
+        Id UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_TimelineMaterializationJobs PRIMARY KEY,
+        FromUtc DATETIME2(3) NOT NULL,
+        ToUtc DATETIME2(3) NOT NULL,
+        StatusName NVARCHAR(16) NOT NULL,
+        CreatedUtc DATETIME2(3) NOT NULL,
+        AvailableUtc DATETIME2(3) NOT NULL,
+        LeaseId UNIQUEIDENTIFIER NULL,
+        LeaseExpiresUtc DATETIME2(3) NULL,
+        AttemptCount INT NOT NULL,
+        LastError NVARCHAR(1024) NULL
+    );
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_TimelineMaterializationJobs_Claim' AND object_id = OBJECT_ID(N'dbo.TimelineMaterializationJobs'))
+BEGIN
+    CREATE INDEX IX_TimelineMaterializationJobs_Claim
+        ON dbo.TimelineMaterializationJobs (StatusName, AvailableUtc, FromUtc)
+        INCLUDE (ToUtc, LeaseExpiresUtc);
+END;
+GO
+
 IF OBJECT_ID(N'dbo.AgentHeartbeats', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AgentHeartbeats
