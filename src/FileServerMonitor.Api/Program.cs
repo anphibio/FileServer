@@ -29,7 +29,10 @@ builder.Services.AddSingleton<LdapAuthSettingsStore>();
 builder.Services.AddSingleton<RetentionSettingsStore>();
 builder.Services.AddSingleton<InventoryScanSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
+builder.Services.AddSingleton<TimelineMaterializationCoordinator>();
+builder.Services.AddSingleton<TimelineMaterializer>();
 builder.Services.AddHostedService<RetentionWorker>();
+builder.Services.AddHostedService<TimelineMaterializationWorker>();
 builder.Services.AddCors(options =>
 {
     var allowedOrigins = builder.Configuration
@@ -183,13 +186,13 @@ app.MapGet("/metrics", async (
 app.MapPost("/api/events", async (
     FileAuditEventRequest request,
     IEventRepository repository,
-    ITimelineRepository timelineRepository,
+    TimelineMaterializationCoordinator materialization,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
     var auditEvent = request.ToAuditEvent();
     await repository.AddAsync(auditEvent, cancellationToken);
-    await RebuildTimelineForIngestedEventsAsync(new[] { auditEvent }, repository, timelineRepository, cancellationToken);
+    QueueTimelineMaterialization(new[] { auditEvent }, materialization);
     var generatedAlerts = await alerts.AnalyzeAsync(new[] { auditEvent }, cancellationToken);
 
     return Results.Created($"/api/events/{auditEvent.Id}", new EventIngestResponse(auditEvent, generatedAlerts));
@@ -198,7 +201,7 @@ app.MapPost("/api/events", async (
 app.MapPost("/api/events/batch", async (
     FileAuditEventRequest[] requests,
     IEventRepository repository,
-    ITimelineRepository timelineRepository,
+    TimelineMaterializationCoordinator materialization,
     AlertStore alerts,
     CancellationToken cancellationToken) =>
 {
@@ -214,7 +217,7 @@ app.MapPost("/api/events/batch", async (
 
     var events = requests.Select(request => request.ToAuditEvent()).ToArray();
     await repository.AddBatchAsync(events, cancellationToken);
-    await RebuildTimelineForIngestedEventsAsync(events, repository, timelineRepository, cancellationToken);
+    QueueTimelineMaterialization(events, materialization);
     var generatedAlerts = await alerts.AnalyzeAsync(events, cancellationToken);
 
     return Results.Accepted(value: new BatchIngestResponse(
@@ -321,7 +324,7 @@ app.MapGet("/api/events/timeline", async (
         timelineQuery.Take,
         repository,
         cancellationToken);
-    var timeline = ProjectTimeline(events, user, action)
+    var timeline = TimelineMaterializer.ProjectTimeline(events, user, action)
         .Where(item => MatchesTimelineQuery(item, timelineQuery))
         .ToArray();
 
@@ -388,7 +391,7 @@ app.MapGet("/api/events/timeline/export.csv", async (
         timelineQuery.Take,
         repository,
         cancellationToken);
-    var timeline = ProjectTimeline(events, user, action)
+    var timeline = TimelineMaterializer.ProjectTimeline(events, user, action)
         .Where(item => MatchesTimelineQuery(item, timelineQuery))
         .ToArray();
     var csv = TimelineCsvExporter.Export(timeline);
@@ -463,7 +466,7 @@ app.MapGet("/api/events/timeline/page", async (
             repository,
             cancellationToken);
         windowEvents = events.Count;
-        filteredTimeline = ProjectTimeline(events, user, action)
+        filteredTimeline = TimelineMaterializer.ProjectTimeline(events, user, action)
             .Where(item => MatchesTimelineQuery(item, pageQuery))
             .Where(item => MatchesTimelineSearch(item, search))
             .ToArray();
@@ -541,48 +544,17 @@ app.MapPost("/api/events/timeline/rebuild", async (
     DateTimeOffset? fromUtc,
     DateTimeOffset? toUtc,
     int? take,
-    IEventRepository repository,
-    ITimelineRepository timelineRepository,
+    TimelineMaterializer materializer,
     CancellationToken cancellationToken) =>
 {
     var safeTake = take is > 0 and <= 50_000 ? take.Value : 20_000;
-    var query = new EventQuery(
-        Server: null,
-        Share: null,
-        User: null,
-        Action: null,
-        Path: null,
-        SourceHost: null,
-        SourceIp: null,
-        Extension: null,
-        Result: null,
-        Severity: null,
-        Source: null,
-        FromUtc: fromUtc,
-        ToUtc: toUtc,
-        Take: safeTake);
-    var rawEvents = await repository.QueryAsync(query, cancellationToken);
-    var contextEvents = await QueryKnownDescendantContextForFolderTransitionsAsync(rawEvents, timelineRepository, cancellationToken);
-    var timelineSource = contextEvents.Count == 0
-        ? rawEvents
-        : rawEvents.Concat(contextEvents).ToArray();
-    var timeline = ProjectTimeline(timelineSource, user: null, action: null);
-
-    if (rawEvents.Count > 0)
-    {
-        var fromWindow = fromUtc ?? rawEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
-        var toWindow = toUtc ?? rawEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
-        var windowTimeline = timeline
-            .Where(item => item.TimestampUtc >= fromWindow && item.TimestampUtc <= toWindow)
-            .ToArray();
-        await timelineRepository.ReplaceWindowAsync(fromWindow, toWindow, windowTimeline, TimelineCorrelationVersion, cancellationToken);
-    }
+    var rebuild = await materializer.RebuildAsync(fromUtc, toUtc, safeTake, cancellationToken);
 
     return Results.Ok(new TimelineRebuildResponse(
-        RawEvents: rawEvents.Count,
-        TimelineEvents: timeline.Count,
-        FromUtc: rawEvents.Count == 0 ? fromUtc : rawEvents.Min(item => item.TimestampUtc),
-        ToUtc: rawEvents.Count == 0 ? toUtc : rawEvents.Max(item => item.TimestampUtc),
+        RawEvents: rebuild.RawEvents,
+        TimelineEvents: rebuild.TimelineEvents,
+        FromUtc: rebuild.FromUtc,
+        ToUtc: rebuild.ToUtc,
         CorrelationVersion: TimelineCorrelationVersion));
 });
 
@@ -1293,77 +1265,6 @@ static string? TryGetWindowsVolume(string path)
     return null;
 }
 
-static FileServerMonitor.Core.FileAuditEvent ToCoreAuditEvent(FileAuditEvent auditEvent)
-{
-    return new FileServerMonitor.Core.FileAuditEvent(
-        auditEvent.Id,
-        auditEvent.TimestampUtc,
-        auditEvent.Server,
-        auditEvent.Share,
-        auditEvent.Path,
-        auditEvent.PreviousPath,
-        auditEvent.ObjectType,
-        auditEvent.Action,
-        auditEvent.User,
-        auditEvent.Sid,
-        auditEvent.SourceHost,
-        auditEvent.SourceIp,
-        auditEvent.ProcessName,
-        auditEvent.FileSizeBytes,
-        auditEvent.Extension,
-        auditEvent.Result,
-        auditEvent.Severity,
-        auditEvent.Source);
-}
-
-static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditDisplayEvent auditEvent)
-{
-    return new FileAuditDisplayEvent(
-        auditEvent.Id,
-        auditEvent.TimestampUtc,
-        auditEvent.Server,
-        auditEvent.Share,
-        auditEvent.Path,
-        auditEvent.PreviousPath,
-        auditEvent.ObjectType,
-        auditEvent.Action,
-        auditEvent.User,
-        auditEvent.Sid,
-        auditEvent.SourceHost,
-        auditEvent.SourceIp,
-        auditEvent.ProcessName,
-        auditEvent.FileSizeBytes,
-        auditEvent.Extension,
-        auditEvent.Result,
-        auditEvent.Severity,
-        auditEvent.Source,
-        auditEvent.DisplayAction,
-        auditEvent.DisplayTarget);
-}
-
-static FileAuditEvent ToAuditEvent(FileAuditDisplayEvent auditEvent)
-{
-    return new FileAuditEvent(
-        auditEvent.Id,
-        auditEvent.TimestampUtc,
-        auditEvent.Server,
-        auditEvent.Share,
-        auditEvent.Path,
-        auditEvent.PreviousPath,
-        auditEvent.ObjectType,
-        auditEvent.Action,
-        auditEvent.User,
-        auditEvent.Sid,
-        auditEvent.SourceHost,
-        auditEvent.SourceIp,
-        auditEvent.ProcessName,
-        auditEvent.FileSizeBytes,
-        auditEvent.Extension,
-        auditEvent.Result,
-        auditEvent.Severity,
-        auditEvent.Source);
-}
-
 static async Task<IReadOnlyCollection<FileAuditEvent>> QueryTimelineSourceEventsAsync(
     string? server,
     string? share,
@@ -1516,11 +1417,9 @@ static bool IsDirectTimelineAction(string? action)
     return action?.Trim().ToLowerInvariant() is "accessed" or "created" or "deleted" or "modified" or "permission_changed";
 }
 
-static async Task RebuildTimelineForIngestedEventsAsync(
+static void QueueTimelineMaterialization(
     IReadOnlyCollection<FileAuditEvent> ingestedEvents,
-    IEventRepository repository,
-    ITimelineRepository timelineRepository,
-    CancellationToken cancellationToken)
+    TimelineMaterializationCoordinator materialization)
 {
     if (ingestedEvents.Count == 0)
     {
@@ -1529,66 +1428,7 @@ static async Task RebuildTimelineForIngestedEventsAsync(
 
     var fromUtc = ingestedEvents.Min(item => item.TimestampUtc).AddSeconds(-TimelineRebuildPaddingSeconds);
     var toUtc = ingestedEvents.Max(item => item.TimestampUtc).AddSeconds(TimelineRebuildPaddingSeconds);
-    var query = new EventQuery(
-        Server: null,
-        Share: null,
-        User: null,
-        Action: null,
-        Path: null,
-        SourceHost: null,
-        SourceIp: null,
-        Extension: null,
-        Result: null,
-        Severity: null,
-        Source: null,
-        FromUtc: fromUtc,
-        ToUtc: toUtc,
-        Take: 20_000);
-    var rawEvents = await repository.QueryAsync(query, cancellationToken);
-    var contextEvents = await QueryKnownDescendantContextForFolderTransitionsAsync(rawEvents, timelineRepository, cancellationToken);
-    var timelineSource = contextEvents.Count == 0
-        ? rawEvents
-        : rawEvents.Concat(contextEvents).ToArray();
-    var timeline = ProjectTimeline(timelineSource, user: null, action: null);
-
-    var windowTimeline = timeline
-        .Where(item => item.TimestampUtc >= fromUtc && item.TimestampUtc <= toUtc)
-        .ToArray();
-    await timelineRepository.ReplaceWindowAsync(fromUtc, toUtc, windowTimeline, TimelineCorrelationVersion, cancellationToken);
-}
-
-static async Task<IReadOnlyCollection<FileAuditEvent>> QueryKnownDescendantContextForFolderTransitionsAsync(
-    IReadOnlyCollection<FileAuditEvent> rawEvents,
-    ITimelineRepository timelineRepository,
-    CancellationToken cancellationToken)
-{
-    var folderTransitions = rawEvents
-        .Where(item => item.Action is "moved" or "renamed"
-            && !string.IsNullOrWhiteSpace(item.PreviousPath)
-            && item.ObjectType is "folder" or "directory")
-        .OrderBy(item => item.TimestampUtc)
-        .ToArray();
-    if (folderTransitions.Length == 0)
-    {
-        return Array.Empty<FileAuditEvent>();
-    }
-
-    var context = new Dictionary<Guid, FileAuditEvent>();
-    foreach (var transition in folderTransitions)
-    {
-        var descendants = await timelineRepository.QueryKnownLiveDescendantsAsync(
-            transition.PreviousPath!,
-            transition.TimestampUtc,
-            5_000,
-            cancellationToken);
-
-        foreach (var descendant in descendants)
-        {
-            context.TryAdd(descendant.Id, ToAuditEvent(descendant));
-        }
-    }
-
-    return context.Values.ToArray();
+    materialization.Enqueue(new TimelineMaterializationWindow(fromUtc, toUtc));
 }
 
 static async Task<IReadOnlyCollection<FileAuditDisplayEvent>?> QueryPersistedTimelineIfCoveredAsync(
@@ -1673,22 +1513,6 @@ static bool HasTimelineCoverage(
     }
 
     return coverage.ToUtc >= effectiveToUtc;
-}
-
-static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
-    IReadOnlyCollection<FileAuditEvent> events,
-    string? user,
-    string? action)
-{
-    return new FileServerMonitor.Core.EventTimelineProjector()
-        .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
-        .Select(ToApiDisplayEvent)
-        .Where(item => string.IsNullOrWhiteSpace(user)
-            || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
-        .Where(item => string.IsNullOrWhiteSpace(action)
-            || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
-            || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
-        .ToArray();
 }
 
 static bool MatchesTimelineSearch(FileAuditDisplayEvent auditEvent, string? search)
@@ -9241,6 +9065,267 @@ internal sealed class InventoryScanSettingsStore
             : new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(ordinal), DateTimeKind.Utc));
     }
 #endif
+}
+
+internal sealed record TimelineMaterializationResult(
+    int RawEvents,
+    int TimelineEvents,
+    DateTimeOffset? FromUtc,
+    DateTimeOffset? ToUtc);
+
+internal sealed class TimelineMaterializer
+{
+    private const int RebuildPaddingSeconds = 30;
+    private const string CorrelationVersion = "core-v1";
+    private readonly IEventRepository _events;
+    private readonly ITimelineRepository _timeline;
+
+    public TimelineMaterializer(IEventRepository events, ITimelineRepository timeline)
+    {
+        _events = events;
+        _timeline = timeline;
+    }
+
+    public async Task<TimelineMaterializationResult> RebuildAsync(
+        DateTimeOffset? fromUtc,
+        DateTimeOffset? toUtc,
+        int take,
+        CancellationToken cancellationToken)
+    {
+        var query = new EventQuery(
+            Server: null,
+            Share: null,
+            User: null,
+            Action: null,
+            Path: null,
+            SourceHost: null,
+            SourceIp: null,
+            Extension: null,
+            Result: null,
+            Severity: null,
+            Source: null,
+            FromUtc: fromUtc,
+            ToUtc: toUtc,
+            Take: Math.Clamp(take, 1, 50_000));
+        var rawEvents = await _events.QueryAsync(query, cancellationToken);
+        if (rawEvents.Count == 0)
+        {
+            return new TimelineMaterializationResult(0, 0, fromUtc, toUtc);
+        }
+
+        var fromWindow = fromUtc ?? rawEvents.Min(item => item.TimestampUtc).AddSeconds(-RebuildPaddingSeconds);
+        var toWindow = toUtc ?? rawEvents.Max(item => item.TimestampUtc).AddSeconds(RebuildPaddingSeconds);
+        var contextEvents = await QueryKnownDescendantContextAsync(rawEvents, cancellationToken);
+        var source = contextEvents.Count == 0
+            ? rawEvents
+            : rawEvents.Concat(contextEvents).ToArray();
+        var projected = ProjectTimeline(source);
+        var windowTimeline = projected
+            .Where(item => item.TimestampUtc >= fromWindow && item.TimestampUtc <= toWindow)
+            .ToArray();
+
+        await _timeline.ReplaceWindowAsync(
+            fromWindow,
+            toWindow,
+            windowTimeline,
+            CorrelationVersion,
+            cancellationToken);
+
+        return new TimelineMaterializationResult(
+            RawEvents: rawEvents.Count,
+            TimelineEvents: windowTimeline.Length,
+            FromUtc: rawEvents.Min(item => item.TimestampUtc),
+            ToUtc: rawEvents.Max(item => item.TimestampUtc));
+    }
+
+    private async Task<IReadOnlyCollection<FileAuditEvent>> QueryKnownDescendantContextAsync(
+        IReadOnlyCollection<FileAuditEvent> rawEvents,
+        CancellationToken cancellationToken)
+    {
+        var transitions = rawEvents
+            .Where(item => item.Action is "moved" or "renamed"
+                && !string.IsNullOrWhiteSpace(item.PreviousPath)
+                && item.ObjectType is "folder" or "directory")
+            .OrderBy(item => item.TimestampUtc)
+            .ToArray();
+        if (transitions.Length == 0)
+        {
+            return Array.Empty<FileAuditEvent>();
+        }
+
+        var context = new Dictionary<Guid, FileAuditEvent>();
+        foreach (var transition in transitions)
+        {
+            var descendants = await _timeline.QueryKnownLiveDescendantsAsync(
+                transition.PreviousPath!,
+                transition.TimestampUtc,
+                5_000,
+                cancellationToken);
+
+            foreach (var descendant in descendants)
+            {
+                context.TryAdd(descendant.Id, ToAuditEvent(descendant));
+            }
+        }
+
+        return context.Values.ToArray();
+    }
+
+    internal static IReadOnlyCollection<FileAuditDisplayEvent> ProjectTimeline(
+        IReadOnlyCollection<FileAuditEvent> events,
+        string? user = null,
+        string? action = null)
+    {
+        return new EventTimelineProjector()
+            .BuildDisplayEvents(events.Select(ToCoreAuditEvent).ToArray())
+            .Select(ToApiDisplayEvent)
+            .Where(item => string.IsNullOrWhiteSpace(user)
+                || item.User.Contains(user, StringComparison.OrdinalIgnoreCase))
+            .Where(item => string.IsNullOrWhiteSpace(action)
+                || item.Action.Equals(action, StringComparison.OrdinalIgnoreCase)
+                || item.DisplayAction.Equals(action, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+    }
+
+    private static FileServerMonitor.Core.FileAuditEvent ToCoreAuditEvent(FileAuditEvent auditEvent)
+    {
+        return new FileServerMonitor.Core.FileAuditEvent(
+            auditEvent.Id,
+            auditEvent.TimestampUtc,
+            auditEvent.Server,
+            auditEvent.Share,
+            auditEvent.Path,
+            auditEvent.PreviousPath,
+            auditEvent.ObjectType,
+            auditEvent.Action,
+            auditEvent.User,
+            auditEvent.Sid,
+            auditEvent.SourceHost,
+            auditEvent.SourceIp,
+            auditEvent.ProcessName,
+            auditEvent.FileSizeBytes,
+            auditEvent.Extension,
+            auditEvent.Result,
+            auditEvent.Severity,
+            auditEvent.Source);
+    }
+
+    private static FileAuditDisplayEvent ToApiDisplayEvent(FileServerMonitor.Core.FileAuditDisplayEvent auditEvent)
+    {
+        return new FileAuditDisplayEvent(
+            auditEvent.Id,
+            auditEvent.TimestampUtc,
+            auditEvent.Server,
+            auditEvent.Share,
+            auditEvent.Path,
+            auditEvent.PreviousPath,
+            auditEvent.ObjectType,
+            auditEvent.Action,
+            auditEvent.User,
+            auditEvent.Sid,
+            auditEvent.SourceHost,
+            auditEvent.SourceIp,
+            auditEvent.ProcessName,
+            auditEvent.FileSizeBytes,
+            auditEvent.Extension,
+            auditEvent.Result,
+            auditEvent.Severity,
+            auditEvent.Source,
+            auditEvent.DisplayAction,
+            auditEvent.DisplayTarget);
+    }
+
+    private static FileAuditEvent ToAuditEvent(FileAuditDisplayEvent auditEvent)
+    {
+        return new FileAuditEvent(
+            auditEvent.Id,
+            auditEvent.TimestampUtc,
+            auditEvent.Server,
+            auditEvent.Share,
+            auditEvent.Path,
+            auditEvent.PreviousPath,
+            auditEvent.ObjectType,
+            auditEvent.Action,
+            auditEvent.User,
+            auditEvent.Sid,
+            auditEvent.SourceHost,
+            auditEvent.SourceIp,
+            auditEvent.ProcessName,
+            auditEvent.FileSizeBytes,
+            auditEvent.Extension,
+            auditEvent.Result,
+            auditEvent.Severity,
+            auditEvent.Source);
+    }
+}
+
+internal sealed class TimelineMaterializationWorker : BackgroundService
+{
+    private static readonly TimeSpan Debounce = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan MaxDebounce = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+    private readonly TimelineMaterializationCoordinator _coordinator;
+    private readonly TimelineMaterializer _materializer;
+    private readonly ILogger<TimelineMaterializationWorker> _logger;
+
+    public TimelineMaterializationWorker(
+        TimelineMaterializationCoordinator coordinator,
+        TimelineMaterializer materializer,
+        ILogger<TimelineMaterializationWorker> logger)
+    {
+        _coordinator = coordinator;
+        _materializer = materializer;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            TimelineMaterializationWindow window;
+            try
+            {
+                window = await _coordinator.ClaimAsync(stoppingToken, Debounce, MaxDebounce);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var result = await _materializer.RebuildAsync(
+                    window.FromUtc,
+                    window.ToUtc,
+                    50_000,
+                    stoppingToken);
+                _coordinator.Complete(window);
+                _logger.LogInformation(
+                    "Timeline materializada em {ElapsedMs} ms. Janela {FromUtc:o} a {ToUtc:o}; brutos {RawEvents}; correlacionados {TimelineEvents}.",
+                    stopwatch.ElapsedMilliseconds,
+                    window.FromUtc,
+                    window.ToUtc,
+                    result.RawEvents,
+                    result.TimelineEvents);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                _coordinator.Retry(window);
+                break;
+            }
+            catch (Exception ex)
+            {
+                _coordinator.Retry(window);
+                _logger.LogError(
+                    ex,
+                    "Falha ao materializar timeline da janela {FromUtc:o} a {ToUtc:o}.",
+                    window.FromUtc,
+                    window.ToUtc);
+                await Task.Delay(RetryDelay, stoppingToken);
+            }
+        }
+    }
 }
 
 internal sealed class RetentionWorker : BackgroundService

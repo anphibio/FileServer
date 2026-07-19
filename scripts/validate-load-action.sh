@@ -2,13 +2,25 @@
 set -euo pipefail
 
 API_BASE_URL="${API_BASE_URL:-http://localhost:8180}"
-SSH_TARGET="${SSH_TARGET:-Administrator@192.168.2.170}"
+SSH_TARGET="${SSH_TARGET:-administrator@fileserver}"
 SERVER_NAME="${SERVER_NAME:-FileServer}"
 ROOT_NAME="${ROOT_NAME:-codex-load-action-$(date -u +%Y%m%d-%H%M%S)}"
 ROOT_PATH="C:\\Corporativo\\${ROOT_NAME}"
-WORKERS="${WORKERS:-6}"
+WORKERS="${WORKERS:-5}"
 ITERATIONS="${ITERATIONS:-8}"
 TAKE="${TAKE:-5000}"
+WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-300}"
+API_KEY="${FILESERVER_MONITOR_API_KEY:-}"
+EXPECTED_USER="${EXPECTED_USER:-FILESERVER\\Administrator}"
+
+if [[ -z "${API_KEY}" && -f .env ]]; then
+  API_KEY="$(sed -n 's/^FILESERVER_MONITOR_API_KEY=//p' .env | head -n 1)"
+fi
+
+if [[ -z "${API_KEY}" ]]; then
+  echo "load-action: FILESERVER_MONITOR_API_KEY nao configurada" >&2
+  exit 2
+fi
 
 echo "load-action: cenário ${ROOT_PATH}, workers=${WORKERS}, iterations=${ITERATIONS}"
 
@@ -96,6 +108,7 @@ root = r"C:\\Corporativo\\${ROOT_NAME}"
 workers = int("${WORKERS}")
 iterations = int("${ITERATIONS}")
 expected = {
+    "user": r"${EXPECTED_USER}",
     "created": [root],
     "deleted": [],
     "accessed": [],
@@ -139,16 +152,21 @@ print(json.dumps(expected, indent=2))
 PY
 
 echo "load-action: aguardando coleta do agente"
-deadline=$((SECONDS + 300))
+deadline=$((SECONDS + WAIT_TIMEOUT_SECONDS))
 last_report=""
 while (( SECONDS < deadline )); do
   events_json="$(mktemp)"
-  curl -fsS "${API_BASE_URL}/api/events?server=${SERVER_NAME}&take=${TAKE}" > "${events_json}"
+  curl -fsS -G \
+    -H "X-Api-Key: ${API_KEY}" \
+    --data-urlencode "server=${SERVER_NAME}" \
+    --data-urlencode "path=${ROOT_PATH}" \
+    --data-urlencode "take=${TAKE}" \
+    "${API_BASE_URL}/api/events/timeline" > "${events_json}"
   report="$(node scripts/validate-load-action-timeline.mjs "${events_json}" "${expected_json}" "${ROOT_NAME}")"
   last_report="${report}"
-  missing_count="$(jq '[.summary[] | .missing] | add' <<<"${report}")"
+  issue_count="$(jq '([.summary[] | (.missing + .extras + .duplicates)] | add) + (.unexpectedActions | length) + (.userMismatches | length)' <<<"${report}")"
 
-  if [[ "${missing_count}" == "0" ]]; then
+  if [[ "${issue_count}" == "0" ]]; then
     echo "load-action timeline:"
     echo "${report}" | jq .
     ssh "${SSH_TARGET}" "powershell -NoProfile -Command \"Remove-Item -LiteralPath '${ROOT_PATH}' -Recurse -Force -ErrorAction SilentlyContinue\"" >/dev/null || true

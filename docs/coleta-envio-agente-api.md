@@ -65,6 +65,8 @@ Campos mais importantes:
 - `agentId`: identificador unico do agente.
 - `server`: nome logico do servidor monitorado.
 - `apiBaseUrl`: URL base da API.
+- `apiRequestTimeoutSeconds`: tempo limite de cada envio HTTP; use 120 segundos para absorver lotes grandes sem reenviar eventos ainda em processamento.
+- `apiBatchSize`: quantidade maxima de eventos por requisicao de ingestao; o padrao 500 aproveita a persistencia em lote sem bloquear o agente na materializacao assincrona da timeline.
 - `apiKey`: chave enviada no header `X-Api-Key`, quando autenticacao estiver ligada.
 - `pollIntervalSeconds`: intervalo entre ciclos de coleta.
 - `batchSize`: limite de eventos por ciclo/lote.
@@ -515,8 +517,11 @@ flowchart TD
     B --> K["POST /api/agents/heartbeat"]
     J --> L["FileServerMonitor.Api"]
     K --> L
-    L --> M["SQL Server ou memoria"]
-    M --> N["Web / Linha do Tempo / Alertas"]
+    L --> M["Persistencia imediata dos eventos brutos"]
+    M --> O["Fila de janelas da timeline"]
+    O --> P["Worker de materializacao no Core"]
+    P --> Q["Timeline correlacionada no SQL Server"]
+    Q --> N["Web / Linha do Tempo / Relatorios"]
 ```
 
 ## O que esta maduro
@@ -565,9 +570,20 @@ Se o ambiente auditar apenas escrita/exclusao, acesso de leitura pode nao aparec
 
 ### Separacao entre evento bruto e timeline limpa
 
-O agente envia eventos ja correlacionados, mas a tela ainda aplica uma limpeza final em TypeScript.
+A API persiste o lote bruto antes de responder ao agente. Em seguida, agenda uma janela temporal para um worker em segundo plano materializar a timeline com as regras do Core.
 
-O ideal futuro e a API/Core entregarem uma timeline pronta, deixando o frontend apenas renderizar.
+As janelas sobrepostas sao acumuladas; janelas temporalmente distantes permanecem separadas. A materializacao aguarda um curto periodo para absorver rajadas, com espera maxima para nao ficar bloqueada por trafego continuo.
+
+Consequencias operacionais:
+
+- o agente nao fica bloqueado pela correlacao da timeline;
+- a fila local volta a zero assim que a API aceita e persiste o lote;
+- eventos e relatorios servem o ultimo snapshot estavel enquanto a proxima janela converge;
+- a timeline pode ficar alguns segundos atras do evento bruto durante rajadas;
+- falhas do worker devolvem a janela para nova tentativa sem descartar trabalho recebido durante a falha;
+- `POST /api/events/timeline/rebuild` permite reconstruir manualmente um periodo quando necessario.
+
+O frontend apenas consulta e renderiza a timeline entregue pela API/Core; ele nao deve reimplementar heuristicas de correlacao.
 
 ## Checklist operacional
 
@@ -584,4 +600,3 @@ Para validar o fluxo completo:
 9. executar o roteiro de teste;
 10. verificar `/api/events`;
 11. confirmar se `state/pending-events.ndjson` ficou vazio.
-

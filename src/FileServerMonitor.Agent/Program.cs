@@ -47,7 +47,7 @@ internal sealed class FileServerAgent
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(options.ApiBaseUrl),
-            Timeout = TimeSpan.FromSeconds(30)
+            Timeout = TimeSpan.FromSeconds(options.ApiRequestTimeoutSeconds)
         };
 
         if (!string.IsNullOrWhiteSpace(options.ApiKey))
@@ -766,7 +766,7 @@ internal sealed class FileServerAgent
 
         try
         {
-            foreach (var chunk in events.Chunk(1_000))
+            foreach (var chunk in events.Chunk(_options.ApiBatchSize))
             {
                 using var response = await _httpClient.PostAsJsonAsync("/api/events/batch", chunk, JsonOptions, cancellationToken);
 
@@ -1234,6 +1234,8 @@ internal sealed record AgentOptions(
     string AgentId,
     string Server,
     string ApiBaseUrl,
+    int ApiRequestTimeoutSeconds,
+    int ApiBatchSize,
     string? ApiKey,
     int PollIntervalSeconds,
     int BatchSize,
@@ -1275,6 +1277,12 @@ internal sealed record AgentOptions(
         return options with
         {
             PollIntervalSeconds = Math.Max(options.PollIntervalSeconds, 5),
+            ApiRequestTimeoutSeconds = options.ApiRequestTimeoutSeconds is >= 30 and <= 600
+                ? options.ApiRequestTimeoutSeconds
+                : 120,
+            ApiBatchSize = options.ApiBatchSize is >= 10 and <= 1_000
+                ? options.ApiBatchSize
+                : 500,
             BatchSize = options.BatchSize is > 0 and <= 1000 ? options.BatchSize : 200,
             QueueFlushBatchesPerCycle = options.QueueFlushBatchesPerCycle is > 0 and <= 100 ? options.QueueFlushBatchesPerCycle : 10,
             QueueFlushMaxEventsPerCycle = options.QueueFlushMaxEventsPerCycle is >= 100 and <= 100_000

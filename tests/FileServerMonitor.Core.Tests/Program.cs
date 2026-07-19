@@ -60,6 +60,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline sintetiza rename dos descendentes conhecidos quando a pasta e renomeada", TimelineSynthesizesKnownDescendantRenamesAfterFolderRename),
     ("timeline evita duplicar rename explicito de descendente quando a pasta e renomeada", TimelineDoesNotDuplicateExplicitDescendantRenameAfterFolderRename),
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
+    ("timeline prefere usuario conhecido em criacao bruta duplicada", TimelinePrefersKnownUserAcrossDuplicateRawCreations),
     ("timeline trata rename de pasta provisoria do windows como criacao", TimelineTreatsProvisionalFolderRenameAsCreation),
     ("timeline preserva rename de pasta provisoria quando ja houve criacao explicita", TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
@@ -81,6 +82,10 @@ var tests = new (string Name, Action Test)[]
     ("mapa conhecido reloca descendentes quando a pasta e movida", KnownPathMapRelocatesFolderDescendants),
     ("fila duravel descarrega apenas o limite mantendo a ordem", DurableQueueFlushesWithinLimitAndPreservesOrder),
     ("fila duravel preserva lote quando o envio falha", DurableQueuePreservesUnsentBatchAfterFailure),
+    ("materializacao acumula janelas concorrentes em um unico trabalho", TimelineMaterializationCoalescesConcurrentWindows),
+    ("materializacao devolve janela falha sem perder trabalho novo", TimelineMaterializationRetriesFailedWindowWithNewWork),
+    ("materializacao mantem janelas distantes em trabalhos separados", TimelineMaterializationKeepsDistantWindowsSeparate),
+    ("materializacao preserva sinal recebido depois do periodo silencioso", TimelineMaterializationPreservesSignalAfterQuietPeriod),
     ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
     ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary),
     ("inventario cruza uso real observado por pasta e usuario", InventoryBuildsObservedActivitySummary),
@@ -239,6 +244,84 @@ static void DurableQueuePreservesUnsentBatchAfterFailure()
             File.Delete(path);
         }
     }
+}
+
+static void TimelineMaterializationCoalescesConcurrentWindows()
+{
+    var coordinator = new TimelineMaterializationCoordinator();
+    var start = new DateTimeOffset(2026, 7, 19, 2, 0, 0, TimeSpan.Zero);
+
+    coordinator.Enqueue(new TimelineMaterializationWindow(start, start.AddSeconds(30)));
+    coordinator.Enqueue(new TimelineMaterializationWindow(start.AddSeconds(20), start.AddMinutes(1)));
+
+    var claimed = coordinator.ClaimAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+    Assert(claimed.FromUtc == start, "A janela acumulada deve preservar o menor inicio.");
+    Assert(claimed.ToUtc == start.AddMinutes(1), "A janela acumulada deve preservar o maior fim.");
+    Assert(coordinator.IsDirty(start.AddSeconds(45), start.AddSeconds(50)), "A janela em processamento deve permanecer marcada como pendente.");
+
+    coordinator.Complete(claimed);
+
+    Assert(!coordinator.IsDirty(start, start.AddMinutes(1)), "A janela concluida nao deve permanecer marcada como pendente.");
+}
+
+static void TimelineMaterializationRetriesFailedWindowWithNewWork()
+{
+    var coordinator = new TimelineMaterializationCoordinator();
+    var start = new DateTimeOffset(2026, 7, 19, 3, 0, 0, TimeSpan.Zero);
+    var first = new TimelineMaterializationWindow(start, start.AddSeconds(30));
+    var second = new TimelineMaterializationWindow(start.AddSeconds(20), start.AddMinutes(1));
+
+    coordinator.Enqueue(first);
+    var claimed = coordinator.ClaimAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+    coordinator.Enqueue(second);
+    coordinator.Retry(claimed);
+
+    var retried = coordinator.ClaimAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+    Assert(retried.FromUtc == first.FromUtc, "A repeticao deve preservar o inicio da janela que falhou.");
+    Assert(retried.ToUtc == second.ToUtc, "A repeticao deve incorporar o trabalho recebido durante a falha.");
+}
+
+static void TimelineMaterializationKeepsDistantWindowsSeparate()
+{
+    var coordinator = new TimelineMaterializationCoordinator();
+    var start = new DateTimeOffset(2026, 7, 19, 4, 0, 0, TimeSpan.Zero);
+    var first = new TimelineMaterializationWindow(start, start.AddMinutes(1));
+    var second = new TimelineMaterializationWindow(start.AddMinutes(20), start.AddMinutes(21));
+
+    coordinator.Enqueue(first);
+    coordinator.Enqueue(second);
+
+    var firstClaim = coordinator.ClaimAsync(CancellationToken.None).AsTask().GetAwaiter().GetResult();
+    coordinator.Complete(firstClaim);
+    using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+    var secondClaim = coordinator.ClaimAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+
+    Assert(firstClaim == first, "A primeira janela distante nao deve ser ampliada ate o trabalho futuro.");
+    Assert(secondClaim == second, "A segunda janela distante deve permanecer como trabalho independente.");
+}
+
+static void TimelineMaterializationPreservesSignalAfterQuietPeriod()
+{
+    var coordinator = new TimelineMaterializationCoordinator();
+    var start = new DateTimeOffset(2026, 7, 19, 5, 0, 0, TimeSpan.Zero);
+    var first = new TimelineMaterializationWindow(start, start.AddMinutes(1));
+    var second = new TimelineMaterializationWindow(start.AddMinutes(20), start.AddMinutes(21));
+
+    coordinator.Enqueue(first);
+    var firstClaim = coordinator
+        .ClaimAsync(CancellationToken.None, TimeSpan.FromMilliseconds(20), TimeSpan.FromMilliseconds(50))
+        .AsTask()
+        .GetAwaiter()
+        .GetResult();
+    coordinator.Complete(firstClaim);
+    coordinator.Enqueue(second);
+
+    using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+    var secondClaim = coordinator.ClaimAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+
+    Assert(secondClaim == second, "O sinal posterior ao periodo silencioso nao pode ser consumido por uma espera abandonada.");
 }
 
 static void InventoryNormalizesFileAndFolderItems()
@@ -1610,6 +1693,27 @@ static void TimelineCollapsesRenameDuplicateAfterUserResolution()
     Assert(display[0].Action == "created", "Pasta provisoria do Windows materializada no nome final deveria aparecer como criacao.");
     Assert(display[0].Path == @"C:\Corporativo\Nova pasta - 10", "Evento preservado deveria apontar para o nome final.");
     Assert(display[0].User == @"FILESERVER\AnphibiO", "Criacao final deveria herdar usuario do Security Log.");
+}
+
+static void TimelinePrefersKnownUserAcrossDuplicateRawCreations()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T01:39:01Z");
+    var path = @"C:\Corporativo\cenario\delete-tree\delete-root.txt";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(timestamp, "created", path, source: "usn-journal", user: "UNKNOWN", processName: "fsutil.exe"),
+        BuildTimelineEvent(timestamp, "created", path, source: "usn-journal+security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events)
+        .Where(item => item.Action == "created" && item.Path == path)
+        .ToArray();
+
+    Assert(display.Length == 1, "Criacoes brutas duplicadas deveriam produzir uma unica criacao na timeline.");
+    Assert(display[0].User == @"FILESERVER\Administrator", "Criacao deduplicada deveria preservar o usuario conhecido.");
+    Assert(display[0].Source == "usn-journal+security-log", "Criacao deduplicada deveria preservar a evidencia correlacionada.");
 }
 
 static void TimelineSynthesizesKnownDescendantMovesAfterFolderMove()

@@ -1817,7 +1817,36 @@ public sealed class EventTimelineProjector
                 : item;
         }
 
-        return grouped.Values.ToArray();
+        return MergeUnknownRawDuplicates(grouped.Values).ToArray();
+    }
+
+    private static IEnumerable<FileAuditEvent> MergeUnknownRawDuplicates(IEnumerable<FileAuditEvent> events)
+    {
+        return events
+            .GroupBy(item => string.Join("|",
+                item.Server,
+                item.Share,
+                item.Action,
+                NormalizePath(item.Path),
+                NormalizePath(item.PreviousPath),
+                TrimToSecond(item.TimestampUtc).ToString("O")), StringComparer.OrdinalIgnoreCase)
+            .SelectMany(group =>
+            {
+                var items = group.ToArray();
+                var knownUsers = items
+                    .Where(item => !IsUnknownUser(item.User))
+                    .Select(item => item.User)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+
+                if (knownUsers.Length != 1 || items.All(item => !IsUnknownUser(item.User)))
+                {
+                    return items;
+                }
+
+                var merged = items.Aggregate(MergeDuplicateEvent);
+                return new[] { merged with { User = knownUsers[0] } };
+            });
     }
 
     private static FileAuditEvent MergeDuplicateEvent(FileAuditEvent left, FileAuditEvent right)

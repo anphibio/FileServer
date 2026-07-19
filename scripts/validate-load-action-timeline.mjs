@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { buildDisplayEvents } from "../src/FileServerMonitor.Web/src/event-timeline.ts";
 
 const [eventsPath, expectedPath, rootName] = process.argv.slice(2);
 
@@ -10,15 +9,16 @@ if (!eventsPath || !expectedPath || !rootName) {
 
 const events = JSON.parse(readFileSync(eventsPath, "utf8"));
 const expected = JSON.parse(readFileSync(expectedPath, "utf8"));
-const display = buildDisplayEvents(events)
+const display = events
   .filter((event) => event.path.includes(rootName) || event.previousPath?.includes(rootName));
+const expectedActions = new Set(["created", "deleted", "accessed", "renamed", "moved"]);
 
 const keyForTransition = (item) => `${item.from} -> ${item.to}`;
 const unique = (items) => [...new Set(items)].sort();
 
 function comparePaths(displayAction, expectedPaths) {
   const actual = display
-    .filter((event) => event.displayAction === displayAction)
+    .filter((event) => event.action === displayAction)
     .map((event) => event.path);
   const actualUnique = unique(actual);
   const expectedSorted = [...expectedPaths].sort();
@@ -34,7 +34,7 @@ function comparePaths(displayAction, expectedPaths) {
 
 function compareTransitions(displayAction, expectedTransitions) {
   const actual = display
-    .filter((event) => event.displayAction === displayAction)
+    .filter((event) => event.action === displayAction)
     .map((event) => ({
       from: event.previousPath,
       to: event.path
@@ -56,11 +56,17 @@ const report = {
   rootName,
   rawEvents: events.filter((event) => event.path.includes(rootName) || event.previousPath?.includes(rootName)).length,
   displayEvents: display.length,
-  created: comparePaths("Criação", expected.created),
-  deleted: comparePaths("Excluído", expected.deleted),
-  accessed: comparePaths("Acessado", expected.accessed),
-  renamed: compareTransitions("Renomeado", expected.renamed),
-  moved: compareTransitions("Movido", expected.moved)
+  unexpectedActions: display
+    .filter((event) => !expectedActions.has(event.action))
+    .map((event) => ({ action: event.action, path: event.path, timestampUtc: event.timestampUtc })),
+  userMismatches: display
+    .filter((event) => event.user !== expected.user)
+    .map((event) => ({ action: event.action, path: event.path, user: event.user })),
+  created: comparePaths("created", expected.created),
+  deleted: comparePaths("deleted", expected.deleted),
+  accessed: comparePaths("accessed", expected.accessed),
+  renamed: compareTransitions("renamed", expected.renamed),
+  moved: compareTransitions("moved", expected.moved)
 };
 
 report.summary = Object.fromEntries(

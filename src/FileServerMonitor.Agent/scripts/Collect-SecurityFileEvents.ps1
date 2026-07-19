@@ -4,7 +4,8 @@ param(
     [int]$MaxEvents = 200,
     [string[]]$EventIds = @("4663", "4660", "4670"),
     [string]$ServerName = $env:COMPUTERNAME,
-    [string]$DefaultShare = "FileServer"
+    [string]$DefaultShare = "FileServer",
+    [switch]$BuildQueryOnly
 )
 
 Set-StrictMode -Version Latest
@@ -202,16 +203,21 @@ function Resolve-EventPath {
     return "$normalizedBase\$normalizedRelative"
 }
 
-$filter = @{
-    LogName = "Security"
-    Id = $normalizedEventIds
+$eventIdPredicate = ($normalizedEventIds | ForEach-Object { "EventID=$_" }) -join " or "
+$filterXPath = "*[System[(($eventIdPredicate)) and EventRecordID > $LastRecordId]]"
+
+if ($BuildQueryOnly) {
+    [pscustomobject]@{
+        logName = "Security"
+        filterXPath = $filterXPath
+        oldest = $true
+        maxEvents = $MaxEvents
+    } | ConvertTo-Json -Compress
+    return
 }
 
 try {
-    $events = Get-WinEvent -FilterHashtable $filter -MaxEvents ([Math]::Max($MaxEvents * 4, $MaxEvents)) |
-        Where-Object { $_.RecordId -gt $LastRecordId } |
-        Sort-Object RecordId |
-        Select-Object -First $MaxEvents
+    $events = Get-WinEvent -LogName "Security" -FilterXPath $filterXPath -Oldest -MaxEvents $MaxEvents
 } catch [System.Diagnostics.Eventing.Reader.EventLogNotFoundException] {
     $events = @()
 } catch {
