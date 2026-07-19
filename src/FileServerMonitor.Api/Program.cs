@@ -1226,10 +1226,15 @@ app.MapPost("/api/inventory/acl/directory-groups/refresh", async (
     await adminAudit.AddAsync(AdminAuditEntry.Create(
         Action: "inventory.acl.directory-groups.refresh",
         EntityType: "directory_group_cache",
-        EntityId: string.Join(';', principals),
+        EntityId: $"batch:{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', principals))))[..24].ToLowerInvariant()}",
         Actor: AdminAuditHelpers.GetActor(httpContext),
         SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
-        Details: new { groups = results.Count, members = results.Sum(item => item.MemberCount) }), cancellationToken);
+        Details: new
+        {
+            principals,
+            groups = results.Count,
+            members = results.Sum(item => item.MemberCount)
+        }), cancellationToken);
 
     return Results.Ok(results);
 });
@@ -13248,8 +13253,17 @@ internal sealed class LdapDirectoryClient
     private static string? GetAttributeValue(SearchResultEntry entry, string name)
     {
         return entry.Attributes.Contains(name) && entry.Attributes[name].Count > 0
-            ? entry.Attributes[name][0]?.ToString()
+            ? DecodeAttributeValue(entry.Attributes[name][0])
             : null;
+    }
+
+    private static string? DecodeAttributeValue(object? value)
+    {
+        return value switch
+        {
+            byte[] bytes => Encoding.UTF8.GetString(bytes),
+            _ => value?.ToString()
+        };
     }
 
     private static string EscapeLdapFilter(string value)
@@ -13682,7 +13696,7 @@ internal sealed class LdapAuthenticator
     private static string? GetAttributeValue(SearchResultEntry entry, string name)
     {
         return entry.Attributes.Contains(name) && entry.Attributes[name].Count > 0
-            ? entry.Attributes[name][0]?.ToString()
+            ? DecodeAttributeValue(entry.Attributes[name][0])
             : null;
     }
 
@@ -13695,10 +13709,19 @@ internal sealed class LdapAuthenticator
 
         return entry.Attributes[name]
             .Cast<object>()
-            .Select(value => value.ToString())
+            .Select(DecodeAttributeValue)
             .Where(value => !string.IsNullOrWhiteSpace(value))
             .Cast<string>()
             .ToArray();
+    }
+
+    private static string? DecodeAttributeValue(object? value)
+    {
+        return value switch
+        {
+            byte[] bytes => Encoding.UTF8.GetString(bytes),
+            _ => value?.ToString()
+        };
     }
 
     private static string EscapeLdapFilter(string value)
