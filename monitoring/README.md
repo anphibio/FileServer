@@ -10,7 +10,7 @@ A API expõe:
 - `GET /metrics`: retrato completo do ambiente em JSON para Zabbix/Grafana.
 - `GET /api/inventory/items`: lista itens do último snapshot para investigação, filtrando por achados como `executable`, `large`, `inactive365` ou `errors`.
 
-O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, capacidade das tabelas principais, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado, contadores do último ciclo de coleta e saúde do inventário gerencial.
+O `/metrics` retorna status geral, status do banco, idade do último evento, total de eventos, capacidade das tabelas principais, fila durável de materialização da timeline, resumo dos agentes, fila local dos agentes, batimentos, atraso do último evento coletado, contadores do último ciclo de coleta e saúde do inventário gerencial.
 
 Principais sinais de banco e capacidade:
 
@@ -34,6 +34,18 @@ Principais sinais de agente:
 - `lastCycleQueuedEvents`: eventos que precisaram ficar na fila local.
 - `maxCollectedEventAgeSeconds`: maior atraso desde o último evento coletado por um agente.
 - `cycleErrors`: quantidade de agentes cujo último ciclo reportou erro.
+
+Principais sinais da materialização da timeline:
+
+- `timeline.status`: `healthy`, `degraded` ou `critical`.
+- `timeline.totalJobs`: total de trabalhos ainda não concluídos.
+- `timeline.pendingJobs`: trabalhos aguardando claim ou debounce.
+- `timeline.processingJobs`: trabalhos com lease ativo.
+- `timeline.retryingJobs`: trabalhos que já falharam ou precisaram de nova tentativa.
+- `timeline.maxAttemptCount`: maior quantidade de tentativas entre os trabalhos atuais.
+- `timeline.oldestJobAgeSeconds`: idade do trabalho mais antigo.
+- `timeline.lastError`: último erro ainda associado a um trabalho da fila.
+- `timeline.queryDurationMs`: duração da consulta operacional da fila.
 
 Principais sinais de inventário:
 
@@ -67,6 +79,8 @@ Macros principais:
 - `{$FILESERVER_MONITOR_LAST_EVENT_MAX_AGE}`: alerta quando nenhum evento novo chegar por esse tempo, em segundos.
 - `{$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}`: alerta quando as tabelas principais reservarem mais espaço que esse limite, em MB.
 - `{$FILESERVER_MONITOR_INVENTORY_MAX_AGE}`: alerta quando o inventário ficar mais antigo que esse tempo, em segundos.
+- `{$FILESERVER_MONITOR_TIMELINE_QUEUE_WARN}`: alerta quando a fila de materialização acumular essa quantidade de jobs.
+- `{$FILESERVER_MONITOR_TIMELINE_QUEUE_MAX_AGE}`: alerta quando o job mais antigo ultrapassar essa idade, em segundos.
 
 O template usa item HTTP agent no endpoint `/metrics` e cria itens dependentes com JSONPath.
 
@@ -85,4 +99,4 @@ Depois da importação, use as variáveis no topo do dashboard:
 - `Host group`: grupo de hosts vindo do Zabbix.
 - `Host`: hosts filtrados pelo grupo selecionado.
 
-Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status` e `database status`, devem usar Query type `Text` no Grafana, mantendo `Group`, `Host`, `Application` e `Item` preenchidos. No JSON exportado pelo plugin, esse modo aparece como `queryType: "2"`. Contadores, tempos e idades usam Query type `Metrics`.
+Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status`, `database status`, `timeline queue status` e `timeline queue last error`, devem usar Query type `Text` no Grafana, mantendo `Group`, `Host`, `Application` e `Item` preenchidos. No JSON exportado pelo plugin, esse modo aparece como `queryType: "2"`. Contadores, tempos e idades usam Query type `Metrics`.

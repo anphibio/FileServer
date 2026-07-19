@@ -189,8 +189,16 @@ BEGIN
         LeaseId UNIQUEIDENTIFIER NULL,
         LeaseExpiresUtc DATETIME2(3) NULL,
         AttemptCount INT NOT NULL,
-        LastError NVARCHAR(1024) NULL
+        LastError NVARCHAR(1024) NULL,
+        LastErrorUtc DATETIME2(3) NULL
     );
+END;
+GO
+
+IF COL_LENGTH(N'dbo.TimelineMaterializationJobs', N'LastErrorUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.TimelineMaterializationJobs
+    ADD LastErrorUtc DATETIME2(3) NULL;
 END;
 GO
 

@@ -88,6 +88,7 @@ var tests = new (string Name, Action Test)[]
     ("materializacao preserva sinal recebido depois do periodo silencioso", TimelineMaterializationPreservesSignalAfterQuietPeriod),
     ("fila de materializacao seleciona cadeia sobreposta sem engolir janela distante", TimelineMaterializationLeaseSelectionKeepsDistantWorkPending),
     ("fila de materializacao calcula janela de ingestao com margem", TimelineMaterializationBuildsIngestionWindowWithPadding),
+    ("saude da fila de materializacao distingue fluxo normal atraso e bloqueio", TimelineMaterializationClassifiesQueueHealth),
     ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
     ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary),
     ("inventario cruza uso real observado por pasta e usuario", InventoryBuildsObservedActivitySummary),
@@ -360,6 +361,31 @@ static void TimelineMaterializationBuildsIngestionWindowWithPadding()
     Assert(window.ToUtc == start.AddSeconds(70), "A margem deve ser aplicada depois do ultimo evento.");
     Assert(TimelineMaterializationWindow.FromTimestamps(Array.Empty<DateTimeOffset>(), TimeSpan.FromSeconds(30)) is null,
         "Uma ingestao vazia nao deve criar trabalho de materializacao.");
+}
+
+static void TimelineMaterializationClassifiesQueueHealth()
+{
+    var thresholds = new TimelineMaterializationHealthThresholds(
+        WarningJobs: 100,
+        CriticalJobs: 1_000,
+        WarningAgeSeconds: 60,
+        CriticalAgeSeconds: 300,
+        CriticalAttemptCount: 5);
+
+    Assert(TimelineMaterializationHealth.Classify(0, null, 0, thresholds) == "healthy",
+        "Fila vazia deve permanecer saudavel.");
+    Assert(TimelineMaterializationHealth.Classify(12, 15, 1, thresholds) == "healthy",
+        "Trabalho recente dentro do debounce nao deve degradar o ambiente.");
+    Assert(TimelineMaterializationHealth.Classify(100, 15, 1, thresholds) == "degraded",
+        "Acumulo no limite de alerta deve degradar a fila.");
+    Assert(TimelineMaterializationHealth.Classify(12, 60, 1, thresholds) == "degraded",
+        "Trabalho antigo no limite de alerta deve degradar a fila.");
+    Assert(TimelineMaterializationHealth.Classify(12, 15, 5, thresholds) == "critical",
+        "Repeticao excessiva deve tornar a fila critica.");
+    Assert(TimelineMaterializationHealth.Classify(1_000, 15, 1, thresholds) == "critical",
+        "Backlog no limite critico deve tornar a fila critica.");
+    Assert(TimelineMaterializationHealth.Classify(12, 300, 1, thresholds) == "critical",
+        "Trabalho antigo no limite critico deve tornar a fila critica.");
 }
 
 static void InventoryNormalizesFileAndFolderItems()

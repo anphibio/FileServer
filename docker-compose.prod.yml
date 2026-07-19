@@ -47,6 +47,11 @@ services:
       Alerts__SuspiciousExtensionThreshold: ${ALERT_SUSPICIOUS_EXTENSION_THRESHOLD:-10}
       Agents__StaleMinutes: ${AGENTS_STALE_MINUTES:-10}
       Agents__BacklogWarningThreshold: ${AGENTS_BACKLOG_WARNING_THRESHOLD:-1000}
+      Metrics__TimelineQueueWarningJobs: ${TIMELINE_QUEUE_WARNING_JOBS:-100}
+      Metrics__TimelineQueueCriticalJobs: ${TIMELINE_QUEUE_CRITICAL_JOBS:-1000}
+      Metrics__TimelineQueueWarningAgeSeconds: ${TIMELINE_QUEUE_WARNING_AGE_SECONDS:-60}
+      Metrics__TimelineQueueCriticalAgeSeconds: ${TIMELINE_QUEUE_CRITICAL_AGE_SECONDS:-300}
+      Metrics__TimelineQueueCriticalAttempts: ${TIMELINE_QUEUE_CRITICAL_ATTEMPTS:-5}
       Notifications__Enabled: ${NOTIFICATIONS_ENABLED:-false}
       Notifications__WebhookUrl: ${NOTIFICATIONS_WEBHOOK_URL:-}
       Notifications__Format: ${NOTIFICATIONS_FORMAT:-generic}

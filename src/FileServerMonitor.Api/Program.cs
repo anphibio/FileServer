@@ -135,22 +135,34 @@ app.Use(async (context, next) =>
 
 app.MapGet("/", () => Results.Redirect("/health"));
 
-app.MapGet("/health", async (IEventRepository repository, CancellationToken cancellationToken) =>
+app.MapGet("/health", async (
+    IEventRepository repository,
+    ITimelineMaterializationQueue timelineQueue,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
 {
     var stats = await repository.GetStatsAsync(cancellationToken);
+    var now = DateTimeOffset.UtcNow;
+    var timeline = await BuildTimelineMaterializationMetricsAsync(
+        timelineQueue,
+        configuration,
+        now,
+        cancellationToken);
 
     return Results.Ok(new HealthResponse(
         Service: "FileServerMonitor.Api",
-        Status: "healthy",
-        TimestampUtc: DateTimeOffset.UtcNow,
+        Status: timeline.Status,
+        TimestampUtc: now,
         StorageProvider: repository.ProviderName,
         StoredEvents: stats.StoredEvents,
-        LastEventUtc: stats.LastEventUtc));
+        LastEventUtc: stats.LastEventUtc,
+        Timeline: timeline));
 });
 
 app.MapGet("/metrics", async (
     IEventRepository repository,
     IInventoryRepository inventory,
+    ITimelineMaterializationQueue timelineQueue,
     AgentHealthStore agents,
     RetentionSettingsStore retentionStore,
     IConfiguration configuration,
@@ -160,11 +172,21 @@ app.MapGet("/metrics", async (
     var database = await BuildDatabaseMetricsAsync(repository, now, cancellationToken);
     var capacity = await BuildDatabaseCapacityMetricsAsync(configuration, repository, now, cancellationToken);
     var inventoryMetrics = await BuildInventoryMetricsAsync(inventory, now, cancellationToken);
+    var timelineMetrics = await BuildTimelineMaterializationMetricsAsync(
+        timelineQueue,
+        configuration,
+        now,
+        cancellationToken);
     var agentSummary = await BuildAgentMetricsAsync(agents, now, cancellationToken);
     var thresholds = new MetricsThresholds(
         AgentStaleMinutes: configuration.GetValue("Agents:StaleMinutes", 10),
         AgentBacklogWarningThreshold: configuration.GetValue("Agents:BacklogWarningThreshold", 1000),
-        LastEventWarningSeconds: configuration.GetValue("Metrics:LastEventWarningSeconds", 1800));
+        LastEventWarningSeconds: configuration.GetValue("Metrics:LastEventWarningSeconds", 1800),
+        TimelineQueueWarningJobs: configuration.GetValue("Metrics:TimelineQueueWarningJobs", 100),
+        TimelineQueueCriticalJobs: configuration.GetValue("Metrics:TimelineQueueCriticalJobs", 1000),
+        TimelineQueueWarningAgeSeconds: configuration.GetValue("Metrics:TimelineQueueWarningAgeSeconds", 60),
+        TimelineQueueCriticalAgeSeconds: configuration.GetValue("Metrics:TimelineQueueCriticalAgeSeconds", 300),
+        TimelineQueueCriticalAttempts: configuration.GetValue("Metrics:TimelineQueueCriticalAttempts", 5));
     var retention = RetentionMetrics.FromSettings(await retentionStore.GetAsync(cancellationToken));
     var api = new ApiMetrics(
         Status: "healthy",
@@ -173,7 +195,7 @@ app.MapGet("/metrics", async (
         StartedUtc: apiStartedUtc,
         MachineName: Environment.MachineName,
         ProcessId: Environment.ProcessId);
-    var status = ResolveMetricsStatus(database, agentSummary, inventoryMetrics);
+    var status = ResolveMetricsStatus(database, agentSummary, inventoryMetrics, timelineMetrics);
 
     return Results.Ok(new MetricsResponse(
         Service: "FileServerMonitor.Api",
@@ -182,6 +204,7 @@ app.MapGet("/metrics", async (
         Api: api,
         Database: database,
         Capacity: capacity,
+        Timeline: timelineMetrics,
         Inventory: inventoryMetrics,
         Agents: agentSummary,
         Retention: retention,
@@ -1691,6 +1714,65 @@ static async Task<DatabaseMetrics> BuildDatabaseMetricsAsync(
     }
 }
 
+static async Task<TimelineMaterializationMetrics> BuildTimelineMaterializationMetricsAsync(
+    ITimelineMaterializationQueue queue,
+    IConfiguration configuration,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    var stopwatch = Stopwatch.StartNew();
+    try
+    {
+        var stats = await queue.GetStatsAsync(cancellationToken);
+        stopwatch.Stop();
+        var oldestAgeSeconds = GetAgeSeconds(now, stats.OldestJobCreatedUtc);
+        var thresholds = new TimelineMaterializationHealthThresholds(
+            WarningJobs: configuration.GetValue("Metrics:TimelineQueueWarningJobs", 100),
+            CriticalJobs: configuration.GetValue("Metrics:TimelineQueueCriticalJobs", 1000),
+            WarningAgeSeconds: configuration.GetValue("Metrics:TimelineQueueWarningAgeSeconds", 60),
+            CriticalAgeSeconds: configuration.GetValue("Metrics:TimelineQueueCriticalAgeSeconds", 300),
+            CriticalAttemptCount: configuration.GetValue("Metrics:TimelineQueueCriticalAttempts", 5));
+        var status = TimelineMaterializationHealth.Classify(
+            stats.TotalJobs,
+            oldestAgeSeconds,
+            stats.MaxAttemptCount,
+            thresholds);
+
+        return new TimelineMaterializationMetrics(
+            Status: status,
+            Provider: queue.ProviderName,
+            TotalJobs: stats.TotalJobs,
+            PendingJobs: stats.PendingJobs,
+            ProcessingJobs: stats.ProcessingJobs,
+            RetryingJobs: stats.RetryingJobs,
+            MaxAttemptCount: stats.MaxAttemptCount,
+            OldestJobCreatedUtc: stats.OldestJobCreatedUtc,
+            OldestJobAgeSeconds: oldestAgeSeconds,
+            LastErrorUtc: stats.LastErrorUtc,
+            LastError: stats.LastError,
+            QueryDurationMs: stopwatch.ElapsedMilliseconds,
+            Error: null);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException)
+    {
+        stopwatch.Stop();
+        return new TimelineMaterializationMetrics(
+            Status: "critical",
+            Provider: queue.ProviderName,
+            TotalJobs: null,
+            PendingJobs: null,
+            ProcessingJobs: null,
+            RetryingJobs: null,
+            MaxAttemptCount: null,
+            OldestJobCreatedUtc: null,
+            OldestJobAgeSeconds: null,
+            LastErrorUtc: null,
+            LastError: null,
+            QueryDurationMs: stopwatch.ElapsedMilliseconds,
+            Error: ex.Message);
+    }
+}
+
 static async Task<DatabaseCapacityResponse> BuildDatabaseCapacityAsync(
     IConfiguration configuration,
     IEventRepository repository,
@@ -2186,18 +2268,24 @@ static string ResolveAgentStatus(int total, int stale, int unhealthy, int backlo
     return "healthy";
 }
 
-static string ResolveMetricsStatus(DatabaseMetrics database, AgentMetricsSummary agents, InventoryMetrics inventory)
+static string ResolveMetricsStatus(
+    DatabaseMetrics database,
+    AgentMetricsSummary agents,
+    InventoryMetrics inventory,
+    TimelineMaterializationMetrics timeline)
 {
     if (database.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
         || agents.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
-        || inventory.Status.Equals("critical", StringComparison.OrdinalIgnoreCase))
+        || inventory.Status.Equals("critical", StringComparison.OrdinalIgnoreCase)
+        || timeline.Status.Equals("critical", StringComparison.OrdinalIgnoreCase))
     {
         return "critical";
     }
 
     if (!database.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase)
         || !agents.Status.Equals("healthy", StringComparison.OrdinalIgnoreCase)
-        || inventory.Status.Equals("degraded", StringComparison.OrdinalIgnoreCase))
+        || inventory.Status.Equals("degraded", StringComparison.OrdinalIgnoreCase)
+        || timeline.Status.Equals("degraded", StringComparison.OrdinalIgnoreCase))
     {
         return "degraded";
     }
@@ -2228,6 +2316,8 @@ internal interface IEventRepository
 
 internal interface ITimelineMaterializationQueue
 {
+    string ProviderName { get; }
+
     Task EnqueueAsync(TimelineMaterializationWindow window, CancellationToken cancellationToken);
 
     Task<TimelineMaterializationLease> ClaimAsync(
@@ -2242,6 +2332,8 @@ internal interface ITimelineMaterializationQueue
         string? error,
         TimeSpan retryDelay,
         CancellationToken cancellationToken);
+
+    Task<TimelineMaterializationQueueStats> GetStatsAsync(CancellationToken cancellationToken);
 }
 
 internal interface ITimelineRepository
@@ -4467,6 +4559,8 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
             ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
     }
 
+    public string ProviderName => "SqlServer";
+
     public async Task EnqueueAsync(
         TimelineMaterializationWindow window,
         CancellationToken cancellationToken)
@@ -4575,13 +4669,68 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
                 AvailableUtc = DATEADD(MILLISECOND, @RetryDelayMs, SYSUTCDATETIME()),
                 LeaseId = NULL,
                 LeaseExpiresUtc = NULL,
-                LastError = @LastError
+                LastError = @LastError,
+                LastErrorUtc = SYSUTCDATETIME()
             WHERE StatusName = N'processing' AND LeaseId = @LeaseId;
             """;
         command.Parameters.AddWithValue("@RetryDelayMs", Math.Max(0, (int)retryDelay.TotalMilliseconds));
         command.Parameters.AddWithValue("@LastError", DbValue(Truncate(error, 1024)));
         command.Parameters.AddWithValue("@LeaseId", lease.LeaseId);
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<TimelineMaterializationQueueStats> GetStatsAsync(
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                COUNT(1) AS TotalJobs,
+                COALESCE(SUM(CASE WHEN StatusName = N'pending' THEN 1 ELSE 0 END), 0) AS PendingJobs,
+                COALESCE(SUM(CASE WHEN StatusName = N'processing' THEN 1 ELSE 0 END), 0) AS ProcessingJobs,
+                COALESCE(SUM(CASE WHEN AttemptCount > 1 OR LastError IS NOT NULL THEN 1 ELSE 0 END), 0) AS RetryingJobs,
+                COALESCE(MAX(AttemptCount), 0) AS MaxAttemptCount,
+                MIN(CreatedUtc) AS OldestJobCreatedUtc
+            FROM dbo.TimelineMaterializationJobs;
+
+            SELECT TOP (1) LastErrorUtc, LastError
+            FROM dbo.TimelineMaterializationJobs
+            WHERE LastError IS NOT NULL
+            ORDER BY LastErrorUtc DESC, CreatedUtc DESC;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+        var totalJobs = reader.GetInt32(0);
+        var pendingJobs = reader.GetInt32(1);
+        var processingJobs = reader.GetInt32(2);
+        var retryingJobs = reader.GetInt32(3);
+        var maxAttemptCount = reader.GetInt32(4);
+        DateTimeOffset? oldestJobCreatedUtc = reader.IsDBNull(5)
+            ? null
+            : ReadUtc(reader.GetDateTime(5));
+
+        DateTimeOffset? lastErrorUtc = null;
+        string? lastError = null;
+        if (await reader.NextResultAsync(cancellationToken)
+            && await reader.ReadAsync(cancellationToken))
+        {
+            lastErrorUtc = reader.IsDBNull(0) ? null : ReadUtc(reader.GetDateTime(0));
+            lastError = reader.IsDBNull(1) ? null : reader.GetString(1);
+        }
+
+        return new TimelineMaterializationQueueStats(
+            totalJobs,
+            pendingJobs,
+            processingJobs,
+            retryingJobs,
+            maxAttemptCount,
+            oldestJobCreatedUtc,
+            lastErrorUtc,
+            lastError);
     }
 
     internal async Task EnsureSchemaAsync(
@@ -4616,8 +4765,15 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
                         LeaseId UNIQUEIDENTIFIER NULL,
                         LeaseExpiresUtc DATETIME2(3) NULL,
                         AttemptCount INT NOT NULL,
-                        LastError NVARCHAR(1024) NULL
+                        LastError NVARCHAR(1024) NULL,
+                        LastErrorUtc DATETIME2(3) NULL
                     );
+                END;
+
+                IF COL_LENGTH(N'dbo.TimelineMaterializationJobs', N'LastErrorUtc') IS NULL
+                BEGIN
+                    ALTER TABLE dbo.TimelineMaterializationJobs
+                    ADD LastErrorUtc DATETIME2(3) NULL;
                 END;
 
                 IF NOT EXISTS
@@ -4691,8 +4847,7 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
                     SET StatusName = N'processing',
                         LeaseId = @LeaseId,
                         LeaseExpiresUtc = DATEADD(SECOND, @LeaseSeconds, SYSUTCDATETIME()),
-                        AttemptCount = AttemptCount + 1,
-                        LastError = NULL
+                        AttemptCount = AttemptCount + 1
                     WHERE StatusName = N'pending' AND Id IN ({idParameters});
                     """;
                 claim.Parameters.AddWithValue("@LeaseId", lease.LeaseId);
@@ -4727,7 +4882,8 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
                 AvailableUtc = SYSUTCDATETIME(),
                 LeaseId = NULL,
                 LeaseExpiresUtc = NULL,
-                LastError = COALESCE(LastError, N'Lease expirado; trabalho retomado automaticamente.')
+                LastError = COALESCE(LastError, N'Lease expirado; trabalho retomado automaticamente.'),
+                LastErrorUtc = COALESCE(LastErrorUtc, SYSUTCDATETIME())
             WHERE StatusName = N'processing'
               AND LeaseExpiresUtc < SYSUTCDATETIME();
             """;
@@ -6024,6 +6180,8 @@ internal sealed class InMemoryTimelineMaterializationQueue : ITimelineMaterializ
         _coordinator = coordinator;
     }
 
+    public string ProviderName => "InMemory";
+
     public Task EnqueueAsync(
         TimelineMaterializationWindow window,
         CancellationToken cancellationToken)
@@ -6063,6 +6221,22 @@ internal sealed class InMemoryTimelineMaterializationQueue : ITimelineMaterializ
         cancellationToken.ThrowIfCancellationRequested();
         _coordinator.Retry(lease.Window);
         return Task.CompletedTask;
+    }
+
+    public Task<TimelineMaterializationQueueStats> GetStatsAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var hasWork = _coordinator.IsDirty();
+        return Task.FromResult(new TimelineMaterializationQueueStats(
+            TotalJobs: hasWork ? 1 : 0,
+            PendingJobs: hasWork ? 1 : 0,
+            ProcessingJobs: 0,
+            RetryingJobs: 0,
+            MaxAttemptCount: hasWork ? 1 : 0,
+            OldestJobCreatedUtc: null,
+            LastErrorUtc: null,
+            LastError: null));
     }
 }
 
@@ -11525,7 +11699,8 @@ internal sealed record HealthResponse(
     DateTimeOffset TimestampUtc,
     string StorageProvider,
     long StoredEvents,
-    DateTimeOffset? LastEventUtc);
+    DateTimeOffset? LastEventUtc,
+    TimelineMaterializationMetrics Timeline);
 
 internal sealed record MetricsResponse(
     string Service,
@@ -11534,6 +11709,7 @@ internal sealed record MetricsResponse(
     ApiMetrics Api,
     DatabaseMetrics Database,
     DatabaseCapacityMetrics Capacity,
+    TimelineMaterializationMetrics Timeline,
     InventoryMetrics Inventory,
     AgentMetricsSummary Agents,
     RetentionMetrics Retention,
@@ -11553,6 +11729,31 @@ internal sealed record DatabaseMetrics(
     long? StoredEvents,
     DateTimeOffset? LastEventUtc,
     long? LastEventAgeSeconds,
+    long QueryDurationMs,
+    string? Error);
+
+internal sealed record TimelineMaterializationQueueStats(
+    int TotalJobs,
+    int PendingJobs,
+    int ProcessingJobs,
+    int RetryingJobs,
+    int MaxAttemptCount,
+    DateTimeOffset? OldestJobCreatedUtc,
+    DateTimeOffset? LastErrorUtc,
+    string? LastError);
+
+internal sealed record TimelineMaterializationMetrics(
+    string Status,
+    string Provider,
+    int? TotalJobs,
+    int? PendingJobs,
+    int? ProcessingJobs,
+    int? RetryingJobs,
+    int? MaxAttemptCount,
+    DateTimeOffset? OldestJobCreatedUtc,
+    long? OldestJobAgeSeconds,
+    DateTimeOffset? LastErrorUtc,
+    string? LastError,
     long QueryDurationMs,
     string? Error);
 
@@ -11689,7 +11890,12 @@ internal sealed record RetentionMetrics(
 internal sealed record MetricsThresholds(
     int AgentStaleMinutes,
     int AgentBacklogWarningThreshold,
-    int LastEventWarningSeconds);
+    int LastEventWarningSeconds,
+    int TimelineQueueWarningJobs,
+    int TimelineQueueCriticalJobs,
+    int TimelineQueueWarningAgeSeconds,
+    int TimelineQueueCriticalAgeSeconds,
+    int TimelineQueueCriticalAttempts);
 
 internal sealed record EventIngestResponse(FileAuditEvent Event, IReadOnlyCollection<FileServerAlert> Alerts);
 

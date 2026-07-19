@@ -102,6 +102,39 @@ public sealed record TimelineMaterializationLease(
     }
 }
 
+public sealed record TimelineMaterializationHealthThresholds(
+    int WarningJobs,
+    int CriticalJobs,
+    long WarningAgeSeconds,
+    long CriticalAgeSeconds,
+    int CriticalAttemptCount);
+
+public static class TimelineMaterializationHealth
+{
+    public static string Classify(
+        int totalJobs,
+        long? oldestJobAgeSeconds,
+        int maxAttemptCount,
+        TimelineMaterializationHealthThresholds thresholds)
+    {
+        if (totalJobs >= thresholds.CriticalJobs
+            || oldestJobAgeSeconds >= thresholds.CriticalAgeSeconds
+            || maxAttemptCount >= thresholds.CriticalAttemptCount)
+        {
+            return "critical";
+        }
+
+        if (totalJobs >= thresholds.WarningJobs
+            || oldestJobAgeSeconds >= thresholds.WarningAgeSeconds
+            || maxAttemptCount > 1)
+        {
+            return "degraded";
+        }
+
+        return "healthy";
+    }
+}
+
 public sealed class TimelineMaterializationCoordinator
 {
     private readonly object _sync = new();

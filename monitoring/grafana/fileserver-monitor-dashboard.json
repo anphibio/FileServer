@@ -2401,12 +2401,1130 @@
       }
     },
     {
+      "id": 42,
+      "title": "Materialização da timeline",
+      "type": "text",
+      "datasource": null,
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 3
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "### Fila persistente do Core\nAcompanhe volume, atraso, tentativas e custo da materialização que transforma eventos brutos na timeline consultada pela aplicação e pelos relatórios."
+      },
+      "transparent": false
+    },
+    {
+      "id": 43,
+      "title": "Fila do Core",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "itemTag": {
+            "filter": ""
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue status"
+          },
+          "macro": {
+            "filter": ""
+          },
+          "mode": 2,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "proxy": {
+            "filter": ""
+          },
+          "refId": "A",
+          "resultFormat": "table",
+          "queryType": "2",
+          "schema": 12,
+          "table": {
+            "skipEmptyValues": false
+          },
+          "tags": {
+            "filter": ""
+          },
+          "textFilter": "",
+          "trigger": {
+            "filter": ""
+          },
+          "triggers": {
+            "acknowledged": 2
+          },
+          "useCaptureGroups": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "healthy": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "OK"
+                },
+                "degraded": {
+                  "color": "orange",
+                  "index": 1,
+                  "text": "Atenção"
+                },
+                "critical": {
+                  "color": "red",
+                  "index": 2,
+                  "text": "Crítico"
+                },
+                "ok": {
+                  "color": "green",
+                  "index": 3,
+                  "text": "OK"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "noValue": "Sem dados"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 44,
+      "title": "Jobs na fila",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue total"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 45,
+      "title": "Pendentes",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue pending"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 46,
+      "title": "Em processamento",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue processing"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 47,
+      "title": "Em repetição",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue retrying"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 48,
+      "title": "Maior espera",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 51,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue oldest age"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
+      "id": 49,
+      "title": "Evolução da fila",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue total"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue pending"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "B",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue processing"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "C",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        },
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue retrying"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "D",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 50,
+      "title": "Idade do job mais antigo",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 55,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue oldest age"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 51,
+      "title": "Latência da consulta da fila",
+      "type": "timeseries",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 55,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue query time"
+          },
+          "mode": 0,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "refId": "A",
+          "resultFormat": "time_series",
+          "queryType": "0",
+          "schema": 12
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 52,
+      "title": "Último erro da materialização",
+      "type": "stat",
+      "datasource": {
+        "type": "alexanderzobnin-zabbix-datasource",
+        "uid": "${DS_ZABBIX}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 63,
+        "w": 24,
+        "h": 3
+      },
+      "targets": [
+        {
+          "application": {
+            "filter": "FileServer Monitor"
+          },
+          "datasource": {
+            "type": "alexanderzobnin-zabbix-datasource",
+            "uid": "${DS_ZABBIX}"
+          },
+          "group": {
+            "filter": "$zabbix_group"
+          },
+          "host": {
+            "filter": "$zabbix_host"
+          },
+          "itemTag": {
+            "filter": ""
+          },
+          "item": {
+            "filter": "FileServer Monitor: timeline queue last error"
+          },
+          "macro": {
+            "filter": ""
+          },
+          "mode": 2,
+          "options": {
+            "count": true,
+            "disableDataAlignment": false,
+            "showDisabledItems": false,
+            "skipEmptyValues": false,
+            "useTrends": "default",
+            "useZabbixValueMapping": false
+          },
+          "proxy": {
+            "filter": ""
+          },
+          "refId": "A",
+          "resultFormat": "table",
+          "queryType": "2",
+          "schema": 12,
+          "table": {
+            "skipEmptyValues": false
+          },
+          "tags": {
+            "filter": ""
+          },
+          "textFilter": "",
+          "trigger": {
+            "filter": ""
+          },
+          "triggers": {
+            "acknowledged": 2
+          },
+          "useCaptureGroups": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "left",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "noValue": "Sem erro registrado"
+      },
+      "pluginVersion": "10.4.0"
+    },
+    {
       "id": 27,
       "type": "text",
       "title": "Inventário gerencial",
       "gridPos": {
         "x": 0,
-        "y": 48,
+        "y": 66,
         "w": 24,
         "h": 3
       },
@@ -2426,7 +3544,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2553,7 +3671,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2633,7 +3751,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2705,7 +3823,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2777,7 +3895,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2849,7 +3967,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 51,
+        "y": 69,
         "w": 4,
         "h": 4
       },
@@ -2929,7 +4047,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3009,7 +4127,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3089,7 +4207,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3169,7 +4287,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3249,7 +4367,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3329,7 +4447,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 55,
+        "y": 73,
         "w": 4,
         "h": 4
       },
@@ -3409,7 +4527,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 59,
+        "y": 77,
         "w": 12,
         "h": 8
       },
@@ -3551,7 +4669,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 59,
+        "y": 77,
         "w": 12,
         "h": 8
       },
@@ -3739,6 +4857,6 @@
   "timezone": "browser",
   "title": "FileServer Monitor",
   "uid": "fileserver-monitor",
-  "version": 3,
+  "version": 5,
   "weekStart": ""
 }

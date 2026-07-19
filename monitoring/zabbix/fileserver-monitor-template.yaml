@@ -25,6 +25,12 @@ zabbix_export:
         - macro: '{$FILESERVER_MONITOR_INVENTORY_MAX_AGE}'
           value: '90000'
           description: 'Tempo maximo sem scan de inventario concluido, em segundos.'
+        - macro: '{$FILESERVER_MONITOR_TIMELINE_QUEUE_WARN}'
+          value: '100'
+          description: 'Quantidade de jobs da timeline que indica acumulacao.'
+        - macro: '{$FILESERVER_MONITOR_TIMELINE_QUEUE_MAX_AGE}'
+          value: '60'
+          description: 'Idade maxima esperada para o job mais antigo da timeline, em segundos.'
       items:
         - uuid: 0d0fdcc35bd047e592adcb65fd1c39e8
           name: 'FileServer Monitor: metrics raw'
@@ -530,6 +536,160 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: ed21adc0c67b4f5ca263d1118bcd6bd1
+          name: 'FileServer Monitor: timeline queue status'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.status
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.status
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 69d860cff84f4f3a88551bf0f9310e41
+          name: 'FileServer Monitor: timeline queue total jobs'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.total
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.totalJobs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: b7d1a5d3c31044acb569d23dcc01a15b
+          name: 'FileServer Monitor: timeline queue pending jobs'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.pending
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.pendingJobs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: dba711c2f1974be2adf17e029a49dae1
+          name: 'FileServer Monitor: timeline queue processing jobs'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.processing
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.processingJobs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 78dddf9db0a6494f8f0124adff0c457f
+          name: 'FileServer Monitor: timeline queue retrying jobs'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.retrying
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.retryingJobs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: ad99cd4c0f924036b7939e3c5e97c020
+          name: 'FileServer Monitor: timeline queue max attempts'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.max_attempts
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.maxAttemptCount
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 0239fe65ff8b45ae9f07b6159bd14600
+          name: 'FileServer Monitor: timeline queue oldest job age'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.oldest_age_seconds
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: s
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.oldestJobAgeSeconds
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 9a858508bc914e41ab40ec25febbbebc
+          name: 'FileServer Monitor: timeline queue query time'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.query_ms
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          units: ms
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.queryDurationMs
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 9cd8648b7f93432ab9d1a508c328d343
+          name: 'FileServer Monitor: timeline queue last error'
+          type: DEPENDENT
+          key: fileserver.timeline.queue.last_error
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.timeline.lastError
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "-" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
         - uuid: 8f13a8e724054a659af8415f4b833ef5
           name: 'FileServer Monitor: inventory status'
           type: DEPENDENT
@@ -807,6 +967,22 @@ zabbix_export:
     - uuid: 48d26932366245d3b20a8c6448029774
       expression: 'last(/Template App FileServer Monitor/fileserver.capacity.reserved_mb)>={$FILESERVER_MONITOR_DB_RESERVED_WARN_MB}'
       name: 'FileServer Monitor: capacidade reservada do banco acima do limite'
+      priority: WARNING
+    - uuid: 9860d80cdc154545b2fc3213b57e35eb
+      expression: 'last(/Template App FileServer Monitor/fileserver.timeline.queue.status)="critical"'
+      name: 'FileServer Monitor: fila de materializacao critica'
+      priority: HIGH
+    - uuid: 5862daa88a224878a1f7debd4dd14484
+      expression: 'last(/Template App FileServer Monitor/fileserver.timeline.queue.total)>={$FILESERVER_MONITOR_TIMELINE_QUEUE_WARN}'
+      name: 'FileServer Monitor: fila de materializacao acumulando jobs'
+      priority: WARNING
+    - uuid: ebdd2a8d4ef24404b947aa7298c60766
+      expression: 'last(/Template App FileServer Monitor/fileserver.timeline.queue.oldest_age_seconds)>{$FILESERVER_MONITOR_TIMELINE_QUEUE_MAX_AGE}'
+      name: 'FileServer Monitor: materializacao da timeline atrasada'
+      priority: WARNING
+    - uuid: 1754a9fce9f94a7d80e865adc428883e
+      expression: 'last(/Template App FileServer Monitor/fileserver.timeline.queue.retrying)>0'
+      name: 'FileServer Monitor: job da timeline em repeticao'
       priority: WARNING
     - uuid: b80b97d6edbd4400801359435c3b7d93
       expression: 'last(/Template App FileServer Monitor/fileserver.agents.total)=0'
