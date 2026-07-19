@@ -171,7 +171,7 @@ Exemplo:
   "enableRemoteConfig": true,
   "filterToConfiguredPaths": true,
   "correlationWindowSeconds": 10,
-  "remoteConfigRefreshMinutes": 5,
+  "remoteConfigRefreshMinutes": 1,
   "sendSecurityLogEvents": true,
   "usnVolumes": [ "D:" ],
   "stateFile": "state/agent-state.json",

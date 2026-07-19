@@ -670,6 +670,12 @@ considera `primaryGroupID`. O resultado fica materializado por 12 horas em
 `dbo.DirectoryGroupExpansionCache` e pode ser lido sem nova chamada ao dominio
 por `GET /api/inventory/acl/directory-groups`.
 
+Para que uma solicitacao manual de scan seja percebida rapidamente sem acoplar
+o inventario ao ciclo de eventos, mantenha `remoteConfigRefreshMinutes` em `1`.
+Esse intervalo consulta apenas a configuracao compacta do agente; a coleta de
+eventos continua obedecendo `pollIntervalSeconds` e o inventario so inicia
+quando solicitado ou quando sua janela programada for atingida.
+
 `Everyone`, `Authenticated Users` e `BUILTIN\Users` nao representam grupos AD
 enumeraveis e recebem estado `not_enumerable`, sem serem tratados como falha de
 conectividade. A expansao nunca e executada pelo agente nem no ciclo do scan.
