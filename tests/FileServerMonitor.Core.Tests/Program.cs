@@ -9,8 +9,12 @@ var tests = new (string Name, Action Test)[]
     ("dispara alerta de ransomware por extensao suspeita", RaisesRansomwareAlertBySuspiciousExtension),
     ("correlaciona USN com Security Log por caminho", CorrelatesUsnWithSecurityLogByPath),
     ("preserva acesso quando Security Log confirma leitura", PreservesAccessWhenSecurityLogConfirmsRead),
+    ("preserva leitura real alguns segundos depois da criacao", PreservesRealReadSecondsAfterCreation),
+    ("preserva leitura real antes de movimentacao", PreservesRealReadBeforeMove),
     ("prioriza escrita do Security Log sobre acesso ao correlacionar modificacao", PrefersSecurityWriteEvidenceOverAccessForModification),
     ("prefere melhor correspondencia por caminho", PrefersBestPathMatch),
+    ("nao correlaciona mesmo nome em pastas diferentes", DoesNotCorrelateSameLeafNameAcrossDifferentFolders),
+    ("nao correlaciona evento do filho com a pasta pai", DoesNotCorrelateChildEventWithParentFolder),
     ("nao correlaciona fora da janela", DoesNotCorrelateOutsideWindow),
     ("consolida rename do USN e suprime ruido do security log", CollapsesUsnRenameAndSuppressesSecurityNoise),
     ("consolida rename do USN mesmo com eventos intercalados", CollapsesUsnRenameWithInterleavedEvents),
@@ -30,6 +34,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline preserva acessos distintos em pastas", TimelineKeepsDistinctFolderAccess),
     ("timeline remove acesso gerado pelo proprio agente", TimelineSuppressesAgentSelfAccessNoise),
     ("timeline preserva criacao de pastas com arquivos filhos", TimelineKeepsFolderCreatesWithChildFiles),
+    ("timeline preserva pasta destino criada antes de receber arquivo movido", TimelineKeepsExplicitDestinationFolderCreateBeforeMove),
     ("timeline completa exclusao de descendentes conhecidos", TimelineSynthesizesKnownDescendantDeletes),
     ("timeline remove criacao tardia de pasta quando a arvore foi excluida", TimelineSuppressesLateFolderCreateEchoAroundDelete),
     ("timeline remove criacao tardia de arquivo quando a arvore foi excluida", TimelineSuppressesLateFileCreateEchoAroundDelete),
@@ -71,6 +76,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline remove modified imediato depois de criacao confirmada", TimelineSuppressesImmediateSecurityModifyAfterConfirmedCreate),
     ("timeline preserva alteracao real depois de criacao antes de exclusao", TimelineKeepsRealModificationAfterCreateBeforeDelete),
     ("timeline preserva acesso real depois de criacao antes de move", TimelineKeepsRealAccessAfterCreateBeforeMove),
+    ("timeline preserva acesso real mesmo com ecos tecnicos do move", TimelineKeepsRealAccessWithMoveSecurityEchoes),
     ("agente classifica saude operacional ok atencao e critico", AgentClassifiesOperationalHealth),
     ("mapa conhecido reloca descendentes quando a pasta e movida", KnownPathMapRelocatesFolderDescendants),
     ("fila duravel descarrega apenas o limite mantendo a ordem", DurableQueueFlushesWithinLimitAndPreservesOrder),
@@ -615,6 +621,43 @@ static void PreservesAccessWhenSecurityLogConfirmsRead()
     Assert(correlated.User == "EMPRESA\\maria.silva", "Acesso deveria herdar usuario do Security Log.");
 }
 
+static void PreservesRealReadSecondsAfterCreation()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var path = @"C:\Corporativo\cenario\arquivo-a.txt";
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("usn", timestamp, path, "UNKNOWN", "usn-journal", "fsutil.exe", action: "created", usn: 100, fileReferenceId: "file-a"),
+        BuildCollectedEvent("security", timestamp.AddMilliseconds(100), path, @"FILESERVER\Administrator", "security-log", "powershell.exe", action: "created_or_appended", recordId: 10),
+        BuildCollectedEvent("security", timestamp.AddSeconds(4), path, @"FILESERVER\Administrator", "security-log", "powershell.exe", action: "accessed", recordId: 11)
+    };
+
+    var correlated = correlator.Correlate(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    Assert(correlated.Any(item => item.CursorType == "usn" && item.Action == "created"), "Criacao deveria permanecer correlacionada.");
+    Assert(correlated.Any(item => item.RecordId == 11 && item.Action == "accessed"), "Leitura real posterior nao deveria ser consumida pela criacao.");
+}
+
+static void PreservesRealReadBeforeMove()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var originalPath = @"C:\Corporativo\cenario\Origem\arquivo-a.txt";
+    var movedPath = @"C:\Corporativo\cenario\Destino\arquivo-a.txt";
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, originalPath, @"FILESERVER\Administrator", "security-log", "powershell.exe", action: "accessed", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(4), originalPath, "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_old", usn: 100, fileReferenceId: "file-a"),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(4).AddMilliseconds(100), movedPath, "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed_new", usn: 101, fileReferenceId: "file-a")
+    };
+
+    var correlated = correlator.Correlate(events).OrderBy(item => item.TimestampUtc).ToArray();
+
+    Assert(correlated.Any(item => item.RecordId == 10 && item.Action == "accessed"), "Leitura anterior nao deveria ser consumida pela movimentacao.");
+    Assert(correlated.Any(item => item.CursorType == "usn" && item.Action == "moved"), "Movimentacao deveria continuar consolidada.");
+}
+
 static void PrefersSecurityWriteEvidenceOverAccessForModification()
 {
     var timestamp = DateTimeOffset.UtcNow;
@@ -646,6 +689,47 @@ static void PrefersBestPathMatch()
     var usn = correlator.Correlate(events).Single(item => item.CursorType == "usn");
 
     Assert(usn.User == "EMPRESA\\usuario.correto", "Correlacao deveria preferir caminho exato.");
+}
+
+static void DoesNotCorrelateSameLeafNameAcrossDifferentFolders()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var unrelatedPathScore = EventCorrelator.GetPathScore(
+        "C:/Corporativo/cenario/Origem",
+        "C:/OutroRecorte/Origem");
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, @"C:\OutroRecorte\Origem", @"EMPRESA\usuario.errado", "security-log", "explorer.exe", action: "accessed", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(1), @"C:\Corporativo\cenario\Origem", "UNKNOWN", "usn-journal", "fsutil.exe", action: "created", usn: 100, fileReferenceId: "folder-1")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var created = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(unrelatedPathScore == 0, "Mesmo nome final sem parentesco entre os caminhos nao deveria pontuar na correlacao.");
+    Assert(created.User == "UNKNOWN", "Mesmo nome final em outra pasta nao deveria atribuir usuario ao evento USN.");
+    Assert(created.Source == "usn-journal", "Caminhos sem relacao nao deveriam ser marcados como correlacionados.");
+    Assert(correlated.Any(item => item.RecordId == 10), "Evento de seguranca independente deveria permanecer disponivel.");
+}
+
+static void DoesNotCorrelateChildEventWithParentFolder()
+{
+    var timestamp = DateTimeOffset.UtcNow;
+    var parent = @"C:\Corporativo\cenario\Origem";
+    var child = $@"{parent}\arquivo-a.txt";
+    var correlator = new EventCorrelator(TimeSpan.FromSeconds(10));
+    var events = new[]
+    {
+        BuildCollectedEvent("security", timestamp, child, @"FILESERVER\Administrator", "security-log", "powershell.exe", action: "accessed", recordId: 10),
+        BuildCollectedEvent("usn", timestamp.AddSeconds(1), parent, "UNKNOWN", "usn-journal", "fsutil.exe", action: "renamed", usn: 100, fileReferenceId: "folder-1", previousPath: @"C:\Corporativo\cenario\Origem-Antiga")
+    };
+
+    var correlated = correlator.Correlate(events).ToArray();
+    var transition = correlated.Single(item => item.CursorType == "usn");
+
+    Assert(transition.User == "UNKNOWN", "Evento do arquivo filho nao deveria atribuir usuario a transicao da pasta.");
+    Assert(correlated.Any(item => item.RecordId == 10 && item.Action == "accessed"), "Acesso ao filho deveria permanecer independente.");
 }
 
 static void DoesNotCorrelateOutsideWindow()
@@ -1032,6 +1116,27 @@ static void TimelineKeepsFolderCreatesWithChildFiles()
     Assert(display.Any(item => item.Action == "created" && item.Path == nested), $"Criacao da subpasta deveria aparecer. Atual: {debug}");
     Assert(display.Any(item => item.Action == "created" && item.Path == sibling), $"Criacao da pasta irma deveria aparecer. Atual: {debug}");
     Assert(display.Count(item => item.Action == "created") == 8, $"Deveriam aparecer 4 pastas e 4 arquivos criados. Atual: {debug}");
+}
+
+static void TimelineKeepsExplicitDestinationFolderCreateBeforeMove()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T00:31:52Z");
+    var projector = new EventTimelineProjector();
+    var sourcePath = @"C:\Corporativo\cenario\Origem\arquivo-a.txt";
+    var destinationFolder = @"C:\Corporativo\cenario\Destino";
+    var destinationPath = $@"{destinationFolder}\arquivo-a.txt";
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", destinationFolder, objectType: "folder", source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(1), "created", sourcePath, source: "usn-journal", user: "UNKNOWN"),
+        BuildTimelineEvent(timestamp.AddSeconds(5), "moved", destinationPath, previousPath: sourcePath, source: "usn-journal+security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Any(item => item.Action == "created" && item.Path == destinationFolder), $"Pasta criada explicitamente deveria permanecer antes do move. Atual: {debug}");
+    Assert(display.Any(item => item.Action == "moved" && item.Path == destinationPath && item.PreviousPath == sourcePath), $"Move para a pasta criada deveria permanecer. Atual: {debug}");
 }
 
 static void TimelineSuppressesLateFolderCreateEchoAroundDelete()
@@ -2062,6 +2167,37 @@ static void TimelineKeepsRealAccessAfterCreateBeforeMove()
     Assert(display.Any(item => item.Action == "created" && item.Path == originalPath), $"Criacao inicial deveria permanecer visivel. Atual: {debug}");
     Assert(display.Any(item => item.Action == "accessed" && item.Path == originalPath), $"Acesso real antes do move nao deveria sumir como ruido. Atual: {debug}");
     Assert(display.Any(item => item.Action == "moved" && item.Path == movedPath && item.PreviousPath == originalPath), $"Move final deveria permanecer visivel. Atual: {debug}");
+}
+
+static void TimelineKeepsRealAccessWithMoveSecurityEchoes()
+{
+    var projector = new EventTimelineProjector();
+    var originalPath = @"C:\Corporativo\codex-mixed-real\Origem\arquivo-a.txt";
+    var movedPath = @"C:\Corporativo\codex-mixed-real\Destino\arquivo-a.txt";
+    var createdAt = DateTimeOffset.Parse("2026-07-18T00:20:51.000Z");
+    var events = new[]
+    {
+        BuildTimelineEvent(createdAt, "created", originalPath, source: "usn-journal"),
+        BuildTimelineEvent(createdAt.AddMilliseconds(80), "created_or_appended", originalPath, source: "windows-security-log"),
+        BuildTimelineEvent(createdAt.AddSeconds(4), "accessed", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(createdAt.AddSeconds(8), "moved", movedPath, previousPath: originalPath, source: "usn-journal+security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(createdAt.AddSeconds(8.76), "deleted", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(createdAt.AddSeconds(8.76), "accessed", originalPath, source: "windows-security-log", user: @"FILESERVER\Administrator"),
+        BuildTimelineEvent(createdAt.AddSeconds(20), "deleted", movedPath, source: "usn-journal+security-log", user: @"FILESERVER\Administrator")
+    };
+
+    var display = projector.BuildDisplayEvents(events)
+        .Where(item => item.Path == originalPath || item.Path == movedPath || item.PreviousPath == originalPath)
+        .OrderBy(item => item.TimestampUtc)
+        .ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Count(item => item.Action == "created" && item.Path == originalPath) == 1, $"Criacao inicial deveria permanecer unica. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "accessed" && item.Path == originalPath) == 1, $"Acesso real deveria permanecer e o eco tecnico sumir. Atual: {debug}");
+    Assert(display.Single(item => item.Action == "accessed").TimestampUtc == createdAt.AddSeconds(4), $"Acesso preservado deveria ser a leitura anterior ao move. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "moved" && item.Path == movedPath && item.PreviousPath == originalPath) == 1, $"Move deveria permanecer unico. Atual: {debug}");
+    Assert(display.Count(item => item.Action == "deleted" && item.Path == movedPath) == 1, $"Exclusao final deveria permanecer unica. Atual: {debug}");
+    Assert(display.Length == 4, $"Ciclo completo deveria exibir somente criacao, acesso, move e exclusao. Atual: {debug}");
 }
 
 static void TimelineKeepsRenameBetweenWindowsDefaultNames()

@@ -566,10 +566,34 @@ public sealed class EventCorrelator
             })
             .Where(item => item.TimeDistance <= _correlationWindow)
             .Where(item => item.PathScore > 0)
+            .Where(item => IsCompatibleSecurityEvidence(usnEvent, item.Event, item.TimeDistance, item.PathScore))
             .OrderByDescending(item => item.PathScore)
             .ThenBy(item => GetSecurityEvidencePriority(usnEvent, item.Event))
             .ThenBy(item => item.TimeDistance)
             .Select(item => item.Event);
+    }
+
+    private static bool IsCompatibleSecurityEvidence(
+        CollectedFileEvent usnEvent,
+        CollectedFileEvent securityEvent,
+        TimeSpan timeDistance,
+        int pathScore)
+    {
+        var isTransition = usnEvent.Action is "renamed" or "moved";
+        if (isTransition && securityEvent.Action.Equals("accessed", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (pathScore < 100)
+        {
+            var isTransitionEvidence = securityEvent.Action is "deleted" or "created_or_appended" or "modified";
+            return isTransition && isTransitionEvidence;
+        }
+
+        return !usnEvent.Action.Equals("created", StringComparison.OrdinalIgnoreCase)
+            || !securityEvent.Action.Equals("accessed", StringComparison.OrdinalIgnoreCase)
+            || timeDistance <= TimeSpan.FromSeconds(2);
     }
 
     private static int GetSecurityEvidencePriority(CollectedFileEvent usnEvent, CollectedFileEvent securityEvent)
@@ -633,15 +657,6 @@ public sealed class EventCorrelator
         if (usnPath.Equals(securityPath, StringComparison.OrdinalIgnoreCase))
         {
             return 100;
-        }
-
-        var usnFileName = Path.GetFileName(usnPath);
-        var securityFileName = Path.GetFileName(securityPath);
-
-        if (!string.IsNullOrWhiteSpace(usnFileName)
-            && usnFileName.Equals(securityFileName, StringComparison.OrdinalIgnoreCase))
-        {
-            return 60;
         }
 
         return securityPath.Contains(usnPath, StringComparison.OrdinalIgnoreCase)

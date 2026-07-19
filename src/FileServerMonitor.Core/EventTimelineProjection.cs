@@ -1589,7 +1589,8 @@ public sealed class EventTimelineProjector
             return true;
         }
 
-        if (IsLikelyFolderPath(item.Path))
+        if (IsLikelyFolderPath(item.Path)
+            && !item.Source.Contains("usn-journal", StringComparison.OrdinalIgnoreCase))
         {
             var folderPath = NormalizePath(item.Path);
             if (all.Any(candidate =>
@@ -1737,7 +1738,16 @@ public sealed class EventTimelineProjector
 
             if (candidate.Action == "accessed")
             {
+                var candidateIsTransitionEcho = all.Any(transition =>
+                    transition.Id != candidate.Id
+                    && transition.Action is "renamed" or "moved"
+                    && candidate.TimestampUtc >= transition.TimestampUtc
+                    && candidate.TimestampUtc - transition.TimestampUtc <= TimeSpan.FromSeconds(5)
+                    && (PathsReferToSameItem(transition.Path, candidate.Path)
+                        || PathsReferToSameItem(transition.PreviousPath, candidate.Path)));
+
                 return IsFileLikePath(item.Path)
+                    && !candidateIsTransitionEcho
                     && PathsReferToSameItem(candidate.Path, item.Path)
                     && NormalizeUser(candidate.User) == NormalizeUser(item.User)
                     && candidate.TimestampUtc > item.TimestampUtc
