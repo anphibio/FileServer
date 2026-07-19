@@ -3,15 +3,20 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
+  ArrowRight,
   BarChart3,
   Bell,
+  CalendarDays,
   CheckCircle2,
   ClipboardList,
   Clock3,
   Database,
   Download,
+  FileText,
   FileClock,
   Files,
+  Filter,
   FolderTree,
   HardDrive,
   KeyRound,
@@ -21,6 +26,7 @@ import {
   RefreshCcw,
   Search,
   Server,
+  SlidersHorizontal,
   ShieldCheck,
   ShieldAlert,
   ScanLine,
@@ -41,8 +47,6 @@ import {
 } from "./report-definitions";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
-const apiKey = import.meta.env.VITE_API_KEY ?? "";
-const actorName = import.meta.env.VITE_ACTOR_NAME ?? "";
 
 type HealthResponse = {
   service: string;
@@ -103,7 +107,54 @@ type RetentionConfig = {
   alertsDays: number;
   intervalHours: number;
   purgeBatchSize: number;
+  maxRowsPerRun: number;
   updatedUtc: string;
+};
+
+type RetentionRun = {
+  runId: string;
+  trigger: string;
+  status: string;
+  startedUtc: string;
+  completedUtc?: string | null;
+  deletedEvents: number;
+  deletedTimelineEvents: number;
+  deletedAlerts: number;
+  durationMs: number;
+  error?: string | null;
+};
+
+type RetentionStatus = {
+  running: boolean;
+  settings: RetentionConfig;
+  latestRun?: RetentionRun | null;
+  estimate: {
+    eligibleEvents: number;
+    eligibleTimelineEvents: number;
+    eligibleAlerts: number;
+    generatedUtc: string;
+  };
+  archive: {
+    available: boolean;
+    archiveRoot: string;
+    archiveFiles: number;
+    archivedRecords: number;
+    archivedBytes: number;
+    lastArchiveUtc?: string | null;
+    recentArchives: ColdArchiveManifest[];
+  };
+};
+
+type ColdArchiveManifest = {
+  archiveId: string;
+  runId: string;
+  dataset: string;
+  relativePath: string;
+  cutoffUtc: string;
+  recordCount: number;
+  fileSizeBytes: number;
+  sha256: string;
+  createdUtc: string;
 };
 
 type InventoryScanConfig = {
@@ -594,21 +645,43 @@ type Notice = {
 
 type GeneratedReport = {
   title: string;
+  scenarioId: ReportScenarioId | null;
   generatedAt: string;
   filtersSummary: string;
   events: DisplayEvent[];
+  totalEvents: number;
+  evidenceLimit: number;
+  evidenceLimitReached: boolean;
+  aggregateCoverage: "complete" | "sample";
   executiveSummary: string;
   highlights: string[];
   risks: string[];
   nextSteps: string[];
+  metrics: ReportMetric[];
+  timeBuckets: ReportTimeBucket[];
   topActions: Array<{ label: string; count: number }>;
   topUsers: Array<{ label: string; count: number }>;
   topPaths: Array<{ label: string; count: number }>;
+  topHosts: Array<{ label: string; count: number }>;
   sections: Array<{ title: string; items: string[] }>;
   inventorySummary?: InventorySummary | null;
+  activitySummary?: ActivitySummary | null;
+  baselineAnomalies?: BaselineAnomalyResponse | null;
 };
 
-type Tab = "dashboard" | "events" | "investigation" | "reports" | "inventory" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
+type ReportMetric = {
+  label: string;
+  value: string;
+  detail: string;
+  tone: "neutral" | "positive" | "warning" | "danger";
+};
+
+type ReportTimeBucket = {
+  label: string;
+  count: number;
+};
+
+type Tab = "dashboard" | "events" | "reports" | "inventory" | "alerts" | "agents" | "paths" | "capacity" | "audit" | "auth";
 type AccessRole = "admin" | "operator" | "reader";
 
 type AccessPolicy = {
@@ -843,9 +916,6 @@ function App() {
           <TabButton icon={<FileClock size={18} />} active={activeTab === "events"} onClick={() => setActiveTab("events")} meta={`${displayedEventCount.toLocaleString("pt-BR")}/${totalDisplayedEventCount.toLocaleString("pt-BR")}`}>
             Eventos
           </TabButton>
-          <TabButton icon={<Search size={18} />} active={activeTab === "investigation"} onClick={() => setActiveTab("investigation")} meta="até 500">
-            Investigação
-          </TabButton>
           <TabButton icon={<BarChart3 size={18} />} active={activeTab === "reports"} onClick={() => setActiveTab("reports")} meta="guiados">
             Relatórios
           </TabButton>
@@ -937,8 +1007,6 @@ function App() {
         {activeTab === "events" && (
           <EventsView events={visibleDisplayedEvents} filter={eventFilter} onFilterChange={setEventFilter} onNotify={setNotice} pagination={eventPagination} />
         )}
-
-        {activeTab === "investigation" && <InvestigationView onNotify={setNotice} />}
 
         {activeTab === "reports" && <ReportsView onNotify={setNotice} />}
 
@@ -1059,6 +1127,7 @@ function LoginPage({ onLogin }: { onLogin: (response: LoginResponse) => void }) 
 function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | null) => void; onChanged: () => void }) {
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [saving, setSaving] = useState(false);
+  const [activeConfigSection, setActiveConfigSection] = useState<"access" | "inventory" | "retention">("access");
 
   useEffect(() => {
     fetchJson<AuthConfig>("/api/auth/config")
@@ -1104,21 +1173,39 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
   }
 
   return (
-    <div className="view-stack auth-view">
-      <section className="auth-hero">
-        <div>
-          <span>Controle de acesso</span>
-          <h2>Autenticacao LDAP/AD</h2>
-          <p>Defina a conexao com o Active Directory, mapeie grupos administrativos e valide o acesso corporativo antes de liberar o uso.</p>
-        </div>
-        <div className="auth-status-grid">
-          <StatusCard label="Integracao" value={config.enabled ? "Ativa" : "Inativa"} detail="Estado atual do login corporativo" />
-          <StatusCard label="Configuracao" value={config.configurationStatus === "complete" ? "Completa" : "Incompleta"} detail="Host, base DN e grupos" />
-          <StatusCard label="Modo de login" value={config.enabled ? "LDAP/AD" : "Chave API"} detail="Admin local fica como contingencia" />
-        </div>
-      </section>
+    <div className="operations-workspace auth-view">
+      <WorkspaceHeader
+        icon={<LockKeyhole size={21} />}
+        eyebrow="Administração da plataforma"
+        title="Configuração operacional"
+        description="Centralize autenticação corporativa, varredura de inventário e política de retenção dos dados."
+        status={config.enabled && config.configurationStatus === "complete" ? "Acesso corporativo ativo" : "Configuração pendente"}
+        statusTone={config.enabled && config.configurationStatus === "complete" ? "neutral" : "attention"}
+        metrics={[
+          { label: "Autenticação", value: config.enabled ? "LDAP/AD" : "Chave API", detail: config.enabled ? "Login corporativo habilitado" : "Modo de contingência" },
+          { label: "Configuração AD", value: config.configurationStatus === "complete" ? "Completa" : "Incompleta", detail: "Host, Base DN e grupos" },
+          { label: "Transporte", value: `${config.security} : ${config.port}`, detail: config.validateTlsCertificate ? "Certificado TLS validado" : "Validação TLS desabilitada", tone: !config.validateTlsCertificate && config.security === "LDAPS" ? "attention" : "neutral" },
+          { label: "Última atualização", value: formatRelativeTime(config.updatedUtc), detail: formatDate(config.updatedUtc) }
+        ]}
+      />
 
-      <Panel title="Configuracao do acesso corporativo" subtitle="Preencha o servidor LDAP/AD, escolha o formato de autenticacao e informe os grupos que definem os perfis da aplicacao.">
+      <div className="workspace-tabs" role="tablist" aria-label="Áreas de configuração">
+        <button className={activeConfigSection === "access" ? "active" : ""} type="button" role="tab" aria-selected={activeConfigSection === "access"} onClick={() => setActiveConfigSection("access")}>
+          <KeyRound size={17} />
+          Acesso corporativo
+        </button>
+        <button className={activeConfigSection === "inventory" ? "active" : ""} type="button" role="tab" aria-selected={activeConfigSection === "inventory"} onClick={() => setActiveConfigSection("inventory")}>
+          <ScanLine size={17} />
+          Inventário
+        </button>
+        <button className={activeConfigSection === "retention" ? "active" : ""} type="button" role="tab" aria-selected={activeConfigSection === "retention"} onClick={() => setActiveConfigSection("retention")}>
+          <Database size={17} />
+          Retenção
+        </button>
+      </div>
+
+      {activeConfigSection === "access" && (
+      <Panel title="Configuração do acesso corporativo" subtitle="Defina o servidor LDAP/AD e os grupos responsáveis por cada perfil da aplicação.">
         <form className="auth-form" onSubmit={submit}>
           <label className="check-row">
             <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
@@ -1198,14 +1285,15 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
 
           <button className="primary-button" type="submit" disabled={saving}>
             <KeyRound size={18} />
-            {saving ? "Salvando..." : "Salvar configuracao"}
+            {saving ? "Salvando..." : "Salvar configuração"}
           </button>
         </form>
       </Panel>
+      )}
 
-      <InventoryScanConfigPanel onNotify={onNotify} />
+      {activeConfigSection === "inventory" && <InventoryScanConfigPanel onNotify={onNotify} />}
 
-      <RetentionConfigPanel onNotify={onNotify} />
+      {activeConfigSection === "retention" && <RetentionConfigPanel onNotify={onNotify} />}
     </div>
   );
 }
@@ -1275,14 +1363,14 @@ function InventoryScanConfigPanel({ onNotify }: { onNotify: (notice: Notice | nu
   }
 
   if (!config) {
-    return <Panel title="Inventário gerencial" subtitle="Carregando configuracao de scan..." />;
+    return <Panel title="Inventário gerencial" subtitle="Carregando configuração do scan..." />;
   }
 
   return (
     <Panel title="Inventário gerencial" subtitle="Controle a varredura da estrutura de arquivos para indicadores de governança e capacidade.">
       <form className="auth-form retention-form" onSubmit={submit}>
         <div className="retention-summary">
-          <StatusCard label="Estado" value={config.enabled ? "Ativo" : "Inativo"} detail={config.enabled ? "Agentes podem executar o scan" : "Nenhum scan automatico sera solicitado"} />
+          <StatusCard label="Estado" value={config.enabled ? "Ativo" : "Inativo"} detail={config.enabled ? "Agentes podem executar o scan" : "Nenhum scan automático será solicitado"} />
           <StatusCard label="Raiz" value={config.rootPath || "Nao definida"} detail={`${config.server || "Servidor"} · ${config.share || "Share"}`} />
           <StatusCard label="Agenda" value={`${config.intervalHours} h`} detail={config.windowStartLocal || config.windowEndLocal ? `${config.windowStartLocal || "00:00"} ate ${config.windowEndLocal || "23:59"}` : "Sem janela fixa"} />
         </div>
@@ -1359,11 +1447,19 @@ function InventoryScanConfigPanel({ onNotify }: { onNotify: (notice: Notice | nu
 
 function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
   const [config, setConfig] = useState<RetentionConfig | null>(null);
+  const [status, setStatus] = useState<RetentionStatus | null>(null);
   const [saving, setSaving] = useState(false);
+  const [running, setRunning] = useState(false);
 
   useEffect(() => {
-    fetchJson<RetentionConfig>("/api/retention/config")
-      .then(setConfig)
+    Promise.all([
+      fetchJson<RetentionConfig>("/api/retention/config"),
+      fetchJson<RetentionStatus>("/api/retention/status")
+    ])
+      .then(([loadedConfig, loadedStatus]) => {
+        setConfig(loadedConfig);
+        setStatus(loadedStatus);
+      })
       .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar retencao." }));
   }, [onNotify]);
 
@@ -1399,22 +1495,101 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
     }
   }
 
-  if (!config) {
-    return <Panel title="Retencao de dados" subtitle="Carregando politica de limpeza..." />;
+  async function runNow() {
+    if (!config) {
+      return;
+    }
+
+    setRunning(true);
+    try {
+      const saveResponse = await fetch(`${apiBaseUrl}/api/retention/config`, {
+        method: "PUT",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify(config)
+      });
+      if (!saveResponse.ok) {
+        throw new Error(await readErrorMessage(saveResponse, "Nao foi possivel salvar a politica antes da execucao."));
+      }
+      setConfig((await saveResponse.json()) as RetentionConfig);
+
+      const response = await fetch(`${apiBaseUrl}/api/retention/run`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel executar a retencao."));
+      }
+      const latestRun = (await response.json()) as RetentionRun;
+      const refreshed = await fetchJson<RetentionStatus>("/api/retention/status");
+      setStatus({ ...refreshed, latestRun });
+      onNotify({
+        tone: latestRun.status === "completed" ? "success" : "danger",
+        message: latestRun.status === "completed"
+          ? `Retencao concluida: ${(latestRun.deletedEvents + latestRun.deletedTimelineEvents + latestRun.deletedAlerts).toLocaleString("pt-BR")} registro(s) arquivado(s) e removido(s).`
+          : latestRun.error || "A execucao de retencao falhou."
+      });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel executar a retencao." });
+    } finally {
+      setRunning(false);
+    }
   }
 
+  async function downloadArchive(archive: ColdArchiveManifest) {
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/retention/archives/${archive.archiveId}/download`, {
+        headers: buildJsonHeaders()
+      });
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel baixar o arquivo frio."));
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = archive.relativePath.split("/").at(-1) || `${archive.archiveId}.jsonl.gz`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel baixar o arquivo frio." });
+    }
+  }
+
+  if (!config) {
+    return <Panel title="Retenção de dados" subtitle="Carregando política de limpeza..." />;
+  }
+
+  const eligibleRows = status
+    ? status.estimate.eligibleEvents + status.estimate.eligibleTimelineEvents + status.estimate.eligibleAlerts
+    : 0;
+  const latest = status?.latestRun;
+  const lastDeleted = latest
+    ? latest.deletedEvents + latest.deletedTimelineEvents + latest.deletedAlerts
+    : 0;
+  const latestStatusLabel = latest?.status === "completed"
+    ? "Concluída"
+    : latest?.status === "failed"
+      ? "Falhou"
+      : latest?.status === "cancelled"
+        ? "Cancelada"
+        : latest?.status || "Ainda não executada";
+
   return (
-    <Panel title="Retencao de dados" subtitle="Controle quanto tempo eventos brutos, linha do tempo correlacionada e alertas ficam no banco.">
+    <Panel title="Retenção e arquivo frio" subtitle="Arquive evidências antigas com integridade verificável antes de removê-las das tabelas operacionais.">
       <form className="auth-form retention-form" onSubmit={submit}>
         <div className="retention-summary">
-          <StatusCard label="Estado" value={config.enabled ? "Ativa" : "Inativa"} detail={config.enabled ? "Limpeza automatica em execucao" : "Banco mantem os dados sem purga automatica"} />
-          <StatusCard label="Linha do tempo" value={`${config.timelineDays} dias`} detail="Eventos correlacionados usados por telas e relatorios" />
-          <StatusCard label="Execucao" value={`${config.intervalHours} h`} detail={`Lotes de ate ${config.purgeBatchSize.toLocaleString("pt-BR")} registros`} />
+          <StatusCard label="Estado" value={config.enabled ? "Ativa" : "Inativa"} detail={config.enabled ? "Limpeza automática em execução" : "Banco mantém os dados sem purga automática"} />
+          <StatusCard label="Elegíveis agora" value={eligibleRows.toLocaleString("pt-BR")} detail="Brutos, timeline e alertas fora da janela configurada" />
+          <StatusCard label="Arquivo frio" value={status?.archive.available ? formatBytes(status.archive.archivedBytes) : "Indisponível"} detail={status?.archive.available ? `${status.archive.archivedRecords.toLocaleString("pt-BR")} registros em ${status.archive.archiveFiles.toLocaleString("pt-BR")} arquivo(s)` : "A purga será bloqueada sem armazenamento persistente"} />
+          <StatusCard label="Última execução" value={latestStatusLabel} detail={latest ? `${lastDeleted.toLocaleString("pt-BR")} arquivados e removidos em ${formatDurationMs(latest.durationMs)}` : `Execução automática a cada ${config.intervalHours} h`} />
         </div>
 
         <label className="check-row">
           <input type="checkbox" checked={config.enabled} onChange={(event) => update("enabled", event.target.checked)} />
-          Habilitar limpeza automatica
+          Habilitar arquivamento e limpeza automática
         </label>
 
         <div className="form-grid five">
@@ -1438,18 +1613,63 @@ function RetentionConfigPanel({ onNotify }: { onNotify: (notice: Notice | null) 
             Lote maximo
             <input value={config.purgeBatchSize} onChange={(event) => update("purgeBatchSize", Number(event.target.value))} inputMode="numeric" min={100} max={100000} step={100} type="number" />
           </label>
+          <label>
+            Limite por conjunto
+            <input value={config.maxRowsPerRun} onChange={(event) => update("maxRowsPerRun", Number(event.target.value))} inputMode="numeric" min={1000} max={5000000} step={1000} type="number" />
+          </label>
         </div>
 
         <div className="auth-badges">
           <span className="badge info">Relatorios usam timeline persistida</span>
-          <span className="badge neutral">Limpeza em lotes para reduzir impacto</span>
+          <span className="badge neutral">Arquivo JSONL compactado com SHA-256</span>
+          <span className="badge neutral">Remoção somente após manifesto transacional</span>
+          <span className="badge neutral">Teto de {config.maxRowsPerRun.toLocaleString("pt-BR")} por tabela e execução</span>
           <span className="badge low">Atualizado em {formatDate(config.updatedUtc)}</span>
         </div>
 
-        <button className="primary-button" type="submit" disabled={saving}>
-          <Database size={18} />
-          {saving ? "Salvando..." : "Salvar retencao"}
-        </button>
+        {latest && (
+          <div className={`sync-banner ${latest.status === "failed" ? "danger" : ""}`}>
+            Última execução {latest.trigger === "manual" ? "manual" : "automática"} em {formatDate(latest.startedUtc)}: {latest.deletedEvents.toLocaleString("pt-BR")} brutos, {latest.deletedTimelineEvents.toLocaleString("pt-BR")} correlacionados e {latest.deletedAlerts.toLocaleString("pt-BR")} alertas arquivados e removidos.
+            {latest.error ? ` ${latest.error}` : ""}
+          </div>
+        )}
+
+        {status?.archive.recentArchives.length ? (
+          <section className="retention-archive-history" aria-label="Arquivos frios recentes">
+            <div className="retention-archive-heading">
+              <div>
+                <span>ARQUIVOS RECENTES</span>
+                <strong>Evidências disponíveis para auditoria</strong>
+              </div>
+              <small>Volume: {status.archive.archiveRoot}</small>
+            </div>
+            <div className="retention-archive-list">
+              {status.archive.recentArchives.map((archive) => (
+                <article key={archive.archiveId}>
+                  <div>
+                    <strong>{archive.dataset === "events" ? "Eventos brutos" : archive.dataset === "timeline" ? "Linha do tempo" : "Alertas"}</strong>
+                    <span>{archive.recordCount.toLocaleString("pt-BR")} registros · {formatBytes(archive.fileSizeBytes)} · {formatDate(archive.createdUtc)}</span>
+                    <code title={archive.sha256}>SHA-256 {archive.sha256.slice(0, 16)}…</code>
+                  </div>
+                  <button className="icon-button" type="button" onClick={() => void downloadArchive(archive)} title="Baixar arquivo frio" aria-label="Baixar arquivo frio">
+                    <Download size={18} />
+                  </button>
+                </article>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        <div className="form-actions">
+          <button className="secondary-button" type="button" onClick={runNow} disabled={running || status?.running || saving}>
+            <RefreshCcw size={18} />
+            {running || status?.running ? "Arquivando..." : "Arquivar agora"}
+          </button>
+          <button className="primary-button" type="submit" disabled={saving || running}>
+            <Database size={18} />
+            {saving ? "Salvando..." : "Salvar retencao"}
+          </button>
+        </div>
       </form>
     </Panel>
   );
@@ -1462,6 +1682,59 @@ function StatusCard({ label, value, detail }: { label: string; value: string; de
       <strong>{value}</strong>
       <p>{detail}</p>
     </article>
+  );
+}
+
+type WorkspaceMetric = {
+  label: string;
+  value: React.ReactNode;
+  detail: string;
+  tone?: "neutral" | "attention" | "critical";
+};
+
+function WorkspaceHeader({
+  icon,
+  eyebrow,
+  title,
+  description,
+  status,
+  statusTone = "neutral",
+  metrics,
+  actions
+}: {
+  icon: React.ReactNode;
+  eyebrow: string;
+  title: string;
+  description: string;
+  status?: string;
+  statusTone?: "neutral" | "attention" | "critical";
+  metrics: WorkspaceMetric[];
+  actions?: React.ReactNode;
+}) {
+  return (
+    <section className="workspace-header">
+      <div className="workspace-header-heading">
+        <div className="workspace-header-icon">{icon}</div>
+        <div>
+          <span>{eyebrow}</span>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+      </div>
+      <div className="workspace-header-actions">
+        {status && <span className={`workspace-status ${statusTone}`}>{status}</span>}
+        {actions}
+      </div>
+      <div className="workspace-metric-strip">
+        {metrics.map((metric) => (
+          <article className={metric.tone && metric.tone !== "neutral" ? metric.tone : ""} key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+            <small>{metric.detail}</small>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -1493,47 +1766,94 @@ function Dashboard({
   const latestEvents = displayEvents.slice(0, 8);
   const highestAnomaly = getHighestAnomaly(baselineAnomalies);
   const posture = getOperationalPosture(openAlerts.length, criticalAlerts.length, offlineAgents.length, highestAnomaly);
+  const timeline = health?.timeline;
+  const pendingTimelineJobs = (timeline?.pendingJobs ?? 0) + (timeline?.processingJobs ?? 0) + (timeline?.retryingJobs ?? 0);
+  const timelineStatus = timeline?.status?.toLowerCase();
+  const timelineStatusHealthy = !timelineStatus || ["ok", "healthy", "ready"].includes(timelineStatus);
+  const timelineNeedsAttention = Boolean(timeline?.error) || pendingTimelineJobs > 0 || !timelineStatusHealthy;
+  const highestAnomalyLabel = highestAnomaly ? formatOperationalDimension(highestAnomaly.name) : null;
+  const highestAnomalyChange = highestAnomaly ? formatAnomalyChange(highestAnomaly) : null;
+  const highestAnomalyHasUnknownActor = highestAnomaly?.name.trim().toUpperCase() === "UNKNOWN";
+  const operationalPriority = criticalAlerts.length > 0
+    ? {
+        title: "Tratar alertas críticos",
+        detail: `${criticalAlerts.length.toLocaleString("pt-BR")} ocorrência(s) exigem validação imediata na fila de alertas.`
+      }
+    : offlineAgents.length > 0
+      ? {
+          title: "Restabelecer a coleta",
+          detail: `${offlineAgents.length.toLocaleString("pt-BR")} agente(s) estão em atenção e podem comprometer a cobertura.`
+        }
+      : timelineNeedsAttention
+        ? {
+            title: "Acompanhar a materialização",
+            detail: `${pendingTimelineJobs.toLocaleString("pt-BR")} trabalho(s) aguardam conclusão na timeline.`
+          }
+        : highestAnomalyHasUnknownActor
+          ? {
+              title: "Revisar eventos sem atribuição",
+              detail: `${highestAnomaly?.currentCount.toLocaleString("pt-BR")} evento(s) não possuem usuário identificado no recorte atual.`
+            }
+        : (highestAnomaly?.deltaPercent ?? 0) > 150
+          ? {
+              title: "Contextualizar o maior desvio",
+              detail: `${highestAnomalyLabel ?? "O comportamento observado"} está acima da referência recente e merece validação operacional.`
+            }
+        : {
+            title: "Manter acompanhamento",
+            detail: "Coleta e materialização sem pressão operacional relevante neste momento."
+          };
   const updateFilter = (field: keyof ActivitySummaryFilters, value: string) => {
     onSummaryFiltersChange({ ...summaryFilters, [field]: value });
   };
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Postura Atual"
-          value={posture.label}
-          detail={posture.detail}
-          tone={posture.tone}
-        />
-        <ExecutiveCard
-          title="Maior Desvio"
-          value={highestAnomaly?.name ?? "Sem desvio forte"}
-          detail={
-            highestAnomaly
-              ? `${highestAnomaly.currentCount.toLocaleString("pt-BR")} agora vs ${highestAnomaly.baselineAverage.toLocaleString("pt-BR")} na média`
-              : "O período atual está próximo do histórico recente."
-          }
-          tone={highestAnomaly && highestAnomaly.deltaPercent > 100 ? "danger" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Janela Analisada"
-          value={labelForPeriod(summaryFilters.periodHours)}
-          detail={buildFilterSummary(summaryFilters)}
-          tone="neutral"
-        />
+    <div className="dashboard-workspace">
+      <section className="dashboard-command-center">
+        <div className="dashboard-command-heading">
+          <div className="dashboard-command-icon"><Activity size={21} /></div>
+          <div>
+            <span>Centro de controle</span>
+            <h2>Visão operacional do ambiente</h2>
+            <p>Acompanhe cobertura, pressão de alertas e mudanças de comportamento numa leitura única.</p>
+          </div>
+        </div>
+        <span className={`dashboard-posture ${posture.tone}`}>{posture.label}</span>
+
+        <div className="dashboard-headline-strip">
+          <article>
+            <span>Eventos catalogados</span>
+            <strong>{(health?.storedEvents ?? events.length).toLocaleString("pt-BR")}</strong>
+            <small>{(activitySummary?.totalEvents ?? 0).toLocaleString("pt-BR")} no período</small>
+          </article>
+          <article className={openAlerts.length > 0 ? "attention" : ""}>
+            <span>Alertas abertos</span>
+            <strong>{openAlerts.length.toLocaleString("pt-BR")}</strong>
+            <small>{criticalAlerts.length.toLocaleString("pt-BR")} críticos</small>
+          </article>
+          <article className={offlineAgents.length > 0 ? "attention" : ""}>
+            <span>Agentes em atenção</span>
+            <strong>{offlineAgents.length.toLocaleString("pt-BR")}</strong>
+            <small>{offlineAgents.length === 0 ? "Cobertura operacional estável" : "Revisar saúde da coleta"}</small>
+          </article>
+          <article className={timelineNeedsAttention ? "attention" : ""}>
+            <span>Fila da timeline</span>
+            <strong>{pendingTimelineJobs.toLocaleString("pt-BR")}</strong>
+            <small>{timelineNeedsAttention ? "Materialização requer acompanhamento" : "Processamento em dia"}</small>
+          </article>
+        </div>
       </section>
 
-      <section className="metrics-grid">
-        <Metric icon={<Database size={20} />} label="Eventos" value={health?.storedEvents ?? events.length} tone="neutral" />
-        <Metric icon={<AlertTriangle size={20} />} label="Alertas abertos" value={openAlerts.length} tone="warning" />
-        <Metric icon={<ShieldAlert size={20} />} label="Críticos" value={criticalAlerts.length} tone="danger" />
-        <Metric icon={<Server size={20} />} label="Agentes atenção" value={offlineAgents.length} tone="neutral" />
-        <Metric icon={<BarChart3 size={20} />} label="Eventos no período" value={activitySummary?.totalEvents ?? 0} tone="neutral" />
-      </section>
-
-      <Panel title="Filtros do Relatório" subtitle="Use um mesmo recorte para acompanhar volume, anomalias e exportações.">
-        <div className="report-filters">
+      <section className="dashboard-filter-panel">
+        <div className="dashboard-section-heading">
+          <div>
+            <span>Escopo do painel</span>
+            <h3>{labelForPeriod(summaryFilters.periodHours)}</h3>
+            <p>{buildFilterSummary(summaryFilters)}</p>
+          </div>
+          <Filter size={20} />
+        </div>
+        <div className="dashboard-filter-grid">
           <label>
             <span>Período</span>
             <select value={summaryFilters.periodHours} onChange={(event) => updateFilter("periodHours", event.target.value)}>
@@ -1569,7 +1889,9 @@ function Dashboard({
             </select>
           </label>
         </div>
-        <div className="toolbar export-toolbar">
+        <div className="dashboard-filter-actions">
+          <small>Os filtros vazios consideram todo o ambiente monitorado.</small>
+          <div>
           <button className="text-button" type="button" onClick={() => downloadAlertsCsv(openAlerts, onNotify)}>
             <Download size={16} />
             Exportar Alertas
@@ -1578,40 +1900,102 @@ function Dashboard({
             <Download size={16} />
             Exportar Anomalias
           </button>
+          </div>
         </div>
-      </Panel>
+      </section>
 
-      <section className="analytics-grid">
+      <section className="dashboard-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <span>Prioridades agora</span>
+            <h3>O que merece atenção primeiro</h3>
+            <p>Sinais consolidados para orientar a próxima ação operacional.</p>
+          </div>
+        </div>
+        <div className="dashboard-priority-grid">
+          <article className={`dashboard-priority-card ${posture.tone}`}>
+            <span>Recomendação operacional</span>
+            <strong>{operationalPriority.title}</strong>
+            <p>{operationalPriority.detail}</p>
+            <small>{posture.detail}</small>
+          </article>
+          <Panel title="Maior desvio observado" subtitle="Comparação com a média dos sete períodos anteriores.">
+            <div className="dashboard-focus-value">
+              <strong>{highestAnomalyLabel ?? "Sem desvio relevante"}</strong>
+              <span>{highestAnomalyChange ?? "Estável"}</span>
+              <p>{highestAnomaly ? `${highestAnomaly.currentCount.toLocaleString("pt-BR")} agora, ante média de ${highestAnomaly.baselineAverage.toLocaleString("pt-BR")}.` : "O comportamento atual permanece próximo do histórico recente."}</p>
+              {highestAnomalyHasUnknownActor && <small>Eventos em que as fontes coletadas não permitiram atribuir uma identidade confiável.</small>}
+            </div>
+          </Panel>
+          <Panel title="Saúde da timeline" subtitle="Persistência dos eventos correlacionados para consulta e relatório.">
+            <dl className="dashboard-runtime-list">
+              <div><dt>Status</dt><dd className={timelineNeedsAttention ? "attention" : "ok"}>{formatTimelineStatus(timeline?.status)}</dd></div>
+              <div><dt>Pendentes</dt><dd>{pendingTimelineJobs.toLocaleString("pt-BR")}</dd></div>
+              <div><dt>Maior espera</dt><dd>{timeline?.oldestJobAgeSeconds ? formatElapsedSeconds(timeline.oldestJobAgeSeconds) : "Sem espera"}</dd></div>
+              <div><dt>Consulta</dt><dd>{timeline?.queryDurationMs?.toLocaleString("pt-BR") ?? 0} ms</dd></div>
+            </dl>
+          </Panel>
+        </div>
+      </section>
+
+      <section className="dashboard-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <span>Atividade no período</span>
+            <h3>Onde a movimentação está concentrada</h3>
+            <p>Distribuição por ação, compartilhamento e usuário no escopo selecionado.</p>
+          </div>
+        </div>
+        <div className="dashboard-analysis-grid">
         <Panel title="Top Ações" subtitle="Volume concentrado no período selecionado.">
-          <SummaryBars items={activitySummary?.byAction ?? []} />
+          <SummaryBars items={(activitySummary?.byAction ?? []).map((item) => ({ ...item, name: formatAction(item.name) }))} />
         </Panel>
         <Panel title="Top Shares" subtitle="Compartilhamentos com mais atividade recente.">
           <SummaryBars items={activitySummary?.byShare ?? []} />
         </Panel>
         <Panel title="Top Usuários" subtitle="Usuários mais presentes no recorte atual.">
-          <SummaryBars items={activitySummary?.byUser ?? []} />
+          <SummaryBars items={(activitySummary?.byUser ?? []).map((item) => ({ ...item, name: formatOperationalDimension(item.name) }))} />
         </Panel>
+        </div>
       </section>
 
-      <section className="analytics-grid">
+      <section className="dashboard-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <span>Desvios do padrão</span>
+            <h3>Mudanças que pedem contexto</h3>
+            <p>Variações em relação ao comportamento recente, sem confundir desvio com incidente.</p>
+          </div>
+        </div>
+        <div className="dashboard-analysis-grid">
         <Panel title="Anomalias por Ação" subtitle="Comparação com a média dos 7 períodos anteriores.">
-          <BaselineList items={baselineAnomalies?.byAction ?? []} />
+          <BaselineList items={(baselineAnomalies?.byAction ?? []).map((item) => ({ ...item, name: formatAction(item.name) }))} />
         </Panel>
         <Panel title="Anomalias por Share" subtitle="Desvios de comportamento por compartilhamento.">
           <BaselineList items={baselineAnomalies?.byShare ?? []} />
         </Panel>
         <Panel title="Anomalias por Usuário" subtitle="Usuários acima do padrão recente.">
-          <BaselineList items={baselineAnomalies?.byUser ?? []} />
+          <BaselineList items={(baselineAnomalies?.byUser ?? []).map((item) => ({ ...item, name: formatOperationalDimension(item.name) }))} />
         </Panel>
+        </div>
       </section>
 
-      <section className="split-grid">
+      <section className="dashboard-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <span>Últimos acontecimentos</span>
+            <h3>Contexto operacional recente</h3>
+            <p>Eventos correlacionados e alertas ainda abertos para investigação.</p>
+          </div>
+        </div>
+        <div className="dashboard-recent-grid">
         <Panel title="Eventos Recentes" subtitle="Linha curta para leitura operacional rápida.">
           <EventTable events={latestEvents} compact />
         </Panel>
         <Panel title="Alertas Recentes" subtitle="Itens abertos mais recentes e mais acionáveis.">
           <AlertList alerts={openAlerts.slice(0, 8)} />
         </Panel>
+        </div>
       </section>
     </div>
   );
@@ -1654,10 +2038,7 @@ function BaselineList({ items }: { items: BaselineAnomalyItem[] }) {
               {item.currentCount.toLocaleString("pt-BR")} vs {item.baselineAverage.toLocaleString("pt-BR")}
             </span>
           </div>
-          <small className={item.deltaPercent > 100 ? "anomaly-high" : "anomaly-medium"}>
-            {item.deltaPercent > 0 ? "+" : ""}
-            {item.deltaPercent.toFixed(0)}%
-          </small>
+          <small className={item.deltaPercent > 100 ? "anomaly-high" : "anomaly-medium"}>{formatAnomalyChange(item)}</small>
         </div>
       ))}
     </div>
@@ -1677,9 +2058,27 @@ function EventsView({
   onNotify: (notice: Notice | null) => void;
   pagination: PaginationState;
 }) {
+  const latestEvent = events[0];
+  const identifiedUsers = new Set(events.map((event) => event.user).filter((user) => user && user.toUpperCase() !== "UNKNOWN")).size;
+
   return (
-    <div className="view-stack">
-      <div className="toolbar">
+    <div className="operations-workspace events-workspace">
+      <WorkspaceHeader
+        icon={<FileClock size={21} />}
+        eyebrow="Linha do tempo operacional"
+        title="Eventos correlacionados"
+        description="Consulte as ações já consolidadas pelo Core, com autoria, origem e transições de caminho preservadas."
+        status={events.length > 0 ? "Timeline atualizada" : "Sem eventos no recorte"}
+        statusTone={events.length > 0 ? "neutral" : "attention"}
+        metrics={[
+          { label: "Eventos no recorte", value: pagination.totalItems.toLocaleString("pt-BR"), detail: `${pagination.totalPages.toLocaleString("pt-BR")} página(s) disponível(is)` },
+          { label: "Página atual", value: `${pagination.page.toLocaleString("pt-BR")} / ${pagination.totalPages.toLocaleString("pt-BR")}`, detail: `${events.length.toLocaleString("pt-BR")} evento(s) em exibição` },
+          { label: "Usuários identificados", value: identifiedUsers.toLocaleString("pt-BR"), detail: "No conjunto visível desta página" },
+          { label: "Evento mais recente", value: latestEvent ? formatRelativeTime(latestEvent.timestampUtc) : "Sem registro", detail: latestEvent ? formatDate(latestEvent.timestampUtc) : "Aguardando coleta" }
+        ]}
+      />
+
+      <section className="workspace-control-bar">
         <label className="search-box">
           <Search size={18} />
           <input
@@ -1692,8 +2091,8 @@ function EventsView({
           <Download size={16} />
           Exportar CSV
         </button>
-      </div>
-      <Panel title="Linha do Tempo">
+      </section>
+      <Panel title="Linha do tempo" subtitle="Ordenada do evento mais recente para o mais antigo no recorte carregado.">
         <EventTable events={events} pagination={pagination} />
       </Panel>
     </div>
@@ -1867,30 +2266,36 @@ function InvestigationView({ onNotify }: { onNotify: (notice: Notice | null) => 
 }
 
 function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }) {
+  const [workspaceStep, setWorkspaceStep] = useState<"library" | "configure" | "result">("library");
   const [mode, setMode] = useState<"guided" | "custom">("guided");
   const [selectedScenario, setSelectedScenario] = useState<ReportScenarioId>("folder-activity");
+  const [selectedCategory, setSelectedCategory] = useState("Executivo");
+  const [scenarioSearch, setScenarioSearch] = useState("");
   const [filters, setFilters] = useState<ReportFilters>(createFiltersForScenario("folder-activity"));
   const [events, setEvents] = useState<DisplayEvent[]>([]);
-  const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generatedReport, setGeneratedReport] = useState<GeneratedReport | null>(null);
-  const [activeReportResultTab, setActiveReportResultTab] = useState<"summary" | "timeline" | "groups">("summary");
+  const [activeReportResultTab, setActiveReportResultTab] = useState<"executive" | "operational" | "evidence">("executive");
   const [showAdvancedReportFilters, setShowAdvancedReportFilters] = useState(false);
   const [page, setPage] = useState(1);
   const scenario = getReportScenario(selectedScenario);
-  const reportTitle = mode === "guided" ? scenario.title : "Relatorio personalizado";
+  const reportTitle = mode === "guided" ? scenario.title : "Relatório personalizado";
+  const scenarioGroups = useMemo(() => groupReportScenariosByCategory(reportScenarios), []);
+  const visibleScenarios = useMemo(() => {
+    const normalizedSearch = scenarioSearch.trim().toLocaleLowerCase("pt-BR");
+    if (normalizedSearch) {
+      return reportScenarios.filter((item) => `${item.title} ${item.description} ${item.focus}`.toLocaleLowerCase("pt-BR").includes(normalizedSearch));
+    }
+
+    return scenarioGroups.find((group) => group.category === selectedCategory)?.items ?? [];
+  }, [scenarioGroups, scenarioSearch, selectedCategory]);
   const totalPages = Math.max(1, Math.ceil(events.length / EVENTS_PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const visibleEvents = useMemo(
     () => events.slice((safePage - 1) * EVENTS_PAGE_SIZE, safePage * EVENTS_PAGE_SIZE),
     [events, safePage]
   );
-  const groupedRows = useMemo(() => buildReportGroups(events, filters.groupBy), [events, filters.groupBy]);
-  const reportScenarioGroups = useMemo(() => groupReportScenariosByCategory(reportScenarios), []);
-  const uniqueUsers = useMemo(() => new Set(events.map((event) => event.user).filter(Boolean)).size, [events]);
-  const affectedPaths = useMemo(() => new Set(events.map((event) => event.path).filter(Boolean)).size, [events]);
-  const dominantAction = useMemo(() => getTopEventAction(events), [events]);
 
   useEffect(() => {
     setPage((current) => Math.min(current, totalPages));
@@ -1901,385 +2306,265 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
     setMode("guided");
     setFilters(createFiltersForScenario(id));
     setGeneratedReport(null);
-    setActiveReportResultTab("summary");
+    setActiveReportResultTab("executive");
     setError(null);
+    setWorkspaceStep("configure");
   }
 
   function startCustomReport() {
     setMode("custom");
     setFilters(createDefaultReportFilters());
     setGeneratedReport(null);
-    setActiveReportResultTab("summary");
+    setActiveReportResultTab("executive");
     setError(null);
+    setWorkspaceStep("configure");
   }
 
-  async function loadReportEventsForCurrentFilters(options: { showNotice: boolean; activateTimeline: boolean }) {
-    const result = await fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, getReportEventTake(mode === "guided" ? selectedScenario : null)));
-    setEvents(result);
-    setPage(1);
-    setSearched(true);
-
-    if (options.activateTimeline) {
-      setActiveReportResultTab("timeline");
-    }
-
-    if (options.showNotice) {
-      onNotify({
-        tone: result.length > 0 ? "success" : "warning",
-        message: result.length > 0
-          ? `Relatorio atualizado com ${result.length.toLocaleString("pt-BR")} evento(s).`
-          : "Nenhum evento encontrado para este recorte."
-      });
-    }
-
-    return result;
-  }
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
+  async function executeAnalysis(event?: React.FormEvent) {
+    event?.preventDefault();
     if (!validateReportFilters(filters, setError, onNotify)) {
       return;
     }
 
+    const scenarioId = mode === "guided" ? selectedScenario : null;
+    const evidenceLimit = getReportEventTake(scenarioId);
     setLoading(true);
     setError(null);
-    setGeneratedReport(null);
 
     try {
-      await loadReportEventsForCurrentFilters({ showNotice: true, activateTimeline: true });
-    } catch (searchError) {
-      setError(searchError instanceof Error ? searchError.message : "Falha ao consultar relatorio.");
-    } finally {
-      setLoading(false);
-    }
-  }
+      const [reportEvents, [inventoryResult, summaryResult, anomaliesResult]] = await Promise.all([
+        fetchJson<DisplayEvent[]>(buildReportEventsUrl(filters, evidenceLimit), {
+          timeoutMs: 120_000,
+          timeoutMessage: "A análise excedeu 2 minutos. Reduza o período ou aplique mais filtros e tente novamente."
+        }),
+        Promise.allSettled([
+          fetchInventorySummaryForReport(filters),
+          fetchActivitySummaryForReport(filters),
+          fetchBaselineAnomaliesForReport(filters)
+        ])
+      ]);
+      const inventorySummary = settledValue(inventoryResult);
+      const activitySummary = settledValue(summaryResult);
+      const baselineAnomalies = settledValue(anomaliesResult);
+      const report = buildGeneratedReport(
+        reportTitle,
+        filters,
+        reportEvents,
+        inventorySummary,
+        scenarioId,
+        activitySummary,
+        baselineAnomalies,
+        evidenceLimit
+      );
 
-  async function generateReport() {
-    if (!validateReportFilters(filters, setError, onNotify)) {
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    setGeneratedReport(null);
-
-    try {
-      const reportEvents = await loadReportEventsForCurrentFilters({ showNotice: false, activateTimeline: false });
-      const inventorySummary = await fetchInventorySummaryForReport(filters);
-      setGeneratedReport(buildGeneratedReport(reportTitle, filters, reportEvents, inventorySummary));
-      setActiveReportResultTab("summary");
+      setEvents(reportEvents);
+      setGeneratedReport(report);
+      setPage(1);
+      setActiveReportResultTab("executive");
+      setWorkspaceStep("result");
       onNotify({
-        tone: "success",
-        message: `Relatorio gerado com ${reportEvents.length.toLocaleString("pt-BR")} evento(s) no recorte.`
+        tone: reportEvents.length > 0 ? "success" : "warning",
+        message: reportEvents.length > 0
+          ? `Análise concluída com ${report.totalEvents.toLocaleString("pt-BR")} evento(s) no recorte.`
+          : "Análise concluída sem eventos para o recorte informado."
       });
-    } catch (error) {
-      const fallbackEvents = searched ? events : [];
-      onNotify({
-        tone: "warning",
-        message: error instanceof Error
-          ? `Previa textual gerada, mas a leitura de inventario nao foi anexada: ${error.message}`
-          : "Previa textual gerada sem o resumo de inventario."
-      });
-      setGeneratedReport(buildGeneratedReport(reportTitle, filters, fallbackEvents, null));
-      setActiveReportResultTab("summary");
+    } catch (analysisError) {
+      setError(analysisError instanceof Error ? analysisError.message : "Falha ao executar a análise.");
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="view-stack reports-view">
-      <section className="executive-grid reports-kpi-strip">
-        <ExecutiveCard
-          title="Eventos no recorte"
-          value={searched ? events.length.toLocaleString("pt-BR") : "-"}
-          detail={searched ? summarizeReportFilters(filters) || "Sem filtros adicionais." : "Escolha um relatorio e investigue o recorte."}
-          tone={events.length > 500 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Usuarios envolvidos"
-          value={searched ? uniqueUsers.toLocaleString("pt-BR") : "-"}
-          detail={dominantAction ? `Acao dominante: ${dominantAction}.` : "Aguardando consulta."}
-          tone={uniqueUsers > 20 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Caminhos afetados"
-          value={searched ? affectedPaths.toLocaleString("pt-BR") : "-"}
-          detail={`Agrupamento: ${labelForReportGroup(filters.groupBy)}.`}
-          tone={affectedPaths > 100 ? "danger" : "neutral"}
-        />
-      </section>
-
-      <section className="report-workflow">
-        <Panel title="Modelos de relatório" subtitle="Escolha um atalho guiado ou monte um recorte livre.">
-          <div className="report-mode-bar">
-            <button className={mode === "guided" ? "active" : ""} type="button" onClick={() => setMode("guided")}>
-              Guiados
-            </button>
-            <button className={mode === "custom" ? "active" : ""} type="button" onClick={startCustomReport}>
-              Personalizado
-            </button>
-          </div>
-
-          {generatedReport && (
-            <div className="report-current-model">
-              <div>
-                <span>Relatório gerado</span>
-                <strong>{generatedReport.title}</strong>
-              </div>
-              <button className="text-button" type="button" onClick={() => setGeneratedReport(null)}>
-                Trocar modelo
-              </button>
-            </div>
-          )}
-
-          {mode === "guided" ? (
-            <div className="report-scenario-groups">
-              {reportScenarioGroups.map((group) => (
-                <section key={group.category} className="report-scenario-group">
-                  <div className="report-scenario-group-head">
-                    <strong>{group.category}</strong>
-                    <span>{group.items.length} modelo(s)</span>
-                  </div>
-                  <div className="report-card-grid compact">
-                    {group.items.map((item) => (
-                      <button
-                        key={item.id}
-                        className={`report-card ${selectedScenario === item.id ? "active" : ""}`}
-                        type="button"
-                        onClick={() => selectScenario(item.id)}
-                      >
-                        <strong>{item.title}</strong>
-                        <span>{item.description}</span>
-                      </button>
-                    ))}
-                  </div>
-                </section>
-              ))}
-            </div>
-          ) : (
-            <div className="custom-report-note">
-              <strong>Relatorio personalizado</strong>
-              <span>Monte livremente o periodo, escopo, acao, origem e agrupamento antes de investigar.</span>
-            </div>
-          )}
-        </Panel>
-      </section>
-
-      <Panel title={reportTitle} subtitle={mode === "guided" ? scenario.focus : "Use filtros livres e gere um recorte reutilizavel."}>
-        <form className="path-form report-form" onSubmit={submit}>
-          <label>
-            Periodo
-            <select value={filters.periodMode} onChange={(event) => setFilters({ ...filters, periodMode: event.target.value as "preset" | "custom" })}>
-              <option value="preset">Faixa rapida</option>
-              <option value="custom">Dia ou intervalo</option>
-            </select>
-          </label>
-          {filters.periodMode === "preset" ? (
-            <label>
-              Faixa rapida
-              <select value={filters.periodHours} onChange={(event) => setFilters({ ...filters, periodHours: event.target.value })}>
-                <option value="1">Ultima hora</option>
-                <option value="6">Ultimas 6 horas</option>
-                <option value="24">Ultimas 24 horas</option>
-                <option value="168">Ultimos 7 dias</option>
-                <option value="720">Ultimos 30 dias</option>
-              </select>
-            </label>
-          ) : (
-            <>
-              <label>
-                De
-                <input type="date" value={filters.fromDate} onChange={(event) => setFilters({ ...filters, fromDate: event.target.value })} />
-              </label>
-              <label>
-                Ate
-                <input type="date" value={filters.toDate} onChange={(event) => setFilters({ ...filters, toDate: event.target.value })} />
-              </label>
-            </>
-          )}
-          <label>
-            Servidor
-            <input value={filters.server} onChange={(event) => setFilters({ ...filters, server: event.target.value })} placeholder="FileServer" />
-          </label>
-          <label>
-            Compartilhamento
-            <input value={filters.share} onChange={(event) => setFilters({ ...filters, share: event.target.value })} placeholder="Corporativo" />
-          </label>
-          <label>
-            Usuario
-            <input value={filters.user} onChange={(event) => setFilters({ ...filters, user: event.target.value })} placeholder="DOMINIO\\usuario" />
-          </label>
-          <label className="wide-field">
-            Caminho
-            <input value={filters.path} onChange={(event) => setFilters({ ...filters, path: event.target.value })} placeholder="C:\\Corporativo\\RH ou parte do caminho" />
-          </label>
-          <label>
-            Acao
-            <select value={filters.action} onChange={(event) => setFilters({ ...filters, action: event.target.value })}>
-              <option value="">Todas</option>
-              <option value="created">Criado</option>
-              <option value="modified">Alterado</option>
-              <option value="accessed">Acessado</option>
-              <option value="deleted">Excluido</option>
-              <option value="renamed">Renomeado</option>
-              <option value="moved">Movido</option>
-              <option value="permission_changed">Permissao</option>
-            </select>
-          </label>
-          <button className="text-button report-advanced-toggle" type="button" onClick={() => setShowAdvancedReportFilters((current) => !current)}>
-            <Plus size={16} />
-            {showAdvancedReportFilters ? "Ocultar filtros avançados" : "Filtros avançados"}
-          </button>
-          {showAdvancedReportFilters && (
-            <div className="report-advanced-grid">
-              <label>
-                Host origem
-                <input value={filters.sourceHost} onChange={(event) => setFilters({ ...filters, sourceHost: event.target.value })} placeholder="NOTE-01" />
-              </label>
-              <label>
-                IP origem
-                <input value={filters.sourceIp} onChange={(event) => setFilters({ ...filters, sourceIp: event.target.value })} placeholder="192.168.2.10" />
-              </label>
-              <label>
-                Extensoes
-                <input value={filters.extension} onChange={(event) => setFilters({ ...filters, extension: event.target.value })} placeholder=".exe,.ps1,.bat" />
-              </label>
-              <label>
-                Resultado
-                <input value={filters.result} onChange={(event) => setFilters({ ...filters, result: event.target.value })} placeholder="success, denied..." />
-              </label>
-              <label>
-                Severidade
-                <select value={filters.severity} onChange={(event) => setFilters({ ...filters, severity: event.target.value })}>
-                  <option value="">Todas</option>
-                  <option value="info">Info</option>
-                  <option value="warning">Warning</option>
-                  <option value="critical">Critical</option>
-                </select>
-              </label>
-              <label>
-                Agrupar por
-                <select value={filters.groupBy} onChange={(event) => setFilters({ ...filters, groupBy: event.target.value as ReportGrouping })}>
-                  <option value="action">Acao</option>
-                  <option value="user">Usuario</option>
-                  <option value="server">Servidor</option>
-                  <option value="share">Compartilhamento</option>
-                  <option value="sourceHost">Host origem</option>
-                  <option value="path">Caminho</option>
-                  <option value="extension">Extensao</option>
-                  <option value="severity">Severidade</option>
-                </select>
-              </label>
-            </div>
-          )}
-          <div className="report-actions">
-            <button className="text-button" type="submit" disabled={loading}>
-              <Search size={16} />
-              Investigar
-            </button>
-            <button className="text-button" type="button" onClick={() => downloadReportCsv(filters, onNotify)}>
-              <Download size={16} />
-              Exportar CSV
-            </button>
-            <button className="text-button" type="button" onClick={generateReport} disabled={loading}>
-              <ClipboardList size={16} />
-              Gerar relatorio
-            </button>
-          </div>
-        </form>
-      </Panel>
+    <div className="reports-view">
+      <header className="reports-page-head">
+        <div>
+          <span className="reports-eyebrow">Análise e prestação de contas</span>
+          <h2>Relatórios</h2>
+          <p>Investigue eventos correlacionados, avalie impacto e produza uma leitura pronta para decisão.</p>
+        </div>
+        <div className="report-stepper" aria-label="Etapas do relatório">
+          <ReportStep label="Modelo" number="1" active={workspaceStep === "library"} complete={workspaceStep !== "library"} />
+          <ReportStep label="Configuração" number="2" active={workspaceStep === "configure"} complete={workspaceStep === "result"} />
+          <ReportStep label="Resultado" number="3" active={workspaceStep === "result"} complete={false} />
+        </div>
+      </header>
 
       {error && <div className="error-banner">{error}</div>}
 
-      <Panel
-        title={generatedReport ? `Resultado: ${generatedReport.title}` : "Resultado da investigação"}
-        subtitle={generatedReport ? "Relatório gerado com o mesmo recorte investigado." : "Consulte um recorte para liberar resumo, linha do tempo e agrupamentos."}
-      >
-        <div className="report-result-shell">
-          <div className="report-result-tabs">
-            <button className={activeReportResultTab === "summary" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("summary")}>
-              Resumo
+      {workspaceStep === "library" && (
+        <section className="report-library-shell">
+          <aside className="report-library-nav">
+            <div className="report-library-nav-head">
+              <span>Biblioteca</span>
+              <strong>Escolha o objetivo</strong>
+            </div>
+            <nav aria-label="Categorias de relatório">
+              {scenarioGroups.map((group) => (
+                <button
+                  key={group.category}
+                  className={selectedCategory === group.category && !scenarioSearch ? "active" : ""}
+                  type="button"
+                  onClick={() => {
+                    setSelectedCategory(group.category);
+                    setScenarioSearch("");
+                  }}
+                >
+                  <span>{group.category}</span>
+                  <small>{group.items.length}</small>
+                </button>
+              ))}
+            </nav>
+            <button className="report-custom-entry" type="button" onClick={startCustomReport}>
+              <SlidersHorizontal size={18} />
+              <span>
+                <strong>Relatório personalizado</strong>
+                <small>Monte um recorte livre</small>
+              </span>
+              <ArrowRight size={16} />
             </button>
-            <button className={activeReportResultTab === "timeline" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("timeline")}>
-              Linha do tempo
-            </button>
-            <button className={activeReportResultTab === "groups" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("groups")}>
-              Agrupamentos
-            </button>
+          </aside>
+
+          <div className="report-library-content">
+            <div className="report-library-toolbar">
+              <div>
+                <span>{scenarioSearch ? "Resultados da busca" : selectedCategory}</span>
+                <h3>{scenarioSearch ? `${visibleScenarios.length} modelo(s) encontrado(s)` : getReportCategoryDescription(selectedCategory)}</h3>
+              </div>
+              <label className="report-library-search">
+                <Search size={17} />
+                <input
+                  value={scenarioSearch}
+                  onChange={(event) => setScenarioSearch(event.target.value)}
+                  placeholder="Buscar modelo ou objetivo"
+                />
+              </label>
+            </div>
+            <div className="report-template-list">
+              {visibleScenarios.map((item) => (
+                <button key={item.id} className="report-template-row" type="button" onClick={() => selectScenario(item.id)}>
+                  <span className="report-template-icon"><FileText size={19} /></span>
+                  <span className="report-template-copy">
+                    <strong>{item.title}</strong>
+                    <small>{item.description}</small>
+                    <em>{item.focus}</em>
+                  </span>
+                  <ArrowRight size={18} />
+                </button>
+              ))}
+              {visibleScenarios.length === 0 && <EmptyState text="Nenhum modelo corresponde à busca." />}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {workspaceStep === "configure" && (
+        <section className="report-configure-shell">
+          <button className="report-back-button" type="button" onClick={() => setWorkspaceStep("library")}>
+            <ArrowLeft size={17} />
+            Biblioteca de modelos
+          </button>
+          <div className="report-configure-head">
+            <span className="report-template-icon"><FileText size={21} /></span>
+            <div>
+              <span>{mode === "guided" ? getReportScenarioCategory(selectedScenario) : "Personalizado"}</span>
+              <h3>{reportTitle}</h3>
+              <p>{mode === "guided" ? scenario.focus : "Combine período, escopo, origem e ação para produzir uma análise sob medida."}</p>
+            </div>
+          </div>
+          <div className="report-configure-layout">
+            <div className="report-filter-surface">
+              <div className="report-section-title">
+                <div>
+                  <span>Escopo da análise</span>
+                  <h4>Defina período e filtros</h4>
+                </div>
+                <Filter size={20} />
+              </div>
+              <ReportFiltersForm
+                filters={filters}
+                loading={loading}
+                showAdvanced={showAdvancedReportFilters}
+                onFiltersChange={setFilters}
+                onToggleAdvanced={() => setShowAdvancedReportFilters((current) => !current)}
+                onSubmit={executeAnalysis}
+              />
+            </div>
+            <aside className="report-delivery-summary">
+              <span className="reports-eyebrow">Entrega</span>
+              <h4>O que será analisado</h4>
+              <ul>
+                <li><BarChart3 size={17} /><span>Evolução temporal e distribuição das ações</span></li>
+                <li><Files size={17} /><span>Usuários, caminhos e hosts com maior concentração</span></li>
+                <li><ShieldAlert size={17} /><span>Anomalias, riscos e pontos de atenção</span></li>
+                <li><ClipboardList size={17} /><span>Evidências correlacionadas para auditoria</span></li>
+              </ul>
+              <div className="report-scope-preview">
+                <span>Recorte atual</span>
+                <strong>{summarizeReportFilters(filters) || "Todo o ambiente no período"}</strong>
+              </div>
+            </aside>
+          </div>
+        </section>
+      )}
+
+      {workspaceStep === "result" && generatedReport && (
+        <section className="report-result-workspace">
+          <div className="report-result-head">
+            <div className="report-result-title">
+              <button className="icon-button subtle" type="button" onClick={() => setWorkspaceStep("configure")} title="Voltar aos filtros">
+                <ArrowLeft size={18} />
+              </button>
+              <div>
+                <span>{generatedReport.scenarioId ? getReportScenarioCategory(generatedReport.scenarioId) : "Personalizado"}</span>
+                <h3>{generatedReport.title}</h3>
+                <p>{generatedReport.filtersSummary || "Todo o ambiente no período selecionado."}</p>
+              </div>
+            </div>
+            <div className="report-result-actions">
+              <button className="text-button" type="button" onClick={() => executeAnalysis()} disabled={loading}>
+                <RefreshCcw size={16} />
+                Atualizar
+              </button>
+              <button className="text-button" type="button" onClick={() => downloadReportCsv(filters, onNotify)}>
+                <Download size={16} />
+                CSV
+              </button>
+              <button className="text-button" type="button" onClick={() => window.print()}>
+                <FileText size={16} />
+                PDF
+              </button>
+            </div>
           </div>
 
-          {activeReportResultTab === "summary" && (
-            generatedReport ? (
-              <div className="report-preview">
-                <div className="report-preview-head">
-                  <div>
-                    <strong>{generatedReport.title}</strong>
-                    <span>Gerado em {formatDate(generatedReport.generatedAt)}</span>
-                  </div>
-                  <button className="text-button" type="button" onClick={() => window.print()}>
-                    <Download size={16} />
-                    Imprimir / salvar PDF
-                  </button>
-                </div>
-                <p>{generatedReport.filtersSummary || "Sem filtros adicionais."}</p>
-                <div className="report-preview-metrics">
-                  <span>{generatedReport.events.length.toLocaleString("pt-BR")} evento(s)</span>
-                  <span>{new Set(generatedReport.events.map((event) => event.user).filter(Boolean)).size.toLocaleString("pt-BR")} usuario(s)</span>
-                  <span>{new Set(generatedReport.events.map((event) => event.path).filter(Boolean)).size.toLocaleString("pt-BR")} caminho(s)</span>
-                </div>
-                <div className="report-qbr-grid">
-                  <article className="report-qbr-hero">
-                    <span className="inventory-kicker">Resumo executivo</span>
-                    <strong>{generatedReport.title}</strong>
-                    <p>{generatedReport.executiveSummary}</p>
-                  </article>
-                  <div className="report-qbr-cards">
-                    <ReportTextList title="Destaques do recorte" items={generatedReport.highlights} emptyText="Sem destaque relevante no recorte." />
-                    <ReportTextList title="Pontos de atencao" items={generatedReport.risks} emptyText="Sem ponto de atencao relevante no recorte." />
-                    <ReportTextList title="Proximos passos" items={generatedReport.nextSteps} emptyText="Sem proximo passo sugerido automaticamente." />
-                  </div>
-                </div>
-                <div className="report-qbr-sections">
-                  {generatedReport.sections.map((section) => (
-                    <article key={section.title} className="report-qbr-section">
-                      <div className="report-qbr-section-head">
-                        <span className="inventory-kicker">Seção</span>
-                        <strong>{section.title}</strong>
-                      </div>
-                      {section.items.length === 0 ? (
-                        <p>Sem observações relevantes para esta seção no recorte atual.</p>
-                      ) : (
-                        <ul>
-                          {section.items.map((item) => (
-                            <li key={`${section.title}-${item}`}>{item}</li>
-                          ))}
-                        </ul>
-                      )}
-                    </article>
-                  ))}
-                </div>
-                {generatedReport.inventorySummary && (
-                  <div className="report-preview-metrics">
-                    <span>{generatedReport.inventorySummary.share ?? "Inventario"} · {formatBytes(generatedReport.inventorySummary.totalBytes)}</span>
-                    <span>{generatedReport.inventorySummary.fileCount.toLocaleString("pt-BR")} arquivo(s)</span>
-                    <span>{generatedReport.inventorySummary.recommendations.length.toLocaleString("pt-BR")} recomendacao(oes)</span>
-                    <span>score {generatedReport.inventorySummary.insight.score}</span>
-                    <span>snapshot {generatedReport.inventorySummary.finishedUtc ? formatDate(generatedReport.inventorySummary.finishedUtc) : "em andamento"}</span>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="report-empty-summary">
-                <ClipboardList size={28} />
-                <strong>Nenhum relatório gerado ainda</strong>
-                <p>Use Investigar para validar os eventos e depois clique em Gerar relatório. O resumo aparecerá aqui, separado dos modelos guiados.</p>
-              </div>
-            )
-          )}
+          <div className={`report-coverage ${generatedReport.aggregateCoverage}`}>
+            <CheckCircle2 size={18} />
+            <div>
+              <strong>{generatedReport.aggregateCoverage === "complete" ? "Totais consolidados pelo backend" : "Leitura baseada na evidência carregada"}</strong>
+              <span>
+                Gerado em {formatDate(generatedReport.generatedAt)} · {generatedReport.events.length.toLocaleString("pt-BR")} evidência(s) detalhada(s)
+                {generatedReport.evidenceLimitReached ? ` · limite de ${generatedReport.evidenceLimit.toLocaleString("pt-BR")} atingido` : ""}
+              </span>
+            </div>
+          </div>
 
-          {activeReportResultTab === "timeline" && (
-            searched ? (
+          <div className="report-result-tabs">
+            <button className={activeReportResultTab === "executive" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("executive")}>Visão executiva</button>
+            <button className={activeReportResultTab === "operational" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("operational")}>Análise operacional</button>
+            <button className={activeReportResultTab === "evidence" ? "active" : ""} type="button" onClick={() => setActiveReportResultTab("evidence")}>Evidências</button>
+          </div>
+
+          {activeReportResultTab === "executive" && <ReportExecutiveResult report={generatedReport} />}
+          {activeReportResultTab === "operational" && <ReportOperationalResult report={generatedReport} groupBy={filters.groupBy} />}
+          {activeReportResultTab === "evidence" && (
+            <div className="report-evidence-view">
+              <div className="report-section-title">
+                <div>
+                  <span>Rastreabilidade</span>
+                  <h4>Linha do tempo correlacionada</h4>
+                </div>
+                <small>{events.length.toLocaleString("pt-BR")} registro(s) carregado(s)</small>
+              </div>
               <InvestigationTable
                 events={visibleEvents}
                 pagination={{
@@ -2291,33 +2576,204 @@ function ReportsView({ onNotify }: { onNotify: (notice: Notice | null) => void }
                   onNext: () => setPage((current) => Math.min(totalPages, current + 1))
                 }}
               />
-            ) : (
-              <EmptyState text="Escolha um relatório, ajuste os filtros e clique em Investigar." />
-            )
-          )}
-
-          {activeReportResultTab === "groups" && (
-            <div className="report-group-layout">
-              <Panel title="Resumo por agrupamento" subtitle={`Top ${labelForReportGroup(filters.groupBy).toLowerCase()} no recorte investigado.`}>
-                {groupedRows.length > 0 ? <ReportGroupList rows={groupedRows} total={events.length} /> : <EmptyState text="Consulte um recorte para gerar o resumo." />}
-              </Panel>
-              {generatedReport && (
-                <>
-                  <Panel title="Top ações" subtitle="Distribuição dominante no recorte consultado.">
-                    <ReportGroupList rows={generatedReport.topActions} total={generatedReport.events.length} />
-                  </Panel>
-                  <Panel title="Top usuários" subtitle="Principais atores envolvidos no período.">
-                    <ReportGroupList rows={generatedReport.topUsers} total={generatedReport.events.length} />
-                  </Panel>
-                  <Panel title="Top caminhos" subtitle="Áreas mais impactadas no recorte.">
-                    <ReportGroupList rows={generatedReport.topPaths} total={generatedReport.events.length} />
-                  </Panel>
-                </>
-              )}
             </div>
           )}
+        </section>
+      )}
+    </div>
+  );
+}
+
+function ReportStep({ label, number, active, complete }: { label: string; number: string; active: boolean; complete: boolean }) {
+  return (
+    <div className={`${active ? "active" : ""} ${complete ? "complete" : ""}`}>
+      <span>{complete ? <CheckCircle2 size={15} /> : number}</span>
+      <strong>{label}</strong>
+    </div>
+  );
+}
+
+function ReportFiltersForm({
+  filters,
+  loading,
+  showAdvanced,
+  onFiltersChange,
+  onToggleAdvanced,
+  onSubmit
+}: {
+  filters: ReportFilters;
+  loading: boolean;
+  showAdvanced: boolean;
+  onFiltersChange: (filters: ReportFilters) => void;
+  onToggleAdvanced: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+}) {
+  return (
+    <form className="path-form report-form" onSubmit={onSubmit}>
+      <label>
+        Período
+        <select value={filters.periodMode} onChange={(event) => onFiltersChange({ ...filters, periodMode: event.target.value as "preset" | "custom" })}>
+          <option value="preset">Faixa rápida</option>
+          <option value="custom">Dia ou intervalo</option>
+        </select>
+      </label>
+      {filters.periodMode === "preset" ? (
+        <label>
+          Faixa rápida
+          <select value={filters.periodHours} onChange={(event) => onFiltersChange({ ...filters, periodHours: event.target.value })}>
+            <option value="1">Última hora</option>
+            <option value="6">Últimas 6 horas</option>
+            <option value="24">Últimas 24 horas</option>
+            <option value="168">Últimos 7 dias</option>
+            <option value="720">Últimos 30 dias</option>
+          </select>
+        </label>
+      ) : (
+        <>
+          <label>De<input type="date" value={filters.fromDate} onChange={(event) => onFiltersChange({ ...filters, fromDate: event.target.value })} /></label>
+          <label>Até<input type="date" value={filters.toDate} onChange={(event) => onFiltersChange({ ...filters, toDate: event.target.value })} /></label>
+        </>
+      )}
+      <label>Servidor<input value={filters.server} onChange={(event) => onFiltersChange({ ...filters, server: event.target.value })} placeholder="FileServer" /></label>
+      <label>Compartilhamento<input value={filters.share} onChange={(event) => onFiltersChange({ ...filters, share: event.target.value })} placeholder="Corporativo" /></label>
+      <label>Usuário<input value={filters.user} onChange={(event) => onFiltersChange({ ...filters, user: event.target.value })} placeholder="DOMINIO\\usuario" /></label>
+      <label className="wide-field">Caminho<input value={filters.path} onChange={(event) => onFiltersChange({ ...filters, path: event.target.value })} placeholder="C:\\Corporativo\\RH ou parte do caminho" /></label>
+      <label>
+        Ação
+        <select value={filters.action} onChange={(event) => onFiltersChange({ ...filters, action: event.target.value })}>
+          <option value="">Todas</option>
+          <option value="created">Criado</option>
+          <option value="modified">Alterado</option>
+          <option value="accessed">Acessado</option>
+          <option value="deleted">Excluído</option>
+          <option value="renamed">Renomeado</option>
+          <option value="moved">Movido</option>
+          <option value="permission_changed">Permissão</option>
+        </select>
+      </label>
+      <button className="text-button report-advanced-toggle" type="button" onClick={onToggleAdvanced}>
+        <Plus size={16} />
+        {showAdvanced ? "Ocultar filtros avançados" : "Filtros avançados"}
+      </button>
+      {showAdvanced && (
+        <div className="report-advanced-grid">
+          <label>Host de origem<input value={filters.sourceHost} onChange={(event) => onFiltersChange({ ...filters, sourceHost: event.target.value })} placeholder="NOTE-01" /></label>
+          <label>IP de origem<input value={filters.sourceIp} onChange={(event) => onFiltersChange({ ...filters, sourceIp: event.target.value })} placeholder="192.168.2.10" /></label>
+          <label>Extensões<input value={filters.extension} onChange={(event) => onFiltersChange({ ...filters, extension: event.target.value })} placeholder=".exe,.ps1,.bat" /></label>
+          <label>Resultado<input value={filters.result} onChange={(event) => onFiltersChange({ ...filters, result: event.target.value })} placeholder="success, denied..." /></label>
+          <label>
+            Severidade
+            <select value={filters.severity} onChange={(event) => onFiltersChange({ ...filters, severity: event.target.value })}>
+              <option value="">Todas</option><option value="info">Info</option><option value="warning">Atenção</option><option value="critical">Crítico</option>
+            </select>
+          </label>
+          <label>
+            Agrupar por
+            <select value={filters.groupBy} onChange={(event) => onFiltersChange({ ...filters, groupBy: event.target.value as ReportGrouping })}>
+              <option value="action">Ação</option><option value="user">Usuário</option><option value="server">Servidor</option><option value="share">Compartilhamento</option>
+              <option value="sourceHost">Host de origem</option><option value="path">Caminho</option><option value="extension">Extensão</option><option value="severity">Severidade</option>
+            </select>
+          </label>
         </div>
-      </Panel>
+      )}
+      <div className="report-form-footer">
+        <span>Os filtros vazios não restringem a consulta.</span>
+        <button className="primary-button" type="submit" disabled={loading}>
+          {loading ? <RefreshCcw className="spin" size={17} /> : <Search size={17} />}
+          {loading ? "Analisando..." : "Executar análise"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function ReportExecutiveResult({ report }: { report: GeneratedReport }) {
+  return (
+    <div className="report-executive-view">
+      <div className="report-metric-strip">
+        {report.metrics.map((metric) => (
+          <article key={metric.label} className={`report-metric ${metric.tone}`}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+            <small>{metric.detail}</small>
+          </article>
+        ))}
+      </div>
+      <section className="report-executive-summary">
+        <div>
+          <span className="reports-eyebrow">Leitura executiva</span>
+          <h4>O que o período sinaliza</h4>
+        </div>
+        <p>{report.executiveSummary}</p>
+      </section>
+      <div className="report-management-grid">
+        <ReportTextList title="Destaques" items={report.highlights} emptyText="Sem destaque relevante no recorte." />
+        <ReportTextList title="Pontos de atenção" items={report.risks} emptyText="Nenhum risco relevante detectado." />
+        <ReportTextList title="Ações recomendadas" items={report.nextSteps} emptyText="Nenhuma ação sugerida automaticamente." />
+      </div>
+      {report.inventorySummary && (
+        <section className="report-inventory-context">
+          <div><span>Inventário associado</span><strong>{formatBytes(report.inventorySummary.totalBytes)}</strong><small>{report.inventorySummary.fileCount.toLocaleString("pt-BR")} arquivos</small></div>
+          <div><span>Governança</span><strong>{report.inventorySummary.insight.score}</strong><small>score do snapshot</small></div>
+          <div><span>Dados frios</span><strong>{formatBytes(report.inventorySummary.governance.inactive365DaysBytes)}</strong><small>sem alteração há mais de 365 dias</small></div>
+          <div><span>Variação</span><strong>{formatSignedBytes(report.inventorySummary.growth.totalBytesDelta)}</strong><small>desde o snapshot anterior</small></div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function ReportOperationalResult({ report, groupBy }: { report: GeneratedReport; groupBy: ReportGrouping }) {
+  const customGroups = buildReportGroups(report.events, groupBy);
+  return (
+    <div className="report-operational-view">
+      <div className="report-analysis-primary">
+        <section className="report-analysis-section">
+          <div className="report-section-title"><div><span>Evidência detalhada</span><h4>Distribuição temporal dos registros carregados</h4></div><CalendarDays size={20} /></div>
+          <ReportTrendChart buckets={report.timeBuckets} />
+        </section>
+        <section className="report-analysis-section">
+          <div className="report-section-title"><div><span>Distribuição</span><h4>Ações predominantes</h4></div><BarChart3 size={20} /></div>
+          <ReportGroupList rows={report.topActions} total={Math.max(report.totalEvents, report.events.length)} />
+        </section>
+      </div>
+      <div className="report-ranking-grid">
+        <ReportRanking title="Usuários mais ativos" rows={report.topUsers} total={report.events.length} />
+        <ReportRanking title="Caminhos mais afetados" rows={report.topPaths} total={report.events.length} />
+        <ReportRanking title="Hosts de origem" rows={report.topHosts} total={report.events.length} />
+      </div>
+      <section className="report-analysis-section report-custom-grouping">
+        <div className="report-section-title"><div><span>Recorte configurado</span><h4>Agrupamento por {labelForReportGroup(groupBy).toLowerCase()}</h4></div></div>
+        <ReportGroupList rows={customGroups} total={report.events.length} />
+      </section>
+    </div>
+  );
+}
+
+function ReportRanking({ title, rows, total }: { title: string; rows: Array<{ label: string; count: number }>; total: number }) {
+  return (
+    <section className="report-analysis-section">
+      <div className="report-section-title"><div><span>Ranking</span><h4>{title}</h4></div></div>
+      {rows.length > 0 ? <ReportGroupList rows={rows} total={total} /> : <EmptyState text="Sem dados para este ranking." />}
+    </section>
+  );
+}
+
+function ReportTrendChart({ buckets }: { buckets: ReportTimeBucket[] }) {
+  const maximum = Math.max(...buckets.map((bucket) => bucket.count), 1);
+  if (buckets.length === 0) {
+    return <EmptyState text="Sem eventos para compor a evolução temporal." />;
+  }
+
+  return (
+    <div className="report-trend-chart" role="img" aria-label="Evolução do volume de eventos no período">
+      {buckets.map((bucket) => (
+        <div key={bucket.label} className="report-trend-column">
+          <span>{bucket.count.toLocaleString("pt-BR")}</span>
+          <div><i style={{ height: `${Math.max(6, (bucket.count / maximum) * 100)}%` }} /></div>
+          <small>{bucket.label}</small>
+        </div>
+      ))}
     </div>
   );
 }
@@ -2338,11 +2794,68 @@ function AlertsView({
   onNotify: (notice: Notice | null) => void;
 }) {
   const enabledRules = rules.filter((rule) => rule.enabled).length;
-  const criticalAlerts = alerts.filter((alert) => alert.severity === "critical").length;
-  const openAlerts = alerts.filter((alert) => alert.status === "open").length;
+  const openAlertItems = alerts.filter((alert) => alert.status === "open");
+  const criticalAlerts = openAlertItems.filter((alert) => alert.severity === "critical").length;
+  const highAlerts = openAlertItems.filter((alert) => alert.severity === "high").length;
+  const acknowledgedAlerts = alerts.filter((alert) => alert.status === "acknowledged").length;
+  const openAlerts = openAlertItems.length;
   const [expandedAlertId, setExpandedAlertId] = useState<string | null>(null);
   const [loadingAlertId, setLoadingAlertId] = useState<string | null>(null);
   const [operationsByAlert, setOperationsByAlert] = useState<Record<string, FileAuditEvent[]>>({});
+  const [activeAlertView, setActiveAlertView] = useState<"queue" | "rules">("queue");
+  const [alertSearch, setAlertSearch] = useState("");
+  const [alertStatusFilter, setAlertStatusFilter] = useState("all");
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState("all");
+  const [alertPage, setAlertPage] = useState(1);
+
+  const filteredAlerts = useMemo(() => {
+    const normalizedSearch = alertSearch.trim().toLocaleLowerCase("pt-BR");
+
+    return alerts.filter((alert) => {
+      if (alertStatusFilter !== "all" && alert.status !== alertStatusFilter) {
+        return false;
+      }
+
+      if (alertSeverityFilter !== "all" && alert.severity !== alertSeverityFilter) {
+        return false;
+      }
+
+      if (!normalizedSearch) {
+        return true;
+      }
+
+      return [alert.title, alert.description, alert.server, alert.user, alert.rule, ...alert.samplePaths]
+        .some((value) => value.toLocaleLowerCase("pt-BR").includes(normalizedSearch));
+    });
+  }, [alertSearch, alertSeverityFilter, alertStatusFilter, alerts]);
+
+  const alertPageSize = 10;
+  const alertTotalPages = Math.max(1, Math.ceil(filteredAlerts.length / alertPageSize));
+  const pagedAlerts = filteredAlerts.slice((alertPage - 1) * alertPageSize, alertPage * alertPageSize);
+
+  useEffect(() => {
+    setAlertPage(1);
+  }, [alertSearch, alertSeverityFilter, alertStatusFilter]);
+
+  useEffect(() => {
+    setAlertPage((current) => Math.min(current, alertTotalPages));
+  }, [alertTotalPages]);
+
+  const severityDistribution = [
+    { id: "critical", label: "Críticos", count: openAlertItems.filter((alert) => alert.severity === "critical").length },
+    { id: "high", label: "Altos", count: openAlertItems.filter((alert) => alert.severity === "high").length },
+    { id: "warning", label: "Atenção", count: openAlertItems.filter((alert) => alert.severity === "warning").length },
+    { id: "info", label: "Informativos", count: openAlertItems.filter((alert) => !["critical", "high", "warning"].includes(alert.severity)).length }
+  ];
+  const maximumSeverityCount = Math.max(...severityDistribution.map((item) => item.count), 1);
+  const alertsByRule = openAlertItems.reduce<Record<string, number>>((result, alert) => {
+    result[alert.rule] = (result[alert.rule] ?? 0) + 1;
+    return result;
+  }, {});
+  const topRule = Object.entries(alertsByRule).sort((left, right) => right[1] - left[1])[0];
+  const latestAlert = alerts.reduce<FileServerAlert | null>((latest, alert) => (
+    !latest || new Date(alert.createdUtc).getTime() > new Date(latest.createdUtc).getTime() ? alert : latest
+  ), null);
 
   async function toggleAlertOperations(alert: FileServerAlert) {
     if (expandedAlertId === alert.id) {
@@ -2371,72 +2884,179 @@ function AlertsView({
   }
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Alertas Abertos"
-          value={openAlerts.toLocaleString("pt-BR")}
-          detail={`${criticalAlerts} em criticidade alta para tratamento prioritário.`}
-          tone={criticalAlerts > 0 ? "danger" : openAlerts > 0 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Regras Ativas"
-          value={enabledRules.toLocaleString("pt-BR")}
-          detail={`${rules.length.toLocaleString("pt-BR")} regras configuradas na operação.`}
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Último Alerta"
-          value={alerts[0] ? formatDate(alerts[0].createdUtc) : "Sem alerta"}
-          detail={alerts[0] ? `${alerts[0].server} · ${alerts[0].title}` : "Nenhum disparo recente registrado."}
-          tone={alerts[0]?.severity === "critical" ? "danger" : "neutral"}
-        />
+    <div className="alerts-workspace">
+      <section className="alerts-command-center">
+        <div className="alerts-command-heading">
+          <div className="alerts-command-icon"><Bell size={20} /></div>
+          <div>
+            <span>Central operacional</span>
+            <h2>Triagem e resposta a alertas</h2>
+            <p>Priorize ocorrências, valide as operações relacionadas e registre o tratamento sem perder o contexto.</p>
+          </div>
+        </div>
+        <span className={`alerts-posture ${criticalAlerts > 0 ? "critical" : openAlerts > 0 ? "attention" : "ok"}`}>
+          {criticalAlerts > 0 ? "Ação imediata" : openAlerts > 0 ? "Requer atenção" : "Operação estável"}
+        </span>
+
+        <div className="alerts-summary-grid">
+          <article className={criticalAlerts > 0 ? "danger" : ""}>
+            <span>Alertas abertos</span>
+            <strong>{openAlerts.toLocaleString("pt-BR")}</strong>
+            <small>{criticalAlerts} críticos e {highAlerts} altos</small>
+          </article>
+          <article>
+            <span>Reconhecidos</span>
+            <strong>{acknowledgedAlerts.toLocaleString("pt-BR")}</strong>
+            <small>No recorte carregado pela aplicação</small>
+          </article>
+          <article>
+            <span>Regras ativas</span>
+            <strong>{enabledRules.toLocaleString("pt-BR")}</strong>
+            <small>de {rules.length.toLocaleString("pt-BR")} regras configuradas</small>
+          </article>
+          <article>
+            <span>Último disparo</span>
+            <strong>{latestAlert ? formatRelativeTime(latestAlert.createdUtc) : "Sem alerta"}</strong>
+            <small>{latestAlert ? `${latestAlert.server} · ${latestAlert.title}` : "Nenhuma ocorrência recente"}</small>
+          </article>
+        </div>
       </section>
 
       {canManageAlerts && (
-        <Panel title="Regras de Alerta" subtitle="Ajuste thresholds, escopo, exceções e janelas operacionais sem sair da tela.">
-          <p className="inline-note">Os tipos de alerta já vêm prontos. Aqui você ajusta as regras existentes e o comportamento de cada uma.</p>
-          <AlertRulesEditor rules={rules} onChanged={onChanged} onNotify={onNotify} />
-        </Panel>
-      )}
-      <Panel title="Alertas" subtitle="Fila operacional dos itens abertos e já reconhecidos mais recentes.">
-        <div className="alert-table">
-          {alerts.map((alert) => (
-            <article className="alert-row" key={alert.id}>
-              <div className="alert-main">
-                <span className={`badge ${alert.severity}`}>{alert.severity}</span>
-                <strong>{alert.title}</strong>
-                <p>{alert.description}</p>
-                <small>
-                  {alert.server} · {alert.user} · {formatDate(alert.createdUtc)}
-                </small>
-                <div className="alert-links">
-                  <button className="text-button subtle-button" type="button" onClick={() => toggleAlertOperations(alert)}>
-                    {loadingAlertId === alert.id ? "Carregando operações..." : expandedAlertId === alert.id ? "Ocultar operações" : "Ver operações"}
-                  </button>
-                </div>
-                {expandedAlertId === alert.id && (
-                  <AlertOperationList
-                    alert={alert}
-                    events={operationsByAlert[alert.id] ?? []}
-                    loading={loadingAlertId === alert.id}
-                  />
-                )}
-              </div>
-              <div className="alert-actions">
-                <span className={`status ${alert.status}`}>{alert.status}</span>
-                {canManageAlerts && alert.status === "open" && (
-                  <button className="text-button" onClick={() => acknowledgeAlert(alert.id, onAcknowledge, onNotify)}>
-                    <CheckCircle2 size={16} />
-                    Reconhecer
-                  </button>
-                )}
-              </div>
-            </article>
-          ))}
-          {alerts.length === 0 && <EmptyState text="Nenhum alerta encontrado." />}
+        <div className="alerts-tabs" role="tablist" aria-label="Áreas da central de alertas">
+          <button className={activeAlertView === "queue" ? "active" : ""} type="button" role="tab" aria-selected={activeAlertView === "queue"} onClick={() => setActiveAlertView("queue")}>
+            <Bell size={17} />
+            Fila operacional
+            <small>{openAlerts.toLocaleString("pt-BR")}</small>
+          </button>
+          <button className={activeAlertView === "rules" ? "active" : ""} type="button" role="tab" aria-selected={activeAlertView === "rules"} onClick={() => setActiveAlertView("rules")}>
+            <SlidersHorizontal size={17} />
+            Regras e simulação
+            <small>{enabledRules.toLocaleString("pt-BR")}</small>
+          </button>
         </div>
-      </Panel>
+      )}
+
+      {activeAlertView === "queue" && (
+        <section className="alerts-view-section">
+          <div className="alerts-view-heading">
+            <div>
+              <h3>Fila de tratamento</h3>
+              <p>Comece pelos alertas críticos, abra as evidências e reconheça apenas depois da validação.</p>
+            </div>
+            <span><Clock3 size={14} /> {alerts.length.toLocaleString("pt-BR")} alerta(s) carregado(s)</span>
+          </div>
+
+          <div className="alerts-insight-grid">
+            <Panel title="Distribuição dos alertas abertos" subtitle="Pressão atual por nível de criticidade.">
+              <div className="alerts-severity-chart">
+                {severityDistribution.map((item) => (
+                  <div key={item.id}>
+                    <div><span>{item.label}</span><strong>{item.count.toLocaleString("pt-BR")}</strong></div>
+                    <i><b className={item.id} style={{ width: `${Math.max(item.count > 0 ? 4 : 0, (item.count / maximumSeverityCount) * 100)}%` }} /></i>
+                  </div>
+                ))}
+              </div>
+            </Panel>
+            <Panel title="Contexto operacional" subtitle="Sinais para orientar a primeira análise.">
+              <dl className="alerts-context-list">
+                <div><dt>Regra mais recorrente</dt><dd>{topRule ? `${topRule[0]} · ${topRule[1]} alerta(s)` : "Sem recorrência aberta"}</dd></div>
+                <div><dt>Último servidor afetado</dt><dd>{latestAlert?.server ?? "Sem registro"}</dd></div>
+                <div><dt>Eventos envolvidos</dt><dd>{openAlertItems.reduce((total, alert) => total + alert.eventCount, 0).toLocaleString("pt-BR")}</dd></div>
+              </dl>
+            </Panel>
+          </div>
+
+          <section className="panel alert-queue-panel">
+            <header className="alert-queue-header">
+              <div>
+                <h2>Alertas recentes</h2>
+                <p>Exibindo {pagedAlerts.length.toLocaleString("pt-BR")} de {filteredAlerts.length.toLocaleString("pt-BR")} resultado(s).</p>
+              </div>
+              <div className="alert-filter-bar">
+                <label className="alert-search-field">
+                  <Search size={16} />
+                  <input value={alertSearch} onChange={(event) => setAlertSearch(event.target.value)} placeholder="Buscar título, usuário, servidor ou caminho" aria-label="Buscar alertas" />
+                </label>
+                <select value={alertStatusFilter} onChange={(event) => setAlertStatusFilter(event.target.value)} aria-label="Filtrar alertas por status">
+                  <option value="all">Todos os status</option>
+                  <option value="open">Abertos</option>
+                  <option value="acknowledged">Reconhecidos</option>
+                </select>
+                <select value={alertSeverityFilter} onChange={(event) => setAlertSeverityFilter(event.target.value)} aria-label="Filtrar alertas por criticidade">
+                  <option value="all">Todas as criticidades</option>
+                  <option value="critical">Crítico</option>
+                  <option value="high">Alto</option>
+                  <option value="warning">Atenção</option>
+                </select>
+              </div>
+            </header>
+            <div className="alert-table">
+              {pagedAlerts.map((alert) => (
+                <article className={`alert-row alert-row--${alert.severity}`} key={alert.id}>
+                  <div className="alert-main">
+                    <div className="alert-item-heading">
+                      <span className={`badge ${alert.severity}`}>{formatAlertSeverity(alert.severity)}</span>
+                      <strong>{alert.title}</strong>
+                    </div>
+                    <p>{alert.description}</p>
+                    <div className="alert-item-facts">
+                      <span><Server size={14} /> {alert.server}</span>
+                      <span>{alert.user}</span>
+                      <span>{alert.eventCount.toLocaleString("pt-BR")} evento(s)</span>
+                      <span>{formatDate(alert.createdUtc)}</span>
+                    </div>
+                    {alert.samplePaths[0] && <div className="alert-sample-path" title={alert.samplePaths[0]}>{alert.samplePaths[0]}</div>}
+                    <div className="alert-links">
+                      <button className="text-button subtle-button" type="button" onClick={() => toggleAlertOperations(alert)}>
+                        {loadingAlertId === alert.id ? "Carregando operações..." : expandedAlertId === alert.id ? "Ocultar operações" : "Ver operações relacionadas"}
+                      </button>
+                    </div>
+                    {expandedAlertId === alert.id && (
+                      <AlertOperationList alert={alert} events={operationsByAlert[alert.id] ?? []} loading={loadingAlertId === alert.id} />
+                    )}
+                  </div>
+                  <div className="alert-actions">
+                    <span className={`status ${alert.status}`}>{formatAlertStatus(alert.status)}</span>
+                    {canManageAlerts && alert.status === "open" && (
+                      <button className="text-button" onClick={() => acknowledgeAlert(alert.id, onAcknowledge, onNotify)}>
+                        <CheckCircle2 size={16} />
+                        Reconhecer
+                      </button>
+                    )}
+                  </div>
+                </article>
+              ))}
+              {filteredAlerts.length === 0 && <EmptyState text="Nenhum alerta corresponde aos filtros selecionados." />}
+            </div>
+            {filteredAlerts.length > 0 && (
+              <PaginationFooter
+                pagination={{
+                  page: alertPage,
+                  totalPages: alertTotalPages,
+                  pageItems: pagedAlerts.length,
+                  totalItems: filteredAlerts.length,
+                  onPrevious: () => setAlertPage((current) => Math.max(1, current - 1)),
+                  onNext: () => setAlertPage((current) => Math.min(alertTotalPages, current + 1))
+                }}
+              />
+            )}
+          </section>
+        </section>
+      )}
+
+      {canManageAlerts && activeAlertView === "rules" && (
+        <section className="alerts-view-section">
+          <div className="alerts-view-heading">
+            <div>
+              <h3>Regras e simulação</h3>
+              <p>Revise limiares, escopo, janelas e exceções sem percorrer uma tabela extensa.</p>
+            </div>
+            <span><SlidersHorizontal size={14} /> {rules.length.toLocaleString("pt-BR")} regra(s)</span>
+          </div>
+          <AlertRulesEditor rules={rules} onChanged={onChanged} onNotify={onNotify} />
+        </section>
+      )}
     </div>
   );
 }
@@ -2498,6 +3118,7 @@ function AlertRulesEditor({
   const [savingRule, setSavingRule] = useState<string | null>(null);
   const [simulatingRule, setSimulatingRule] = useState<string | null>(null);
   const [simulation, setSimulation] = useState<AlertRuleSimulationResponse | null>(null);
+  const [expandedRule, setExpandedRule] = useState<string | null>(null);
 
   useEffect(() => {
     setDrafts(Object.fromEntries(rules.map((rule) => [rule.rule, rule])));
@@ -2506,174 +3127,138 @@ function AlertRulesEditor({
   const items = rules.map((rule) => drafts[rule.rule] ?? rule);
 
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Regra</th>
-            <th>Ativa</th>
-            <th>Severidade</th>
-            <th>Threshold</th>
-            <th>Threshold 2</th>
-            <th>Severidade 2</th>
-            <th>Servidor</th>
-            <th>Share</th>
-            <th>Path prefix</th>
-            <th>Hora início</th>
-            <th>Hora fim</th>
-            <th>Dias</th>
-            <th>Ignorar usuários</th>
-            <th>Ignorar hosts</th>
-            <th>Ignorar processos</th>
-            <th>Fuso</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((rule) => (
-            <tr key={rule.rule}>
-              <td>
-                <strong>{rule.title}</strong>
-                <span className="muted-id">{rule.rule}</span>
-              </td>
-              <td>
-                <input
-                  type="checkbox"
-                  checked={rule.enabled}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, enabled: event.target.checked } })}
-                />
-              </td>
-              <td>
-                <select value={rule.severity} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, severity: event.target.value } })}>
-                  <option value="warning">warning</option>
-                  <option value="high">high</option>
-                  <option value="critical">critical</option>
-                </select>
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  value={rule.threshold ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, threshold: event.target.value ? Number(event.target.value) : null } })}
-                />
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  value={rule.secondaryThreshold ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, secondaryThreshold: event.target.value ? Number(event.target.value) : null } })}
-                />
-              </td>
-              <td>
-                <select
-                  value={rule.secondarySeverity ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, secondarySeverity: event.target.value || null } })}
-                >
-                  <option value="">-</option>
-                  <option value="high">high</option>
-                  <option value="critical">critical</option>
-                </select>
-              </td>
-              <td>
-                <input
-                  value={rule.serverFilter ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, serverFilter: event.target.value || null } })}
-                  placeholder="FileServer"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.shareFilter ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, shareFilter: event.target.value || null } })}
-                  placeholder="Departamentos"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.pathFilter ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, pathFilter: event.target.value || null } })}
-                  placeholder="D:\\Shares\\Financeiro"
-                />
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={0}
-                  max={23}
-                  value={rule.activeFromHour ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeFromHour: event.target.value ? Number(event.target.value) : null } })}
-                  placeholder="19"
-                />
-              </td>
-              <td>
-                <input
-                  type="number"
-                  min={0}
-                  max={23}
-                  value={rule.activeToHour ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeToHour: event.target.value ? Number(event.target.value) : null } })}
-                  placeholder="7"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.activeDays ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeDays: event.target.value || null } })}
-                  placeholder="seg,ter,qua,qui,sex"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.excludedUsers ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedUsers: event.target.value || null } })}
-                  placeholder="svc_backup,svc_antivirus"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.excludedHosts ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedHosts: event.target.value || null } })}
-                  placeholder="WKS-ADM-01,SRV-BKP-01"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.excludedProcesses ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedProcesses: event.target.value || null } })}
-                  placeholder="robocopy.exe,veeamagent.exe"
-                />
-              </td>
-              <td>
-                <input
-                  value={rule.timeZoneId ?? ""}
-                  onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, timeZoneId: event.target.value || null } })}
-                  placeholder="America/Maceio"
-                />
-              </td>
-              <td className="row-actions">
-                <div className="row-button-stack">
-                  <button
-                    className="text-button"
-                    disabled={savingRule === rule.rule}
-                    onClick={() => updateAlertRule(rule, setSavingRule, onChanged, onNotify)}
-                  >
-                    {savingRule === rule.rule ? "Salvando..." : "Salvar"}
+    <div className="alert-rules-workspace">
+      <div className="alert-rule-list">
+        {items.map((rule) => {
+          const isExpanded = expandedRule === rule.rule;
+          const scope = rule.pathFilter || rule.shareFilter || rule.serverFilter || "Todo o ambiente";
+          const operationalWindow = rule.activeFromHour != null || rule.activeToHour != null
+            ? `${String(rule.activeFromHour ?? 0).padStart(2, "0")}:00–${String(rule.activeToHour ?? 23).padStart(2, "0")}:00`
+            : "Tempo integral";
+
+          return (
+            <article className={`alert-rule-card ${isExpanded ? "expanded" : ""}`} key={rule.rule}>
+              <div className="alert-rule-summary">
+                <div className="alert-rule-identity">
+                  <span className="alert-rule-icon"><SlidersHorizontal size={17} /></span>
+                  <div>
+                    <strong>{rule.title}</strong>
+                    <p>{rule.description}</p>
+                    <small>{rule.rule}</small>
+                  </div>
+                </div>
+                <div className="alert-rule-state">
+                  <span className={`status ${rule.enabled ? "ok" : "paused"}`}>{rule.enabled ? "Ativa" : "Pausada"}</span>
+                  <span className={`badge ${rule.severity}`}>{formatAlertSeverity(rule.severity)}</span>
+                </div>
+                <dl className="alert-rule-facts">
+                  <div><dt>Limiar principal</dt><dd>{rule.threshold?.toLocaleString("pt-BR") ?? "Padrão"}</dd></div>
+                  <div><dt>Escalonamento</dt><dd>{rule.secondaryThreshold ? `${rule.secondaryThreshold.toLocaleString("pt-BR")} · ${formatAlertSeverity(rule.secondarySeverity ?? "high")}` : "Não configurado"}</dd></div>
+                  <div><dt>Escopo</dt><dd title={scope}>{scope}</dd></div>
+                  <div><dt>Janela</dt><dd>{operationalWindow}</dd></div>
+                </dl>
+                <div className="alert-rule-actions">
+                  <button className="text-button" type="button" onClick={() => setExpandedRule(isExpanded ? null : rule.rule)}>
+                    <SlidersHorizontal size={16} />
+                    {isExpanded ? "Fechar edição" : "Editar regra"}
                   </button>
-                  <button
-                    className="text-button"
-                    disabled={simulatingRule === rule.rule}
-                    onClick={() => simulateAlertRule(rule.rule, setSimulatingRule, setSimulation, onNotify)}
-                  >
+                  <button className="text-button subtle-button" type="button" disabled={simulatingRule === rule.rule} onClick={() => simulateAlertRule(rule.rule, setSimulatingRule, setSimulation, onNotify)}>
+                    <Activity size={16} />
                     {simulatingRule === rule.rule ? "Simulando..." : "Simular"}
                   </button>
                 </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              </div>
+
+              {isExpanded && (
+                <div className="alert-rule-editor">
+                  <label className="alert-rule-toggle">
+                    <input type="checkbox" checked={rule.enabled} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, enabled: event.target.checked } })} />
+                    <span>Regra ativa para novos eventos</span>
+                  </label>
+
+                  <div className="alert-rule-editor-grid">
+                    <fieldset>
+                      <legend>Detecção</legend>
+                      <label>Severidade
+                        <select value={rule.severity} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, severity: event.target.value } })}>
+                          <option value="warning">Atenção</option>
+                          <option value="high">Alta</option>
+                          <option value="critical">Crítica</option>
+                        </select>
+                      </label>
+                      <label>Limiar principal
+                        <input type="number" min={1} value={rule.threshold ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, threshold: event.target.value ? Number(event.target.value) : null } })} />
+                      </label>
+                      <label>Limiar secundário
+                        <input type="number" min={1} value={rule.secondaryThreshold ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, secondaryThreshold: event.target.value ? Number(event.target.value) : null } })} />
+                      </label>
+                      <label>Severidade secundária
+                        <select value={rule.secondarySeverity ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, secondarySeverity: event.target.value || null } })}>
+                          <option value="">Sem escalonamento</option>
+                          <option value="high">Alta</option>
+                          <option value="critical">Crítica</option>
+                        </select>
+                      </label>
+                    </fieldset>
+
+                    <fieldset>
+                      <legend>Escopo monitorado</legend>
+                      <label>Servidor
+                        <input value={rule.serverFilter ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, serverFilter: event.target.value || null } })} placeholder="FileServer" />
+                      </label>
+                      <label>Compartilhamento
+                        <input value={rule.shareFilter ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, shareFilter: event.target.value || null } })} placeholder="Corporativo" />
+                      </label>
+                      <label className="wide-field">Prefixo do caminho
+                        <input value={rule.pathFilter ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, pathFilter: event.target.value || null } })} placeholder="C:\\Corporativo\\Financeiro" />
+                      </label>
+                    </fieldset>
+
+                    <fieldset>
+                      <legend>Janela operacional</legend>
+                      <label>Hora inicial
+                        <input type="number" min={0} max={23} value={rule.activeFromHour ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeFromHour: event.target.value ? Number(event.target.value) : null } })} placeholder="19" />
+                      </label>
+                      <label>Hora final
+                        <input type="number" min={0} max={23} value={rule.activeToHour ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeToHour: event.target.value ? Number(event.target.value) : null } })} placeholder="7" />
+                      </label>
+                      <label className="wide-field">Dias ativos
+                        <input value={rule.activeDays ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, activeDays: event.target.value || null } })} placeholder="seg,ter,qua,qui,sex" />
+                      </label>
+                      <label className="wide-field">Fuso horário
+                        <input value={rule.timeZoneId ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, timeZoneId: event.target.value || null } })} placeholder="America/Maceio" />
+                      </label>
+                    </fieldset>
+
+                    <fieldset className="alert-rule-exclusions">
+                      <legend>Exceções</legend>
+                      <label>Ignorar usuários
+                        <input value={rule.excludedUsers ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedUsers: event.target.value || null } })} placeholder="svc_backup,svc_antivirus" />
+                      </label>
+                      <label>Ignorar hosts
+                        <input value={rule.excludedHosts ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedHosts: event.target.value || null } })} placeholder="WKS-ADM-01,SRV-BKP-01" />
+                      </label>
+                      <label>Ignorar processos
+                        <input value={rule.excludedProcesses ?? ""} onChange={(event) => setDrafts({ ...drafts, [rule.rule]: { ...rule, excludedProcesses: event.target.value || null } })} placeholder="robocopy.exe,veeamagent.exe" />
+                      </label>
+                    </fieldset>
+                  </div>
+
+                  <div className="alert-rule-editor-actions">
+                    <button className="primary-button" type="button" disabled={savingRule === rule.rule} onClick={() => updateAlertRule(rule, setSavingRule, onChanged, onNotify)}>
+                      {savingRule === rule.rule ? "Salvando..." : "Salvar configuração"}
+                    </button>
+                    <button className="text-button" type="button" disabled={simulatingRule === rule.rule} onClick={() => simulateAlertRule(rule.rule, setSimulatingRule, setSimulation, onNotify)}>
+                      <Activity size={16} />
+                      {simulatingRule === rule.rule ? "Simulando..." : "Simular regra"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
       {items.length === 0 && <EmptyState text="Nenhuma regra de alerta disponível." />}
       {simulation && (
         <div className="simulation-panel">
@@ -2700,6 +3285,7 @@ function AgentsView({
   const criticalAgents = agents.filter((agent) => agent.operationalStatus === "critical" || agent.isStale).length;
   const staleAgents = attentionAgents + criticalAgents;
   const queuedAgents = agents.filter((agent) => agent.pendingQueueEvents > 0).length;
+  const queuedEvents = agents.reduce((total, agent) => total + Math.max(0, agent.pendingQueueEvents), 0);
   const cycleErrors = agents.filter((agent) => agent.hasCycleError || agent.lastCycle?.error).length;
   const lastHeartbeat = agents
     .map((agent) => agent.lastHeartbeatUtc)
@@ -2707,33 +3293,21 @@ function AgentsView({
     .sort((left, right) => String(right).localeCompare(String(left)))[0];
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Agentes Visíveis"
-          value={agents.length.toLocaleString("pt-BR")}
-          detail="Heartbeat recebido no ambiente monitorado."
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Agentes em Atenção"
-          value={staleAgents.toLocaleString("pt-BR")}
-          detail={`${attentionAgents} atenção · ${criticalAgents} críticos · ${queuedAgents} com fila.`}
-          tone={criticalAgents > 0 ? "danger" : attentionAgents > 0 || queuedAgents > 0 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Erros de Ciclo"
-          value={cycleErrors.toLocaleString("pt-BR")}
-          detail="Última varredura com erro de coleta, correlação ou envio."
-          tone={cycleErrors > 0 ? "danger" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Último Heartbeat"
-          value={lastHeartbeat ? formatDate(lastHeartbeat) : "Sem registro"}
-          detail="Ajuda a perceber rapidamente se a coleta está respirando."
-          tone={lastHeartbeat ? "neutral" : "warning"}
-        />
-      </section>
+    <div className="operations-workspace agents-workspace">
+      <WorkspaceHeader
+        icon={<Server size={21} />}
+        eyebrow="Cobertura da coleta"
+        title="Saúde dos agentes"
+        description="Acompanhe heartbeat, filas locais, duração dos ciclos e entrega de eventos ao Core."
+        status={criticalAgents > 0 ? "Ação imediata" : staleAgents > 0 || queuedAgents > 0 || cycleErrors > 0 ? "Requer atenção" : "Operação estável"}
+        statusTone={criticalAgents > 0 ? "critical" : staleAgents > 0 || queuedAgents > 0 || cycleErrors > 0 ? "attention" : "neutral"}
+        metrics={[
+          { label: "Agentes visíveis", value: agents.length.toLocaleString("pt-BR"), detail: "Com heartbeat registrado" },
+          { label: "Em atenção", value: staleAgents.toLocaleString("pt-BR"), detail: `${attentionAgents} atenção · ${criticalAgents} críticos`, tone: criticalAgents > 0 ? "critical" : staleAgents > 0 ? "attention" : "neutral" },
+          { label: "Fila acumulada", value: queuedEvents.toLocaleString("pt-BR"), detail: `${queuedAgents} agente(s) com pendência`, tone: queuedEvents > 0 ? "attention" : "neutral" },
+          { label: "Último heartbeat", value: lastHeartbeat ? formatRelativeTime(lastHeartbeat) : "Sem registro", detail: lastHeartbeat ? formatDate(lastHeartbeat) : `${cycleErrors} erro(s) de ciclo`, tone: lastHeartbeat ? "neutral" : "critical" }
+        ]}
+      />
 
       <Panel
         title="Core e timeline"
@@ -2793,7 +3367,7 @@ function AgentsView({
         )}
       </Panel>
 
-      <Panel title="Agentes" subtitle="Saúde do coletor, atraso de heartbeat, fila local e progresso no USN.">
+      <Panel title="Coletores registrados" subtitle="Detalhamento do último ciclo, cursores e entrega de cada agente.">
         <div className="agent-grid">
           {agents.map((agent) => (
             <article className="agent-card" key={agent.agentId}>
@@ -2815,7 +3389,7 @@ function AgentsView({
                 </div>
                 <div>
                   <dt>Serviço</dt>
-                  <dd className={`status ${agent.status}`}>{agent.isStale ? "heartbeat atrasado" : agent.status}</dd>
+                  <dd className={`status ${agent.status}`}>{agent.isStale ? "heartbeat atrasado" : formatAgentServiceStatus(agent.status)}</dd>
                 </div>
                 <div>
                   <dt>Último evento</dt>
@@ -2896,8 +3470,11 @@ function MonitoredPathsView({
   const [saving, setSaving] = useState(false);
   const [editingPathId, setEditingPathId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, MonitoredPath>>({});
+  const [showCreateForm, setShowCreateForm] = useState(paths.length === 0);
   const activePaths = paths.filter((path) => path.status === "active").length;
   const criticalPaths = paths.filter((path) => ["high", "critical"].includes(path.priority)).length;
+  const plannedPaths = paths.filter((path) => path.status === "planned").length;
+  const monitoredServers = new Set(paths.map((path) => path.server).filter(Boolean)).size;
 
   useEffect(() => {
     setDrafts(Object.fromEntries(paths.map((path) => [path.id, path])));
@@ -2919,6 +3496,7 @@ function MonitoredPathsView({
       }
 
       setForm(emptyMonitoredPathForm);
+      setShowCreateForm(false);
       onChanged();
       onNotify({ tone: "success", message: "Caminho monitorado adicionado com sucesso." });
     } catch (error) {
@@ -2929,29 +3507,29 @@ function MonitoredPathsView({
   }
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Caminhos Cadastrados"
-          value={paths.length.toLocaleString("pt-BR")}
-          detail={`${activePaths} ativos no recorte atual.`}
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Prioridade Elevada"
-          value={criticalPaths.toLocaleString("pt-BR")}
-          detail="Itens que merecem onboarding e validação com mais cuidado."
-          tone={criticalPaths > 0 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Cobertura Atual"
-          value={paths[0]?.server ?? "Sem servidor"}
-          detail={paths[0] ? "Use a lista abaixo para revisar status e criticidade." : "Cadastre o primeiro share ou pasta crítica."}
-          tone="neutral"
-        />
-      </section>
+    <div className="operations-workspace paths-workspace">
+      <WorkspaceHeader
+        icon={<FolderTree size={21} />}
+        eyebrow="Escopo monitorado"
+        title="Cobertura de caminhos"
+        description="Revise quais servidores, compartilhamentos e pastas fazem parte da auditoria operacional."
+        status={criticalPaths > 0 ? "Prioridades para revisar" : activePaths > 0 ? "Cobertura ativa" : "Cobertura pendente"}
+        statusTone={criticalPaths > 0 ? "attention" : activePaths > 0 ? "neutral" : "attention"}
+        metrics={[
+          { label: "Caminhos cadastrados", value: paths.length.toLocaleString("pt-BR"), detail: `${activePaths} ativos` },
+          { label: "Servidores cobertos", value: monitoredServers.toLocaleString("pt-BR"), detail: "Com escopo cadastrado" },
+          { label: "Prioridade elevada", value: criticalPaths.toLocaleString("pt-BR"), detail: "Alta ou crítica", tone: criticalPaths > 0 ? "attention" : "neutral" },
+          { label: "Planejados", value: plannedPaths.toLocaleString("pt-BR"), detail: "Aguardando ativação" }
+        ]}
+        actions={canManagePaths ? (
+          <button className="text-button" type="button" onClick={() => setShowCreateForm((current) => !current)}>
+            {showCreateForm ? <ArrowLeft size={16} /> : <Plus size={16} />}
+            {showCreateForm ? "Fechar cadastro" : "Adicionar caminho"}
+          </button>
+        ) : null}
+      />
 
-      {canManagePaths && (
+      {canManagePaths && showCreateForm && (
         <Panel title="Novo Caminho Monitorado" subtitle="Cadastre shares e pastas críticas pensando em prioridade, dono e fase do rollout.">
           <form className="path-form" onSubmit={submit}>
             <label>
@@ -3262,6 +3840,51 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
       progress: mostActiveFolder ? Math.min(100, (mostActiveFolder.eventCount / Math.max(summary.observedActivity.totalEvents, 1)) * 100) : 0
     }
   ] as const;
+  const inventoryTabs = [
+    {
+      id: "overview" as const,
+      label: "Visão geral",
+      icon: <BarChart3 size={17} />,
+      title: "Situação atual do compartilhamento",
+      description: "Score, evolução do ciclo e decisões prioritárias em uma leitura executiva."
+    },
+    {
+      id: "capacity" as const,
+      label: "Capacidade",
+      icon: <Database size={17} />,
+      title: "Consumo e concentração de dados",
+      description: "Entenda onde o espaço está concentrado, o que mais cresceu e quais tipos sustentam o volume."
+    },
+    {
+      id: "cleanup" as const,
+      label: "Limpeza",
+      icon: <FileClock size={17} />,
+      title: "Candidatos para revisão e arquivamento",
+      description: "Priorize arquivos frios, sem acesso observado, antigos ou desproporcionalmente grandes."
+    },
+    {
+      id: "risk" as const,
+      label: "Risco",
+      icon: <ShieldAlert size={17} />,
+      title: "Itens sensíveis e falhas de leitura",
+      description: "Revise executáveis, scripts, erros do scan e achados que exigem validação de segurança."
+    },
+    {
+      id: "activity" as const,
+      label: "Atividade",
+      icon: <Activity size={17} />,
+      title: "Uso real do ambiente",
+      description: "Acompanhe áreas, usuários e ações que concentraram eventos correlacionados."
+    },
+    {
+      id: "snapshots" as const,
+      label: "Snapshots",
+      icon: <CalendarDays size={17} />,
+      title: "Histórico de varreduras",
+      description: "Verifique cobertura, duração e qualidade dos scans usados nas comparações gerenciais."
+    }
+  ];
+  const activeInventoryView = inventoryTabs.find((tab) => tab.id === activeInventoryTab) ?? inventoryTabs[0];
 
   return (
     <div className="inventory-workspace">
@@ -3323,7 +3946,7 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
           </div>
           <div>
             <dt>Status</dt>
-            <dd>{summary.status === "ready" ? "Catálogo disponível" : summary.status}</dd>
+            <dd>{summary.status === "ready" ? "Catálogo disponível" : formatInventoryStatus(summary.status)}</dd>
           </div>
           <div>
             <dt>Atividade observada</dt>
@@ -3333,26 +3956,39 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
       </section>
 
       <div className="inventory-tabs" role="tablist" aria-label="Navegação do inventário">
-        {[
-          ["overview", "Visão geral"],
-          ["capacity", "Capacidade"],
-          ["cleanup", "Limpeza"],
-          ["risk", "Risco"],
-          ["activity", "Atividade"],
-          ["snapshots", "Snapshots"]
-        ].map(([id, label]) => (
+        {inventoryTabs.map((tab) => (
           <button
-            key={id}
-            className={activeInventoryTab === id ? "active" : ""}
+            key={tab.id}
+            className={activeInventoryTab === tab.id ? "active" : ""}
             type="button"
-            onClick={() => setActiveInventoryTab(id as typeof activeInventoryTab)}
+            role="tab"
+            aria-selected={activeInventoryTab === tab.id}
+            onClick={() => {
+              setActiveInventoryTab(tab.id);
+              if (tab.id === "cleanup") {
+                void loadInventoryItems("inactive365");
+              } else if (tab.id === "risk") {
+                void loadInventoryItems("executable");
+              }
+            }}
           >
-            {label}
+            {tab.icon}
+            <span>{tab.label}</span>
           </button>
         ))}
       </div>
 
       <div className={`inventory-tabbed-content inventory-tab-${activeInventoryTab}`}>
+      <header className="inventory-view-header">
+        <div>
+          <h3>{activeInventoryView.title}</h3>
+          <p>{activeInventoryView.description}</p>
+        </div>
+        <span className="inventory-view-freshness">
+          <Clock3 size={15} />
+          {summary.finishedUtc ? `Atualizado em ${formatDate(summary.finishedUtc)}` : "Scan em andamento"}
+        </span>
+      </header>
       <section className="inventory-section inventory-pane-overview" aria-label="Leitura executiva qbr">
         <div className="inventory-section-header">
           <div>
@@ -3422,13 +4058,13 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
         </div>
       </section>
 
-      <section className="inventory-section inventory-pane-overview" aria-label="Panorama executivo">
+      <section className="inventory-section inventory-pane-capacity" aria-label="Panorama de capacidade">
         <div className="inventory-section-header">
           <div>
-            <span className="inventory-section-kicker">Panorama executivo</span>
-            <h3>Leitura rápida do ambiente monitorado</h3>
+            <span className="inventory-section-kicker">Indicadores de capacidade</span>
+            <h3>Tamanho, crescimento e concentração</h3>
           </div>
-          <p>Um retrato do tamanho, atividade e sinais de atenção do compartilhamento.</p>
+          <p>Os números essenciais para dimensionar o compartilhamento e acompanhar sua evolução.</p>
         </div>
         <div className="inventory-kpi-grid">
           <InventoryKpiCard
@@ -3453,30 +4089,30 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
             tone={summary.growth.totalBytesDelta > 0 ? "amber" : "green"}
           />
           <InventoryKpiCard
-            icon={<Activity size={18} />}
-            label="Atividade observada"
-            value={summary.observedActivity.totalEvents.toLocaleString("pt-BR")}
-            detail="Eventos reais cruzados com a timeline persistida"
-            tone="green"
+            icon={<FolderTree size={18} />}
+            label="Maior concentração"
+            value={largestFolder ? formatBytes(largestFolder.totalBytes) : "0 B"}
+            detail={largestFolder?.path ?? "Sem pasta dominante"}
+            tone={capacityHotspotPercent >= 40 ? "amber" : "blue"}
           />
           <InventoryKpiCard
-            icon={<ClipboardList size={18} />}
-            label="Recomendações abertas"
-            value={summary.recommendations.length.toLocaleString("pt-BR")}
-            detail="Achados prontos para revisão ou limpeza"
-            tone={summary.recommendations.length > 0 ? "amber" : "green"}
+            icon={<FileClock size={18} />}
+            label="Volume frio"
+            value={formatBytes(summary.governance.inactive365DaysBytes)}
+            detail={`${summary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} arquivo(s) há mais de 365 dias`}
+            tone={summary.governance.inactive365DaysBytes > 0 ? "amber" : "green"}
           />
           <InventoryKpiCard
-            icon={<ShieldAlert size={18} />}
-            label="Itens sensíveis à revisão"
-            value={(summary.governance.executableFileCount + summary.governance.largeFileCount).toLocaleString("pt-BR")}
-            detail="Executáveis, scripts e arquivos grandes"
-            tone="danger"
+            icon={<Files size={18} />}
+            label="Arquivos grandes"
+            value={summary.governance.largeFileCount.toLocaleString("pt-BR")}
+            detail={`${formatBytes(summary.governance.largeFileBytes)} acima de 1 GB`}
+            tone={summary.governance.largeFileCount > 0 ? "amber" : "green"}
           />
         </div>
       </section>
 
-      <section className="inventory-section inventory-pane-overview inventory-pane-activity" aria-label="Painel gerencial contínuo">
+      <section className="inventory-section inventory-pane-activity" aria-label="Painel de atividade">
         <div className="inventory-section-header">
           <div>
             <span className="inventory-section-kicker">Painel gerencial contínuo</span>
@@ -3530,81 +4166,9 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
           </Panel>
         </div>
 
-        <Panel title="Fila gerencial de decisão" subtitle="Recomendações prontas para virar plano de ação no próximo ciclo.">
-          {summary.executiveOverview.priorities.length === 0 ? (
-            <EmptyState text="Sem prioridades abertas no snapshot atual." />
-          ) : (
-            <div className="inventory-priority-list">
-              {summary.executiveOverview.priorities.map((item) => (
-                <article key={`${item.title}-${item.detail}`} className={`inventory-priority-item ${item.tone}`}>
-                  <div className="inventory-priority-head">
-                    <strong>{item.title}</strong>
-                    <span className={`status ${item.severity === "warning" ? "critical" : "attention"}`}>{item.severity}</span>
-                  </div>
-                  <p>{item.detail}</p>
-                </article>
-              ))}
-            </div>
-          )}
-        </Panel>
       </section>
 
-      <section className="inventory-section inventory-pane-overview" aria-label="Leitura do ciclo">
-        <div className="inventory-section-header">
-          <div>
-            <span className="inventory-section-kicker">Leitura do ciclo</span>
-            <h3>Como o compartilhamento está se comportando agora</h3>
-          </div>
-          <p>Uma leitura curta para dizer se o ambiente melhorou, se manteve ou se pede reação mais rápida.</p>
-        </div>
-        <div className="inventory-cycle-grid">
-          <InventorySignalCard
-            title="Score de higiene"
-            value={`${summary.insight?.score ?? 0}`}
-            caption={summary.insight?.score && summary.insight.score >= 85 ? "ambiente bem organizado" : summary.insight?.score && summary.insight.score >= 65 ? "atenção gerenciável" : "prioridade de revisão"}
-            tone={summary.insight?.tone ?? "green"}
-            bullets={[
-              `${formatPercent((summary.governance.inactive365DaysBytes / Math.max(summary.totalBytes, 1)) * 100)} do volume está frio há +365 dias`,
-              `${formatPercent((summary.governance.neverAccessedBytes / Math.max(summary.totalBytes, 1)) * 100)} sem acesso observado`,
-              `${summary.recommendations.length.toLocaleString("pt-BR")} recomendação(ões) em aberto`
-            ]}
-          />
-          <InventorySignalCard
-            title="Comparação do ciclo"
-            value={cycleStatusLabel}
-            caption={summary.comparison.previousStartedUtc ? `Comparado ao snapshot de ${formatDate(summary.comparison.previousStartedUtc)}` : "Sem ciclo anterior para comparar"}
-            tone={summary.insight?.trend === "improved" ? "green" : summary.insight?.trend === "worsened" ? "danger" : "blue"}
-            bullets={[
-              summary.comparison.previousStartedUtc ? `Variação de volume: ${formatPercent(summary.comparison.totalBytesGrowthPercent)}` : "Primeiro ciclo comparável ainda não disponível",
-              `Delta de arquivos: ${formatSignedNumber(summary.growth.fileCountDelta)}`,
-              `Delta de pastas: ${formatSignedNumber(summary.growth.folderCountDelta)}`
-            ]}
-          />
-          <InventorySignalCard
-            title="Melhorou"
-            value={`${summary.insight?.positives.length ?? 0}`}
-            caption="Sinais positivos identificados"
-            tone="green"
-            bullets={summary.insight?.positives.length ? summary.insight.positives.slice(0, 3) : ["Sem destaque positivo neste ciclo."]}
-          />
-          <InventorySignalCard
-            title="Manteve"
-            value={`${summary.insight?.stables.length ?? 0}`}
-            caption="Aspectos sem mudança brusca"
-            tone="blue"
-            bullets={summary.insight?.stables.length ? summary.insight.stables.slice(0, 3) : ["Nenhum sinal estável destacado neste ciclo."]}
-          />
-          <InventorySignalCard
-            title="Piorou"
-            value={`${summary.insight?.attentions.length ?? 0}`}
-            caption="Pontos que pedem intervenção"
-            tone="danger"
-            bullets={summary.insight?.attentions.length ? summary.insight.attentions.slice(0, 3) : ["Nenhum agravamento relevante percebido neste ciclo."]}
-          />
-        </div>
-      </section>
-
-      <section className="inventory-section inventory-pane-cleanup inventory-pane-risk inventory-pane-activity" aria-label="Risco e uso">
+      <section className="inventory-section inventory-pane-cleanup" aria-label="Candidatos de limpeza">
         <div className="inventory-section-header">
           <div>
             <span className="inventory-section-kicker">Risco e uso</span>
@@ -3617,33 +4181,33 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
           <InventoryActionMetric icon={<FileClock size={19} />} label="Arquivos frios" value={summary.governance.inactive365DaysFileCount} detail={`${formatBytes(summary.governance.inactive365DaysBytes)} sem alteração há mais de um ano`} tone="warning" />
           <InventoryActionMetric icon={<Clock3 size={19} />} label="Sem registro de acesso" value={summary.governance.neverAccessedFileCount} detail={formatBytes(summary.governance.neverAccessedBytes)} tone="neutral" />
           <InventoryActionMetric icon={<Files size={19} />} label="Arquivos grandes" value={summary.governance.largeFileCount} detail={`${formatBytes(summary.governance.largeFileBytes)} acima de 1 GB`} tone="warning" />
-          <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
+          <InventoryActionMetric icon={<ClipboardList size={19} />} label="Recomendações" value={summary.recommendations.length} detail="Sugestões de revisão no snapshot atual" tone={summary.recommendations.length > 0 ? "warning" : "neutral"} />
         </section>
 
-        <div className="inventory-analysis-grid">
-          <Panel title="Composição do armazenamento" subtitle="Tipos de conteúdo que mais ocupam espaço.">
-            <InventoryCategoryChart items={summary.contentCategories} />
+        <div className="inventory-analysis-grid inventory-analysis-grid--two">
+          <Panel title="Pressão de limpeza" subtitle="Participação dos principais candidatos no volume catalogado.">
+            <InventoryRatioList items={governanceRatioItems.filter((item) => item.label !== "Executáveis e scripts")} />
           </Panel>
           <Panel title="Ciclo de vida dos arquivos" subtitle="Distribuição pela última modificação conhecida.">
             <InventoryAgeChart buckets={summary.ageBuckets} />
           </Panel>
-          <Panel title="Atividade observada" subtitle="Ações correlacionadas nos últimos 30 dias.">
-            <div className="inventory-activity-total">
-              <Activity size={20} />
-              <strong>{summary.observedActivity.totalEvents.toLocaleString("pt-BR")}</strong>
-              <span>eventos reais</span>
-            </div>
-            <InventoryRanking
-              items={summary.observedActivity.topFolders}
-              getKey={(item) => item.path}
-              renderLabel={(item) => item.path}
-              renderValue={(item) => `${item.eventCount.toLocaleString("pt-BR")}`}
-              renderDetail={(item) => `${item.topAction} · ${formatDate(item.lastActivityUtc)}`}
-              maxValue={Math.max(...summary.observedActivity.topFolders.map((item) => item.eventCount), 1)}
-              getBarValue={(item) => item.eventCount}
-            />
-          </Panel>
         </div>
+      </section>
+
+      <section className="inventory-section inventory-pane-risk" aria-label="Sinais de risco">
+        <div className="inventory-section-header">
+          <div>
+            <span className="inventory-section-kicker">Triagem de risco</span>
+            <h3>Itens que exigem validação antes de permanecerem no compartilhamento</h3>
+          </div>
+          <p>Contagens do snapshot atual para orientar revisão técnica e correção de cobertura.</p>
+        </div>
+        <section className="inventory-action-strip" aria-label="Indicadores de risco">
+          <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
+          <InventoryActionMetric icon={<AlertTriangle size={19} />} label="Erros de leitura" value={summary.errorCount} detail="Itens sem catalogação completa no último scan" tone={summary.errorCount > 0 ? "danger" : "neutral"} />
+          <InventoryActionMetric icon={<Files size={19} />} label="Arquivos acima de 1 GB" value={summary.governance.largeFileCount} detail={formatBytes(summary.governance.largeFileBytes)} tone="warning" />
+          <InventoryActionMetric icon={<ClipboardList size={19} />} label="Recomendações abertas" value={summary.recommendations.length} detail="Achados aguardando avaliação operacional" tone={summary.recommendations.length > 0 ? "warning" : "neutral"} />
+        </section>
       </section>
 
       <section className="inventory-section inventory-pane-cleanup inventory-pane-risk" aria-label="Prioridades de revisão">
@@ -3703,11 +4267,18 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
         <div className="inventory-section-header">
           <div>
             <span className="inventory-section-kicker">Exploração detalhada</span>
-            <h3>Achados, crescimento e itens que merecem auditoria fina</h3>
+            <h3>
+              {activeInventoryTab === "capacity"
+                ? "Onde o volume está crescendo"
+                : activeInventoryTab === "cleanup"
+                  ? "Quais itens podem sair do armazenamento ativo"
+                  : "Quais itens exigem validação técnica"}
+            </h3>
           </div>
-          <p>Essa camada é útil para a equipe aprofundar a análise sem sair do inventário.</p>
+          <p>Abra os achados do snapshot atual e avance da tendência agregada para os arquivos que explicam o indicador.</p>
         </div>
 
+        {(activeInventoryTab === "cleanup" || activeInventoryTab === "risk") && (
         <Panel title="Investigar achados" subtitle="Revise itens do último snapshot sem executar uma nova varredura.">
           <div className="toolbar">
             {[
@@ -3767,32 +4338,64 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
             </div>
           )}
         </Panel>
+        )}
 
-        <Panel title="Pastas que mais cresceram" subtitle="Comparação entre o snapshot atual e o anterior do mesmo compartilhamento.">
-          <InventoryRanking
-            items={summary.growth.topGrowingFolders}
-            getKey={(item) => item.path}
-            renderLabel={(item) => item.path}
-            renderValue={(item) => formatSignedBytes(item.totalBytesDelta)}
-            renderDetail={(item) => `${formatSignedNumber(item.fileCountDelta)} arquivo(s) · ${formatSignedNumber(item.folderCountDelta)} pasta(s)`}
-            maxValue={Math.max(...summary.growth.topGrowingFolders.map((item) => item.totalBytesDelta), 1)}
-            getBarValue={(item) => item.totalBytesDelta}
-          />
-        </Panel>
+        {activeInventoryTab === "capacity" && (
+          <div className="inventory-details-grid">
+            <Panel title="Pastas com maior consumo" subtitle="Áreas que concentram mais dados no compartilhamento.">
+              <InventoryRanking
+                items={summary.topFolders}
+                getKey={(item) => item.path}
+                renderLabel={(item) => item.path}
+                renderValue={(item) => formatBytes(item.totalBytes)}
+                renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivos · ${item.folderCount.toLocaleString("pt-BR")} pastas`}
+                maxValue={Math.max(...summary.topFolders.map((item) => item.totalBytes), 1)}
+              />
+            </Panel>
+            <Panel title="Pastas que mais cresceram" subtitle="Comparação entre o snapshot atual e o anterior do mesmo compartilhamento.">
+              <InventoryRanking
+                items={summary.growth.topGrowingFolders}
+                getKey={(item) => item.path}
+                renderLabel={(item) => item.path}
+                renderValue={(item) => formatSignedBytes(item.totalBytesDelta)}
+                renderDetail={(item) => `${formatSignedNumber(item.fileCountDelta)} arquivo(s) · ${formatSignedNumber(item.folderCountDelta)} pasta(s)`}
+                maxValue={Math.max(...summary.growth.topGrowingFolders.map((item) => item.totalBytesDelta), 1)}
+                getBarValue={(item) => item.totalBytesDelta}
+              />
+            </Panel>
+          </div>
+        )}
 
-        <div className="inventory-details-grid">
-          <Panel title="Maiores arquivos" subtitle="Candidatos para revisão de consumo, arquivamento ou política de retenção.">
-            <InventoryRanking
-              items={summary.topLargeFiles}
-              getKey={(item) => item.path}
-              renderLabel={(item) => item.name}
-              renderValue={(item) => formatBytes(item.sizeBytes)}
-              renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
-              maxValue={Math.max(...summary.topLargeFiles.map((item) => item.sizeBytes), 1)}
-              getBarValue={(item) => item.sizeBytes}
-            />
-          </Panel>
+        {activeInventoryTab === "capacity" && (
+          <div className="inventory-analysis-grid">
+            <Panel title="Composição do armazenamento" subtitle="Tipos de conteúdo que mais ocupam espaço.">
+              <InventoryCategoryChart items={summary.contentCategories} />
+            </Panel>
+            <Panel title="Maiores arquivos" subtitle="Candidatos para revisão de consumo, arquivamento ou política de retenção.">
+              <InventoryRanking
+                items={summary.topLargeFiles}
+                getKey={(item) => item.path}
+                renderLabel={(item) => item.name}
+                renderValue={(item) => formatBytes(item.sizeBytes)}
+                renderDetail={(item) => `${item.path} · ${formatInventoryFileAge(item)}`}
+                maxValue={Math.max(...summary.topLargeFiles.map((item) => item.sizeBytes), 1)}
+                getBarValue={(item) => item.sizeBytes}
+              />
+            </Panel>
+            <Panel title="Top extensões por tamanho" subtitle="Tipos que sustentam a maior parte do consumo catalogado.">
+              <InventoryRanking
+                items={summary.topExtensions}
+                getKey={(item) => item.extension}
+                renderLabel={(item) => item.extension}
+                renderValue={(item) => formatBytes(item.totalBytes)}
+                renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s)`}
+                maxValue={Math.max(...summary.topExtensions.map((item) => item.totalBytes), 1)}
+              />
+            </Panel>
+          </div>
+        )}
 
+        {activeInventoryTab === "cleanup" && (
           <Panel title="Arquivos antigos" subtitle="Itens com modificação mais antiga no snapshot atual.">
             <InventoryRanking
               items={summary.topInactiveFiles}
@@ -3804,9 +4407,9 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
               getBarValue={(item) => item.ageDays ?? 0}
             />
           </Panel>
-        </div>
+        )}
 
-        <div className="inventory-details-grid">
+        {activeInventoryTab === "risk" && (
           <Panel title="Executáveis e scripts encontrados" subtitle="Arquivos que merecem revisão rápida em compartilhamentos corporativos.">
             <InventoryRanking
               items={summary.topExecutableFiles}
@@ -3818,18 +4421,7 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
               getBarValue={(item) => item.sizeBytes}
             />
           </Panel>
-
-          <Panel title="Top extensões por tamanho" subtitle="Ajuda a encontrar arquivos de mídia, backup, PST, ISO e outros consumidores.">
-            <InventoryRanking
-              items={summary.topExtensions}
-              getKey={(item) => item.extension}
-              renderLabel={(item) => item.extension}
-              renderValue={(item) => formatBytes(item.totalBytes)}
-              renderDetail={(item) => `${item.fileCount.toLocaleString("pt-BR")} arquivo(s)`}
-              maxValue={Math.max(...summary.topExtensions.map((item) => item.totalBytes), 1)}
-            />
-          </Panel>
-        </div>
+        )}
       </section>
 
       <div className="inventory-pane-snapshots">
@@ -3956,35 +4548,6 @@ function InventoryKpiCard({
       </div>
       <strong>{value}</strong>
       <small>{detail}</small>
-    </article>
-  );
-}
-
-function InventorySignalCard({
-  title,
-  value,
-  caption,
-  bullets,
-  tone
-}: {
-  title: string;
-  value: string;
-  caption: string;
-  bullets: string[];
-  tone: "green" | "blue" | "amber" | "danger";
-}) {
-  return (
-    <article className={`inventory-signal-card ${tone}`}>
-      <div className="inventory-signal-head">
-        <span>{title}</span>
-        <strong>{value}</strong>
-      </div>
-      <p>{caption}</p>
-      <ul>
-        {bullets.map((item) => (
-          <li key={`${title}-${item}`}>{item}</li>
-        ))}
-      </ul>
     </article>
   );
 }
@@ -4210,43 +4773,60 @@ function DatabaseCapacityView({ onNotify }: { onNotify: (notice: Notice | null) 
 
   if (!capacity) {
     return (
-      <Panel title="Capacidade do Banco" subtitle={loading ? "Carregando capacidade..." : "Sem dados carregados."}>
-        <EmptyState text={loading ? "Consultando SQL Server..." : "Clique em atualizar para carregar a capacidade."} />
-      </Panel>
+      <div className="operations-workspace database-workspace">
+        <WorkspaceHeader
+          icon={<Database size={21} />}
+          eyebrow="Persistência da aplicação"
+          title="Capacidade e retenção"
+          description="Acompanhe crescimento, ocupação das tabelas e cobertura temporal dos dados operacionais."
+          status={loading ? "Consultando SQL Server" : "Dados indisponíveis"}
+          statusTone={loading ? "neutral" : "attention"}
+          metrics={[
+            { label: "Linhas", value: "-", detail: "Aguardando consulta" },
+            { label: "Espaço reservado", value: "-", detail: "Aguardando consulta" },
+            { label: "Timeline", value: "-", detail: "Aguardando consulta" },
+            { label: "Atualização", value: "-", detail: "Sem leitura concluída" }
+          ]}
+          actions={(
+            <button className="text-button" type="button" onClick={loadCapacity} disabled={loading}>
+              <RefreshCcw size={16} />
+              {loading ? "Atualizando..." : "Tentar novamente"}
+            </button>
+          )}
+        />
+        <Panel title="Leitura de capacidade" subtitle="A consulta requer acesso administrativo ao SQL Server da aplicação.">
+          <EmptyState text={loading ? "Consultando SQL Server..." : "Nenhum dado de capacidade foi retornado."} />
+        </Panel>
+      </div>
     );
   }
 
+  const largestTable = [...capacity.tables].sort((left, right) => right.usedMb - left.usedMb)[0];
+
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Linhas Totais"
-          value={capacity.totalRows.toLocaleString("pt-BR")}
-          detail={`Provider ${capacity.provider}. Atualizado em ${formatDate(capacity.generatedUtc)}.`}
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Espaço Reservado"
-          value={formatMegabytes(capacity.totalReservedMb)}
-          detail="Soma das tabelas principais da aplicação."
-          tone={capacity.totalReservedMb > 102400 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Timeline Correlacionada"
-          value={capacity.timelineRows.toLocaleString("pt-BR")}
-          detail={timelineWindow?.fromUtc ? `${formatDate(timelineWindow.fromUtc)} até ${formatDate(timelineWindow.toUtc ?? timelineWindow.fromUtc)}` : "Sem janela registrada."}
-          tone="neutral"
-        />
-      </section>
+    <div className="operations-workspace database-workspace">
+      <WorkspaceHeader
+        icon={<Database size={21} />}
+        eyebrow="Persistência da aplicação"
+        title="Capacidade e retenção"
+        description="Acompanhe crescimento, ocupação das tabelas e cobertura temporal dos dados operacionais."
+        status={capacity.totalReservedMb > 102400 ? "Planejar capacidade" : "Capacidade sob controle"}
+        statusTone={capacity.totalReservedMb > 102400 ? "attention" : "neutral"}
+        metrics={[
+          { label: "Linhas totais", value: capacity.totalRows.toLocaleString("pt-BR"), detail: `Provider ${capacity.provider}` },
+          { label: "Espaço reservado", value: formatMegabytes(capacity.totalReservedMb), detail: "Tabelas principais", tone: capacity.totalReservedMb > 102400 ? "attention" : "neutral" },
+          { label: "Timeline correlacionada", value: capacity.timelineRows.toLocaleString("pt-BR"), detail: timelineWindow?.fromUtc ? `Desde ${formatDate(timelineWindow.fromUtc)}` : "Sem janela registrada" },
+          { label: "Maior tabela", value: largestTable?.name ?? "Sem dados", detail: largestTable ? formatMegabytes(largestTable.usedMb) : "Sem ocupação detalhada" }
+        ]}
+        actions={(
+          <button className="text-button" type="button" onClick={loadCapacity} disabled={loading}>
+            <RefreshCcw size={16} />
+            {loading ? "Atualizando..." : "Atualizar capacidade"}
+          </button>
+        )}
+      />
 
       {capacity.message && <div className="sync-banner">{capacity.message}</div>}
-
-      <div className="toolbar">
-        <button className="text-button" type="button" onClick={loadCapacity} disabled={loading}>
-          <RefreshCcw size={16} />
-          {loading ? "Atualizando..." : "Atualizar capacidade"}
-        </button>
-      </div>
 
       <Panel title="Tabelas principais" subtitle="Volume e espaço reservado para os dados que mais crescem em produção.">
         <div className="table-wrap">
@@ -4330,32 +4910,27 @@ function AdminAuditView({ entries }: { entries: AdminAuditEntry[] }) {
     );
   }, [entries, filter]);
   const uniqueActors = useMemo(() => new Set(filteredEntries.map((entry) => entry.actor).filter(Boolean)).size, [filteredEntries]);
+  const uniqueActions = useMemo(() => new Set(filteredEntries.map((entry) => entry.action).filter(Boolean)).size, [filteredEntries]);
   const latestAudit = filteredEntries[0]?.timestampUtc ?? null;
 
   return (
-    <div className="view-stack">
-      <section className="executive-grid">
-        <ExecutiveCard
-          title="Registros no Recorte"
-          value={filteredEntries.length.toLocaleString("pt-BR")}
-          detail="Ações administrativas visíveis com o filtro atual."
-          tone="neutral"
-        />
-        <ExecutiveCard
-          title="Operadores"
-          value={uniqueActors.toLocaleString("pt-BR")}
-          detail="Pessoas ou integrações que alteraram configuração ou cadastro."
-          tone={uniqueActors > 3 ? "warning" : "neutral"}
-        />
-        <ExecutiveCard
-          title="Última Alteração"
-          value={latestAudit ? formatDate(latestAudit) : "Sem registro"}
-          detail={filter.trim() ? `Filtro ativo: ${filter.trim()}` : "Sem filtro adicional aplicado."}
-          tone="neutral"
-        />
-      </section>
+    <div className="operations-workspace audit-workspace">
+      <WorkspaceHeader
+        icon={<ClipboardList size={21} />}
+        eyebrow="Governança administrativa"
+        title="Trilha de alterações"
+        description="Revise mudanças de configuração, responsáveis, origem e detalhes das operações administrativas."
+        status={filteredEntries.length > 0 ? "Auditoria disponível" : "Sem registros no recorte"}
+        statusTone={filteredEntries.length > 0 ? "neutral" : "attention"}
+        metrics={[
+          { label: "Registros no recorte", value: filteredEntries.length.toLocaleString("pt-BR"), detail: filter.trim() ? "Filtro aplicado" : "Sem filtro adicional" },
+          { label: "Operadores", value: uniqueActors.toLocaleString("pt-BR"), detail: "Pessoas ou integrações" },
+          { label: "Tipos de ação", value: uniqueActions.toLocaleString("pt-BR"), detail: "Mudanças distintas" },
+          { label: "Última alteração", value: latestAudit ? formatRelativeTime(latestAudit) : "Sem registro", detail: latestAudit ? formatDate(latestAudit) : "Aguardando atividade" }
+        ]}
+      />
 
-      <div className="toolbar">
+      <section className="workspace-control-bar">
         <label className="search-box">
           <Search size={18} />
           <input
@@ -4364,7 +4939,8 @@ function AdminAuditView({ entries }: { entries: AdminAuditEntry[] }) {
             placeholder="Filtrar por ação, entidade, operador ou IP"
           />
         </label>
-      </div>
+        <span className="workspace-control-summary">{filteredEntries.length.toLocaleString("pt-BR")} resultado(s)</span>
+      </section>
       <Panel title="Auditoria Administrativa" subtitle="Trilha de mudanças operacionais para apoiar governança e troubleshooting.">
         <div className="table-wrap">
           <table>
@@ -4693,14 +5269,32 @@ function FeedbackBanner({
   );
 }
 
-async function fetchJson<T>(path: string, options: { timeoutMs?: number } = {}): Promise<T> {
+async function fetchJson<T>(
+  path: string,
+  options: { timeoutMs?: number; timeoutMessage?: string } = {}
+): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
 
-  const response = await fetch(`${apiBaseUrl}${path}`, {
-    headers: buildHeaders(),
-    signal: controller.signal
-  }).finally(() => window.clearTimeout(timeout));
+  try {
+    response = await fetch(`${apiBaseUrl}${path}`, {
+      headers: buildHeaders(),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        options.timeoutMessage
+          ?? `A API não respondeu em ${Math.ceil(timeoutMs / 1000)} segundos. Tente novamente.`
+      );
+    }
+
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     throw new Error(await readErrorMessage(response, `${response.status} ao chamar ${path}`));
@@ -4846,12 +5440,54 @@ function buildReportEventsUrl(filters: ReportFilters, take = 5000) {
   return `/api/events/timeline?${params.toString()}`;
 }
 
-function getReportEventTake(scenarioId: ReportScenarioId | null) {
-  if (scenarioId === "executive-qbr" || scenarioId === "capacity-cleanup" || scenarioId === "cold-data") {
-    return 3000;
+function getReportEventTake(_scenarioId: ReportScenarioId | null) {
+  return 1000;
+}
+
+function settledValue<T>(result: PromiseSettledResult<T>): T | null {
+  return result.status === "fulfilled" ? result.value : null;
+}
+
+async function fetchActivitySummaryForReport(filters: ReportFilters) {
+  const path = buildReportAggregateUrl("/api/reports/activity-summary", filters);
+  return path ? fetchJson<ActivitySummary>(path, { timeoutMs: 20_000 }) : null;
+}
+
+async function fetchBaselineAnomaliesForReport(filters: ReportFilters) {
+  const path = buildReportAggregateUrl("/api/reports/baseline-anomalies", filters);
+  return path ? fetchJson<BaselineAnomalyResponse>(path, { timeoutMs: 20_000 }) : null;
+}
+
+function buildReportAggregateUrl(path: string, filters: ReportFilters) {
+  if (
+    filters.path.trim()
+    || filters.sourceHost.trim()
+    || filters.sourceIp.trim()
+    || filters.extension.trim()
+    || filters.result.trim()
+    || filters.severity.trim()
+  ) {
+    return null;
   }
 
-  return 10000;
+  const params = new URLSearchParams({ take: "20" });
+  if (filters.periodMode === "custom" && filters.fromDate) {
+    const fromDate = new Date(`${filters.fromDate}T00:00:00`);
+    const toDate = filters.toDate ? new Date(`${filters.toDate}T23:59:59.999`) : new Date(`${filters.fromDate}T23:59:59.999`);
+    params.set("fromUtc", fromDate.toISOString());
+    params.set("toUtc", toDate.toISOString());
+  } else {
+    const periodHours = Number(filters.periodHours);
+    if (Number.isFinite(periodHours) && periodHours > 0) {
+      params.set("fromUtc", new Date(Date.now() - periodHours * 60 * 60 * 1000).toISOString());
+    }
+  }
+
+  if (filters.server.trim()) params.set("server", filters.server.trim());
+  if (filters.share.trim()) params.set("share", filters.share.trim());
+  if (filters.user.trim()) params.set("user", filters.user.trim());
+  if (filters.action.trim()) params.set("action", filters.action.trim());
+  return `${path}?${params.toString()}`;
 }
 
 async function fetchInventorySummaryForReport(filters: ReportFilters) {
@@ -5121,16 +5757,8 @@ function buildHeaders() {
   const headers: Record<string, string> = {};
   const token = localStorage.getItem(authTokenStorageKey);
 
-  if (apiKey) {
-    headers["X-Api-Key"] = apiKey;
-  }
-
   if (token) {
     headers.Authorization = `Bearer ${token}`;
-  }
-
-  if (actorName) {
-    headers["X-Actor"] = actorName;
   }
 
   return Object.keys(headers).length > 0 ? headers : undefined;
@@ -5189,7 +5817,7 @@ function resolveAccessRole(authStatus: AuthStatusResponse | null, authUser: Auth
 }
 
 function getVisibleTabs(policy: AccessPolicy): Tab[] {
-  const tabs: Tab[] = ["dashboard", "events", "investigation", "reports", "inventory"];
+  const tabs: Tab[] = ["dashboard", "events", "reports", "inventory"];
 
   if (policy.canManageAlerts) {
     tabs.push("alerts");
@@ -5232,7 +5860,6 @@ function titleForTab(tab: Tab) {
   const titles: Record<Tab, string> = {
     dashboard: "Dashboard",
     events: "Eventos",
-    investigation: "Investigação",
     reports: "Relatórios",
     inventory: "Inventário Gerencial",
     alerts: "Alertas",
@@ -5301,6 +5928,52 @@ function getHighestAnomaly(response: BaselineAnomalyResponse | null) {
 
   return [...response.byAction, ...response.byShare, ...response.byUser]
     .sort((left, right) => right.deltaPercent - left.deltaPercent)[0] ?? null;
+}
+
+function formatOperationalDimension(value: string) {
+  const normalized = value.trim();
+
+  if (!normalized || normalized.toUpperCase() === "UNKNOWN") {
+    return "Usuário não identificado";
+  }
+
+  return formatAction(normalized);
+}
+
+function formatAnomalyChange(item: BaselineAnomalyItem) {
+  if (item.baselineAverage <= 0) {
+    return item.currentCount > 0 ? "Novo no período" : "Sem variação";
+  }
+
+  const ratio = item.currentCount / item.baselineAverage;
+
+  if (ratio >= 3) {
+    return `${ratio.toLocaleString("pt-BR", { maximumFractionDigits: ratio >= 100 ? 0 : 1 })}× a média`;
+  }
+
+  if (item.deltaPercent >= 10) {
+    return `${item.deltaPercent.toLocaleString("pt-BR", { maximumFractionDigits: 0 })}% acima da média`;
+  }
+
+  if (item.deltaPercent <= -10) {
+    return `${Math.abs(item.deltaPercent).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}% abaixo da média`;
+  }
+
+  return "Próximo da média";
+}
+
+function formatTimelineStatus(value?: string | null) {
+  const labels: Record<string, string> = {
+    healthy: "Saudável",
+    ok: "Saudável",
+    ready: "Saudável",
+    degraded: "Atenção",
+    warning: "Atenção",
+    critical: "Crítico",
+    error: "Com erro"
+  };
+
+  return value ? labels[value.toLowerCase()] ?? value : "Indisponível";
 }
 
 function formatMegabytes(value: number) {
@@ -5383,7 +6056,7 @@ function getOperationalPosture(
   if (criticalAlerts > 0 || offlineAgents > 0 || (highestAnomaly?.deltaPercent ?? 0) > 150) {
     return {
       label: "Atenção alta",
-      detail: `${criticalAlerts} críticos, ${offlineAgents} agentes em atenção e maior desvio de ${Math.round(highestAnomaly?.deltaPercent ?? 0)}%.`,
+      detail: `${criticalAlerts} críticos e ${offlineAgents} agentes em atenção.${highestAnomaly ? ` Maior desvio: ${formatAnomalyChange(highestAnomaly)}.` : ""}`,
       tone: "danger" as const
     };
   }
@@ -5496,11 +6169,23 @@ function buildGeneratedReport(
   title: string,
   filters: ReportFilters,
   events: DisplayEvent[],
-  inventorySummary: InventorySummary | null
+  inventorySummary: InventorySummary | null,
+  scenarioId: ReportScenarioId | null,
+  activitySummary: ActivitySummary | null,
+  baselineAnomalies: BaselineAnomalyResponse | null,
+  evidenceLimit: number
 ): GeneratedReport {
-  const topActions = buildReportGroups(events, "action").slice(0, 5);
-  const topUsers = buildReportGroups(events, "user").slice(0, 5);
+  const topActions = activitySummary?.byAction?.length
+    ? activitySummary.byAction.map((item) => ({ label: formatAction(item.name), count: item.eventCount })).slice(0, 5)
+    : buildReportGroups(events, "action").slice(0, 5);
+  const topUsers = activitySummary?.byUser?.length
+    ? activitySummary.byUser.map((item) => ({ label: item.name, count: item.eventCount })).slice(0, 5)
+    : buildReportGroups(events, "user").slice(0, 5);
   const topPaths = buildReportGroups(events, "path").slice(0, 5);
+  const topHosts = buildReportGroups(events, "sourceHost").slice(0, 5);
+  const totalEvents = activitySummary?.totalEvents ?? events.length;
+  const aggregateCoverage = activitySummary ? "complete" : "sample";
+  const evidenceLimitReached = events.length >= evidenceLimit;
   const deletedCount = events.filter((event) => event.action === "deleted").length;
   const renamedCount = events.filter((event) => event.action === "renamed").length;
   const movedCount = events.filter((event) => event.action === "moved").length;
@@ -5510,13 +6195,12 @@ function buildGeneratedReport(
   const uniquePaths = new Set(events.map((event) => event.path).filter(Boolean)).size;
   const criticalCount = events.filter((event) => (event.severity ?? "").toLowerCase() === "critical").length;
   const warningCount = events.filter((event) => (event.severity ?? "").toLowerCase() === "warning").length;
-  const topHosts = buildReportGroups(events, "sourceHost").slice(0, 3);
   const highlights: string[] = [];
   const risks: string[] = [];
   const nextSteps: string[] = [];
 
-  if (events.length > 0) {
-    highlights.push(`${events.length.toLocaleString("pt-BR")} evento(s) correlacionado(s) no recorte, com predominio de ${dominantAction.toLowerCase()}.`);
+  if (totalEvents > 0) {
+    highlights.push(`${totalEvents.toLocaleString("pt-BR")} evento(s) no recorte, com predominância de ${dominantAction.toLowerCase()}.`);
   }
 
   if (topUsers[0]) {
@@ -5559,10 +6243,15 @@ function buildGeneratedReport(
     nextSteps.push(...inventorySummary.executiveOverview.priorities.slice(0, 2).map((item) => item.title));
   }
 
+  const scenarioNarrative = buildScenarioReportNarrative(scenarioId, totalEvents, topUsers, topPaths, inventorySummary);
+  highlights.push(...scenarioNarrative.highlights);
+  risks.push(...scenarioNarrative.risks);
+  nextSteps.push(...scenarioNarrative.nextSteps);
+
   const executiveSummaryParts = [
     `${title} cobrindo ${summarizeReportFilters(filters) || "o recorte selecionado"}.`,
-    events.length > 0
-      ? `Foram observados ${events.length.toLocaleString("pt-BR")} evento(s), distribuido(s) por ${uniqueUsers.toLocaleString("pt-BR")} usuario(s) e ${uniquePaths.toLocaleString("pt-BR")} caminho(s).`
+    totalEvents > 0
+      ? `Foram observados ${totalEvents.toLocaleString("pt-BR")} evento(s). A evidência detalhada envolve ${uniqueUsers.toLocaleString("pt-BR")} usuário(s) e ${uniquePaths.toLocaleString("pt-BR")} caminho(s).`
       : "Nenhum evento foi encontrado para o recorte informado.",
     inventorySummary
       ? `O inventario associado aponta ${formatBytes(inventorySummary.totalBytes)} monitorados, score ${inventorySummary.insight.score} e ${inventorySummary.recommendations.length.toLocaleString("pt-BR")} recomendacao(oes) aberta(s).`
@@ -5573,7 +6262,7 @@ function buildGeneratedReport(
     {
       title: "Resumo executivo",
       items: dedupeText([
-        `${events.length.toLocaleString("pt-BR")} evento(s) no periodo, com ${dominantAction.toLowerCase()} como comportamento dominante.`,
+        `${totalEvents.toLocaleString("pt-BR")} evento(s) no período, com ${dominantAction.toLowerCase()} como comportamento dominante.`,
         topUsers[0] ? `${topUsers[0].label} foi o principal ator do recorte com ${topUsers[0].count.toLocaleString("pt-BR")} acao(oes).` : "",
         inventorySummary ? `O compartilhamento ${inventorySummary.share ?? "monitorado"} encerra o ciclo com score ${inventorySummary.insight.score} e tom ${inventorySummary.insight.tone}.` : ""
       ]).slice(0, 4)
@@ -5632,20 +6321,39 @@ function buildGeneratedReport(
     }
   ];
 
+  const metrics = buildScenarioReportMetrics(
+    scenarioId,
+    totalEvents,
+    events,
+    inventorySummary,
+    baselineAnomalies,
+    aggregateCoverage
+  );
+
   return {
     title,
+    scenarioId,
     generatedAt: new Date().toISOString(),
     filtersSummary: summarizeReportFilters(filters),
     events,
+    totalEvents,
+    evidenceLimit,
+    evidenceLimitReached,
+    aggregateCoverage,
     executiveSummary: executiveSummaryParts.join(" "),
     highlights: dedupeText(highlights).slice(0, 5),
     risks: dedupeText(risks).slice(0, 5),
     nextSteps: dedupeText(nextSteps).slice(0, 5),
+    metrics,
+    timeBuckets: buildReportTimeBuckets(events),
     topActions,
     topUsers,
     topPaths,
+    topHosts,
     sections,
-    inventorySummary
+    inventorySummary,
+    activitySummary,
+    baselineAnomalies
   };
 }
 
@@ -5717,6 +6425,179 @@ function getReportScenarioCategory(id: ReportScenarioId) {
   return "Investigação";
 }
 
+function getReportCategoryDescription(category: string) {
+  const descriptions: Record<string, string> = {
+    Executivo: "Acompanhe evolução, capacidade e prioridades do ciclo",
+    Governança: "Encontre exposição, dados frios e mudanças sensíveis",
+    Incidente: "Isole eventos críticos e acelere a resposta operacional",
+    Investigação: "Reconstrua atividade por usuário, pasta, servidor ou origem"
+  };
+
+  return descriptions[category] ?? "Escolha um modelo para iniciar a análise";
+}
+
+function buildScenarioReportMetrics(
+  scenarioId: ReportScenarioId | null,
+  totalEvents: number,
+  events: DisplayEvent[],
+  inventorySummary: InventorySummary | null,
+  baselineAnomalies: BaselineAnomalyResponse | null,
+  coverage: "complete" | "sample"
+): ReportMetric[] {
+  const uniqueUsers = new Set(events.map((event) => event.user).filter(Boolean)).size;
+  const uniquePaths = new Set(events.map((event) => event.path).filter(Boolean)).size;
+  const buckets = buildReportTimeBuckets(events);
+  const peak = buckets.reduce<ReportTimeBucket | null>((current, item) => !current || item.count > current.count ? item : current, null);
+  const highestAnomaly = getHighestReportAnomaly(baselineAnomalies);
+  const evidenceDetail = coverage === "complete" ? "total consolidado" : "evidência carregada";
+
+  if (scenarioId === "executive-qbr") {
+    return [
+      { label: "Atividade do ciclo", value: totalEvents.toLocaleString("pt-BR"), detail: evidenceDetail, tone: "neutral" },
+      { label: "Usuários observados", value: uniqueUsers.toLocaleString("pt-BR"), detail: "na evidência detalhada", tone: "neutral" },
+      { label: "Espaço inventariado", value: inventorySummary ? formatBytes(inventorySummary.totalBytes) : "-", detail: inventorySummary ? `${inventorySummary.fileCount.toLocaleString("pt-BR")} arquivos` : "snapshot indisponível", tone: "neutral" },
+      { label: "Score de governança", value: inventorySummary ? String(inventorySummary.insight.score) : "-", detail: inventorySummary ? inventorySummary.insight.trend : "sem inventário", tone: inventorySummary?.insight.tone === "danger" ? "danger" : inventorySummary?.insight.tone === "amber" ? "warning" : "positive" }
+    ];
+  }
+
+  if (scenarioId === "capacity-cleanup" || scenarioId === "cold-data") {
+    return [
+      { label: "Espaço catalogado", value: inventorySummary ? formatBytes(inventorySummary.totalBytes) : "-", detail: inventorySummary ? `${inventorySummary.fileCount.toLocaleString("pt-BR")} arquivos` : "snapshot indisponível", tone: "neutral" },
+      { label: "Dados frios +365 dias", value: inventorySummary ? formatBytes(inventorySummary.governance.inactive365DaysBytes) : "-", detail: inventorySummary ? `${inventorySummary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} arquivos` : "sem inventário", tone: "warning" },
+      { label: "Sem acesso observado", value: inventorySummary ? formatBytes(inventorySummary.governance.neverAccessedBytes) : "-", detail: inventorySummary ? `${inventorySummary.governance.neverAccessedFileCount.toLocaleString("pt-BR")} arquivos` : "sem inventário", tone: "warning" },
+      { label: "Variação do volume", value: inventorySummary ? formatSignedBytes(inventorySummary.growth.totalBytesDelta) : "-", detail: "contra o snapshot anterior", tone: (inventorySummary?.growth.totalBytesDelta ?? 0) > 0 ? "warning" : "positive" }
+    ];
+  }
+
+  const sensitiveScenario = scenarioId === "mass-delete"
+    || scenarioId === "mass-rename"
+    || scenarioId === "mass-move"
+    || scenarioId === "permission-changes"
+    || scenarioId === "recurrent-denied-access"
+    || scenarioId === "suspicious-remote-access"
+    || scenarioId === "executable-creation";
+
+  if (sensitiveScenario) {
+    return [
+      { label: "Ocorrências", value: totalEvents.toLocaleString("pt-BR"), detail: evidenceDetail, tone: totalEvents > 0 ? "danger" : "positive" },
+      { label: "Usuários envolvidos", value: uniqueUsers.toLocaleString("pt-BR"), detail: "na evidência detalhada", tone: uniqueUsers > 5 ? "warning" : "neutral" },
+      { label: "Caminhos afetados", value: uniquePaths.toLocaleString("pt-BR"), detail: "na evidência detalhada", tone: uniquePaths > 20 ? "warning" : "neutral" },
+      { label: "Maior desvio", value: highestAnomaly ? formatPercent(highestAnomaly.deltaPercent) : "-", detail: highestAnomaly?.name ?? (peak ? `pico em ${peak.label}` : "sem baseline"), tone: highestAnomaly && highestAnomaly.deltaPercent > 100 ? "danger" : "neutral" }
+    ];
+  }
+
+  return [
+    { label: "Eventos no recorte", value: totalEvents.toLocaleString("pt-BR"), detail: evidenceDetail, tone: "neutral" },
+    { label: "Usuários observados", value: uniqueUsers.toLocaleString("pt-BR"), detail: "na evidência detalhada", tone: "neutral" },
+    { label: "Caminhos afetados", value: uniquePaths.toLocaleString("pt-BR"), detail: "na evidência detalhada", tone: "neutral" },
+    { label: "Pico de atividade", value: peak ? peak.count.toLocaleString("pt-BR") : "0", detail: peak?.label ?? "sem atividade", tone: peak && peak.count > 100 ? "warning" : "neutral" }
+  ];
+}
+
+function buildScenarioReportNarrative(
+  scenarioId: ReportScenarioId | null,
+  totalEvents: number,
+  topUsers: Array<{ label: string; count: number }>,
+  topPaths: Array<{ label: string; count: number }>,
+  inventorySummary: InventorySummary | null
+) {
+  const highlights: string[] = [];
+  const risks: string[] = [];
+  const nextSteps: string[] = [];
+  const topUser = topUsers[0];
+  const topPath = topPaths[0];
+
+  switch (scenarioId) {
+    case "mass-delete":
+      if (topUser) highlights.push(`${topUser.label} concentrou ${topUser.count.toLocaleString("pt-BR")} exclusão(ões) no período.`);
+      if (topPath) risks.push(`${topPath.label} é a área com maior concentração de itens excluídos na evidência.`);
+      nextSteps.push("Preservar a evidência do período e validar retenção, backup e autorização da operação.");
+      break;
+    case "mass-rename":
+      if (topUser) highlights.push(`${topUser.label} aparece como principal responsável pelas renomeações observadas.`);
+      nextSteps.push("Revisar os pares antes/depois e confirmar se o padrão de nomes corresponde a uma reorganização autorizada.");
+      break;
+    case "mass-move":
+      if (topPath) highlights.push(`${topPath.label} concentra o maior número de movimentos na evidência detalhada.`);
+      nextSteps.push("Validar destinos e descendentes afetados para preservar a rastreabilidade dos arquivos movidos com suas pastas.");
+      break;
+    case "permission-changes":
+      risks.push(`${totalEvents.toLocaleString("pt-BR")} alteração(ões) de permissão exigem confirmação de autoria e necessidade.`);
+      nextSteps.push("Comparar a ACL atual com o padrão esperado e registrar a aprovação da mudança nas áreas sensíveis.");
+      break;
+    case "executable-creation":
+      risks.push(`${totalEvents.toLocaleString("pt-BR")} criação(ões) de executável ou script foram encontradas no recorte.`);
+      nextSteps.push("Validar origem, assinatura, hash e necessidade operacional antes de manter os artefatos disponíveis.");
+      break;
+    case "recurrent-denied-access":
+    case "suspicious-remote-access":
+      if (topUser) risks.push(`${topUser.label} lidera as ocorrências que exigem validação de identidade e origem.`);
+      nextSteps.push("Correlacionar usuário, host, IP e horário com os registros de autenticação e a política de acesso.");
+      break;
+    case "capacity-cleanup":
+    case "cold-data":
+      if (inventorySummary) highlights.push(`${inventorySummary.governance.inactive365DaysFileCount.toLocaleString("pt-BR")} arquivo(s) estão sem alteração há mais de um ano.`);
+      nextSteps.push("Submeter as maiores áreas frias aos respectivos responsáveis antes de arquivar ou remover conteúdo.");
+      break;
+    case "executive-qbr":
+      if (inventorySummary) highlights.push(`O ciclo encerra com score de governança ${inventorySummary.insight.score} e tendência ${inventorySummary.insight.trend}.`);
+      nextSteps.push("Registrar responsáveis e prazo para as prioridades do ciclo antes da próxima revisão gerencial.");
+      break;
+    case "user-activity":
+    case "source-host-activity":
+    case "after-hours-activity":
+      if (topPath) highlights.push(`${topPath.label} foi a área mais impactada pela atividade investigada.`);
+      nextSteps.push("Validar com o responsável o contexto das ações mais sensíveis e dos horários fora do padrão.");
+      break;
+    default:
+      break;
+  }
+
+  return { highlights, risks, nextSteps };
+}
+
+function getHighestReportAnomaly(response: BaselineAnomalyResponse | null) {
+  if (!response) return null;
+  const items = [...response.byAction, ...response.byShare, ...response.byUser];
+  return items.reduce<BaselineAnomalyItem | null>((current, item) => !current || item.deltaPercent > current.deltaPercent ? item : current, null);
+}
+
+function buildReportTimeBuckets(events: DisplayEvent[], maxBuckets = 10): ReportTimeBucket[] {
+  const timestamps = events
+    .map((event) => new Date(event.timestampUtc).getTime())
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
+  if (timestamps.length === 0) return [];
+
+  const start = timestamps[0];
+  const end = timestamps[timestamps.length - 1];
+  if (start === end) {
+    return [{ label: formatReportBucketLabel(start, 0), count: timestamps.length }];
+  }
+
+  const bucketCount = Math.min(maxBuckets, Math.max(2, Math.ceil(Math.sqrt(timestamps.length))));
+  const duration = Math.max(1, end - start + 1);
+  const bucketSize = duration / bucketCount;
+  const counts = Array.from({ length: bucketCount }, () => 0);
+  for (const timestamp of timestamps) {
+    counts[Math.min(bucketCount - 1, Math.floor((timestamp - start) / bucketSize))] += 1;
+  }
+
+  return counts.map((count, index) => ({
+    label: formatReportBucketLabel(start + index * bucketSize, duration),
+    count
+  }));
+}
+
+function formatReportBucketLabel(timestamp: number, duration: number) {
+  const date = new Date(timestamp);
+  if (duration > 3 * 24 * 60 * 60 * 1000) {
+    return new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit" }).format(date);
+  }
+
+  return new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
 function dedupeText(items: string[]) {
   return [...new Set(items.filter(Boolean))];
 }
@@ -5749,6 +6630,38 @@ function formatDate(value: string) {
     dateStyle: "short",
     timeStyle: "medium"
   }).format(new Date(value));
+}
+
+function formatRelativeTime(value: string) {
+  const ageSeconds = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000);
+
+  if (ageSeconds >= 86400) {
+    return `${Math.round(ageSeconds / 86400)}d atrás`;
+  }
+
+  return formatAge(ageSeconds);
+}
+
+function formatAlertSeverity(value: string) {
+  const labels: Record<string, string> = {
+    critical: "Crítico",
+    high: "Alto",
+    warning: "Atenção",
+    info: "Informativo",
+    low: "Baixo"
+  };
+
+  return labels[value] ?? value;
+}
+
+function formatAlertStatus(value: string) {
+  const labels: Record<string, string> = {
+    open: "Aberto",
+    acknowledged: "Reconhecido",
+    closed: "Encerrado"
+  };
+
+  return labels[value] ?? value;
 }
 
 function formatDateWithAge(value?: string | null, ageSeconds?: number | null) {
@@ -5818,6 +6731,18 @@ function formatAgentOperationalStatus(value: string) {
   };
 
   return labels[value] ?? value;
+}
+
+function formatAgentServiceStatus(value: string) {
+  const labels: Record<string, string> = {
+    running: "em execução",
+    stopped: "parado",
+    degraded: "degradado",
+    error: "com erro",
+    unknown: "indefinido"
+  };
+
+  return labels[value.toLowerCase()] ?? value;
 }
 
 function formatUsn(value: Record<string, number>) {

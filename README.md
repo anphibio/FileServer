@@ -69,10 +69,10 @@ Configure:
 
 - `PUBLIC_API_BASE_URL`: URL publica do painel/API.
 - `PUBLIC_WEB_ORIGIN`: origem HTTPS permitida no CORS da API.
-- `PUBLIC_WEB_API_KEY`: chave administrativa usada pelo painel web.
-- `PUBLIC_WEB_ACTOR_NAME`: identificador temporario do operador do painel, usado em auditoria administrativa.
-- `FILESERVER_MONITOR_API_KEY`: chave forte para API, agente e automacoes.
+- `FILESERVER_MONITOR_API_KEY`: chave operacional de contingencia e automacoes.
 - `FILESERVER_MONITOR_ADMIN_API_KEY`: chave forte para administracao do painel.
+- `FILESERVER_MONITOR_AGENT_API_KEY`: chave exclusiva dos agentes.
+- `FILESERVER_MONITOR_SESSION_SIGNING_KEY`: segredo exclusivo para assinar sessoes humanas.
 - `SQLSERVER_CONNECTION_STRING`: connection string do SQL Server externo.
 
 Suba a pilha:
@@ -277,7 +277,7 @@ GET /api/admin-audit?action=monitored_path.create
 GET /api/admin-audit?entityType=alert
 ```
 
-Quando houver um proxy ou autenticacao corporativa, envie `X-Actor` para registrar o operador real. Na configuracao padrao com SQL Server, os registros sao persistidos na tabela `dbo.AdminAuditLog`.
+O operador e obtido da sessao autenticada; headers enviados pelo navegador nao definem a identidade administrativa. Na configuracao padrao com SQL Server, os registros sao persistidos na tabela `dbo.AdminAuditLog`.
 
 O painel web tambem possui a aba `Auditoria`, com busca por acao, entidade, operador ou IP.
 
@@ -335,6 +335,8 @@ Variaveis:
 AUTH_ENABLED=true
 FILESERVER_MONITOR_API_KEY=uma-chave-forte
 FILESERVER_MONITOR_ADMIN_API_KEY=uma-chave-admin-forte
+FILESERVER_MONITOR_AGENT_API_KEY=uma-chave-exclusiva-do-agente
+FILESERVER_MONITOR_SESSION_SIGNING_KEY=um-segredo-exclusivo-para-sessoes
 ```
 
 Quando habilitada, a API exige um destes formatos:
@@ -344,14 +346,10 @@ X-Api-Key: uma-chave-forte
 Authorization: Bearer uma-chave-forte
 ```
 
-O agente pode enviar a chave pelo campo `apiKey` em `appsettings.agent.json`.
-
-O frontend deve usar a chave administrativa quando for administrar caminhos, reconhecer alertas ou consultar auditoria:
-
-```text
-VITE_API_KEY=uma-chave-admin-forte
-VITE_ACTOR_NAME=operador.infra
-```
+O agente envia `FILESERVER_MONITOR_AGENT_API_KEY` pelo campo `apiKey` de
+`appsettings.agent.json`, junto do header `X-Agent-Id`. Essa credencial e aceita
+somente nas rotas de coleta. O frontend nao recebe API key no bundle: usuarios
+humanos autenticam via LDAP/AD e usam a sessao assinada emitida pela API.
 
 Se `FILESERVER_MONITOR_ADMIN_API_KEY` nao for configurada, a API usa `FILESERVER_MONITOR_API_KEY` tambem para administracao. Em producao, prefira separar as duas.
 
@@ -598,9 +596,15 @@ RETENTION_TIMELINE_DAYS=180
 RETENTION_ALERTS_DAYS=365
 RETENTION_INTERVAL_HOURS=24
 RETENTION_PURGE_BATCH_SIZE=10000
+RETENTION_MAX_ROWS_PER_RUN=500000
+RETENTION_ARCHIVE_HOST_PATH=/srv/fileserver-monitor/archive
 ```
 
-Quando habilitada, a API remove eventos brutos, eventos correlacionados da linha do tempo e alertas antigos em lotes para reduzir impacto no SQL Server. Ajuste os dias conforme politica interna, LGPD, auditoria e capacidade do banco.
+A política arquiva dados em lotes e limita cada execução por conjunto de dados para não monopolizar o banco. Cada lote vira um arquivo `JSONL` compactado com GZip e hash SHA-256. O manifesto e a remoção dos IDs arquivados são confirmados na mesma transação; se o volume, a escrita ou o banco falhar, nenhuma linha daquele lote é removida.
+
+Administradores podem consultar a estimativa e o histórico em `GET /api/retention/status`, listar manifestos em `GET /api/retention/archives`, baixar uma evidência em `GET /api/retention/archives/{archiveId}/download` ou iniciar uma execução controlada em `POST /api/retention/run`.
+
+Quando habilitada, a API arquiva e remove eventos brutos, eventos correlacionados da linha do tempo e alertas antigos em lotes para reduzir impacto no SQL Server. O diretório indicado por `RETENTION_ARCHIVE_HOST_PATH` precisa estar em armazenamento persistente e entrar na política de backup. Ajuste os dias conforme política interna, LGPD, auditoria e capacidade do banco.
 
 ## Interface Web
 
@@ -617,11 +621,12 @@ Stack:
 - Vite.
 - Nginx no container final.
 
-Telas iniciais:
+Telas principais:
 
 - Dashboard.
 - Eventos.
-- Investigacao.
+- Relatorios.
+- Inventario.
 - Alertas.
 - Agentes.
 
@@ -629,8 +634,6 @@ Variavel opcional:
 
 ```text
 VITE_API_BASE_URL=http://localhost:8080
-VITE_API_KEY=uma-chave-forte
-VITE_ACTOR_NAME=operador.infra
 ```
 
 Publicar o agente:
@@ -751,10 +754,10 @@ Em outro terminal, popular dados de demonstracao:
 ./scripts/seed-demo.sh
 ```
 
-Com API key:
+Com a chave de agente:
 
 ```bash
-API_KEY=uma-chave ./scripts/seed-demo.sh
+API_KEY=uma-chave-de-agente ./scripts/seed-demo.sh
 ```
 
 O seed cria heartbeat de agente, eventos variados e alertas de exemplo.
@@ -812,7 +815,7 @@ Arquivos de apoio:
 - Dashboard com cards executivos para postura atual, maior desvio e janela analisada.
 - Paineis com subtitulos operacionais para leitura mais rapida do contexto.
 - Lista de alertas recentes com severidade, status e resumo visual mais direto.
-- Telas de Alertas, Investigacao, Agentes, Caminhos e Auditoria com resumos executivos para leitura consistente entre as areas do painel.
+- Telas de Alertas, Relatorios, Agentes, Caminhos e Auditoria com resumos executivos para leitura consistente entre as areas do painel.
 - Interface com avisos de sucesso/erro no proprio painel, indicacao de atualizacao em andamento e retorno visual melhor para acoes operacionais.
 - Navegacao lateral com contadores por area, resumo rapido no topo e tabelas com leitura mais confortavel para uso continuo.
 - Preview local com script de checagem para confirmar subida da web, API e dados de demonstracao antes da revisao visual.

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib-api-auth.sh"
+
 API_BASE_URL="${API_BASE_URL:-http://localhost:8180}"
+API_KEY="$(require_human_api_key)"
 SSH_TARGET="${SSH_TARGET:-Administrator@192.168.2.170}"
 SERVER_NAME="${SERVER_NAME:-FileServer}"
 ROOT_NAME="${ROOT_NAME:-codex-delete-action-$(date -u +%Y%m%d-%H%M%S)}"
@@ -76,7 +80,7 @@ deadline=$((SECONDS + 180))
 last_report=""
 while (( SECONDS < deadline )); do
   events_json="$(mktemp)"
-  curl -fsS "${API_BASE_URL}/api/events?server=${SERVER_NAME}&take=500" > "${events_json}"
+  curl -fsS -H "X-Api-Key: ${API_KEY}" "${API_BASE_URL}/api/events?server=${SERVER_NAME}&take=500" > "${events_json}"
 
   report="$(jq -n --arg root "${ROOT_NAME}" --slurpfile events "${events_json}" --slurpfile expected "${expected_json}" '
     def norm: ascii_downcase;

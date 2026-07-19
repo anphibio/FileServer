@@ -66,8 +66,10 @@ Campos mais importantes:
 - `server`: nome logico do servidor monitorado.
 - `apiBaseUrl`: URL base da API.
 - `apiRequestTimeoutSeconds`: tempo limite de cada envio HTTP; use 120 segundos para absorver lotes grandes sem reenviar eventos ainda em processamento.
-- `apiBatchSize`: quantidade maxima de eventos por requisicao de ingestao; o padrao 500 aproveita a persistencia em lote sem bloquear o agente na materializacao assincrona da timeline.
-- `apiKey`: chave enviada no header `X-Api-Key`, quando autenticacao estiver ligada.
+- `apiBatchSize`: quantidade maxima de eventos por requisicao de ingestao; o padrao 1000 aproveita a persistencia SQL set-based e reduz viagens HTTP durante picos.
+- `queueFlushBatchesPerCycle`: quantidade maxima de lotes HTTP usados para drenar a fila em cada ciclo.
+- `queueFlushMaxEventsPerCycle`: teto absoluto de eventos retirados da fila por ciclo; prevalece quando for menor que `apiBatchSize x queueFlushBatchesPerCycle`.
+- `apiKey`: chave exclusiva do agente, enviada no header `X-Api-Key`.
 - `pollIntervalSeconds`: intervalo entre ciclos de coleta.
 - `batchSize`: limite de eventos por ciclo/lote.
 - `enableSecurityLogCollector`: liga/desliga coleta do Log de Seguranca.
@@ -457,19 +459,24 @@ Esse endpoint marca agente como:
 - `backlog`, quando a fila local passou do limite;
 - `stale`, quando parou de mandar heartbeat.
 
-## Autenticacao
+## Autenticacao de maquina
 
-A API pode exigir chave de API.
+A API separa credenciais humanas e de maquina. O agente envia dois headers:
+
+- `X-Api-Key`, com `Auth:AgentApiKey`;
+- `X-Agent-Id`, com o `agentId` configurado.
 
 A configuracao fica em:
 
 - `Auth:Enabled`;
 - `Auth:ApiKey`;
-- `Auth:AdminApiKey`.
+- `Auth:AdminApiKey`;
+- `Auth:AgentApiKey`;
+- `Auth:SessionSigningKey`.
 
-Quando ligada, a API aceita a chave pelo header:
-
-`X-Api-Key`
+`Auth:ApiKey` e `Auth:AdminApiKey` nao autorizam ingestao. Usuarios humanos
+autenticam via LDAP/AD e recebem uma sessao assinada. A chave do agente nunca e
+incluida no bundle do frontend.
 
 Rotas anonimas:
 
@@ -477,6 +484,27 @@ Rotas anonimas:
 - `/health`.
 
 Rotas administrativas exigem chave administrativa, como administracao de caminhos, alertas e auditoria administrativa.
+
+## Evidencia de origem e idempotencia
+
+Cada evento coletado leva ate o banco os metadados que identificam sua origem:
+
+- `AgentId`;
+- `CursorType` (`security` ou `usn`);
+- `SourceRecordId`;
+- `SourceUsn` e `SourceVolume`;
+- `FileReferenceId`;
+- `SourceEventId` calculado pelo Core.
+
+`SourceEventId` e um hash deterministico do agente, cursor, horario original e
+identificadores nativos. Reenviar o mesmo evento depois de timeout nao cria outra
+linha, outro alerta ou outro trabalho de materializacao. O horario faz parte da
+identidade para evitar colisao quando o Security Log ou o USN reutiliza cursores
+apos reset.
+
+No SQL Server, o indice filtrado `UX_FileAuditEvents_Agent_SourceEvent` reforca
+essa garantia. A migracao de schema deve ser executada por uma conta com permissao
+de DDL antes de iniciar uma versao nova da API em producao.
 
 ## Preparacao do Windows para coleta
 
@@ -540,7 +568,9 @@ O agente ja tem uma base boa para piloto:
 - envia heartbeat;
 - busca configuracao remota;
 - filtra caminhos monitorados;
-- chama o motor de correlacao do Core antes do envio.
+- chama o motor de correlacao do Core antes do envio;
+- envia evidencia nativa de origem para auditoria e deduplicacao idempotente;
+- usa credencial de maquina separada das sessoes humanas.
 
 ## Pontos que ainda merecem atencao
 

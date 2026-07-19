@@ -99,4 +99,6 @@ Depois da importação, use as variáveis no topo do dashboard:
 - `Host group`: grupo de hosts vindo do Zabbix.
 - `Host`: hosts filtrados pelo grupo selecionado.
 
-Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status`, `database status`, `timeline queue status` e `timeline queue last error`, devem usar Query type `Text` no Grafana, mantendo `Group`, `Host`, `Application` e `Item` preenchidos. No JSON exportado pelo plugin, esse modo aparece como `queryType: "2"`. Contadores, tempos e idades usam Query type `Metrics`.
+Observação para manutenção do dashboard: itens textuais do Zabbix, como `overall status`, `database status`, `timeline queue status`, `timeline queue last error`, `retention last status` e `retention last error`, devem usar Query type `Text` no Grafana, mantendo `Group`, `Host`, `Application` e `Item` preenchidos. No JSON exportado pelo plugin, esse modo aparece como `queryType: "2"`. Contadores, tempos e idades usam Query type `Metrics`.
+
+O bloco de retenção acompanha o estado e a duração da última execução, quantos registros foram removidos de eventos brutos, timeline e alertas, além da última mensagem de erro. Também mostra disponibilidade, quantidade de pacotes, registros e bytes do arquivo frio. O template dispara alerta quando uma execução falha, ultrapassa `{$FILESERVER_MONITOR_RETENTION_MAX_DURATION_MS}` ou está ativa sem o volume frio disponível.

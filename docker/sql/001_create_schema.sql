@@ -29,8 +29,32 @@ BEGIN
         ResultName NVARCHAR(64) NOT NULL,
         Severity NVARCHAR(32) NOT NULL,
         SourceName NVARCHAR(128) NOT NULL,
+        AgentId NVARCHAR(128) NULL,
+        SourceEventId CHAR(64) NULL,
+        CursorType NVARCHAR(32) NULL,
+        SourceRecordId BIGINT NULL,
+        SourceUsn BIGINT NULL,
+        SourceVolume NVARCHAR(32) NULL,
+        FileReferenceId NVARCHAR(128) NULL,
         IngestedUtc DATETIME2(3) NOT NULL CONSTRAINT DF_FileAuditEvents_IngestedUtc DEFAULT SYSUTCDATETIME()
     );
+END;
+GO
+
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'AgentId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD AgentId NVARCHAR(128) NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceEventId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceEventId CHAR(64) NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'CursorType') IS NULL ALTER TABLE dbo.FileAuditEvents ADD CursorType NVARCHAR(32) NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceRecordId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceRecordId BIGINT NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceUsn') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceUsn BIGINT NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceVolume') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceVolume NVARCHAR(32) NULL;
+IF COL_LENGTH(N'dbo.FileAuditEvents', N'FileReferenceId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD FileReferenceId NVARCHAR(128) NULL;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_FileAuditEvents_Agent_SourceEvent' AND object_id = OBJECT_ID(N'dbo.FileAuditEvents'))
+BEGIN
+    CREATE UNIQUE INDEX UX_FileAuditEvents_Agent_SourceEvent
+        ON dbo.FileAuditEvents (AgentId, SourceEventId)
+        WHERE AgentId IS NOT NULL AND SourceEventId IS NOT NULL;
 END;
 GO
 
@@ -546,5 +570,93 @@ BEGIN
         ReaderGroupDn NVARCHAR(1024) NOT NULL,
         UpdatedUtc DATETIME2(3) NOT NULL
     );
+END;
+GO
+
+IF OBJECT_ID(N'dbo.RetentionSettings', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RetentionSettings
+    (
+        Id INT NOT NULL CONSTRAINT PK_RetentionSettings PRIMARY KEY,
+        Enabled BIT NOT NULL,
+        EventsDays INT NOT NULL,
+        TimelineDays INT NOT NULL,
+        AlertsDays INT NOT NULL,
+        IntervalHours INT NOT NULL,
+        PurgeBatchSize INT NOT NULL,
+        MaxRowsPerRun INT NOT NULL CONSTRAINT DF_RetentionSettings_MaxRowsPerRun DEFAULT 500000,
+        UpdatedUtc DATETIME2(3) NOT NULL
+    );
+END;
+GO
+
+IF COL_LENGTH(N'dbo.RetentionSettings', N'MaxRowsPerRun') IS NULL
+BEGIN
+    ALTER TABLE dbo.RetentionSettings
+    ADD MaxRowsPerRun INT NOT NULL CONSTRAINT DF_RetentionSettings_MaxRowsPerRun_Upgrade DEFAULT 500000;
+END;
+GO
+
+IF OBJECT_ID(N'dbo.RetentionRuns', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RetentionRuns
+    (
+        RunId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionRuns PRIMARY KEY,
+        TriggerName NVARCHAR(32) NOT NULL,
+        StatusName NVARCHAR(32) NOT NULL,
+        StartedUtc DATETIME2(3) NOT NULL,
+        CompletedUtc DATETIME2(3) NULL,
+        EventsCutoffUtc DATETIME2(3) NOT NULL,
+        TimelineCutoffUtc DATETIME2(3) NOT NULL,
+        AlertsCutoffUtc DATETIME2(3) NOT NULL,
+        DeletedEvents INT NOT NULL,
+        DeletedTimelineEvents INT NOT NULL,
+        DeletedAlerts INT NOT NULL,
+        DurationMs BIGINT NOT NULL,
+        ErrorMessage NVARCHAR(2048) NULL
+    );
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionRuns_StartedUtc' AND object_id = OBJECT_ID(N'dbo.RetentionRuns'))
+BEGIN
+    CREATE INDEX IX_RetentionRuns_StartedUtc ON dbo.RetentionRuns (StartedUtc DESC);
+END;
+GO
+
+UPDATE dbo.RetentionRuns
+SET StatusName = N'failed',
+    CompletedUtc = COALESCE(CompletedUtc, SYSUTCDATETIME()),
+    ErrorMessage = COALESCE(ErrorMessage, N'Execucao interrompida antes da conclusao.')
+WHERE StatusName = N'running'
+  AND StartedUtc < DATEADD(HOUR, -6, SYSUTCDATETIME());
+GO
+
+IF OBJECT_ID(N'dbo.RetentionArchives', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.RetentionArchives
+    (
+        ArchiveId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionArchives PRIMARY KEY,
+        RunId UNIQUEIDENTIFIER NOT NULL,
+        DatasetName NVARCHAR(32) NOT NULL,
+        RelativePath NVARCHAR(1024) NOT NULL,
+        CutoffUtc DATETIME2(3) NOT NULL,
+        RecordCount INT NOT NULL,
+        FileSizeBytes BIGINT NOT NULL,
+        Sha256 CHAR(64) NOT NULL,
+        CreatedUtc DATETIME2(3) NOT NULL
+    );
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionArchives_RunId' AND object_id = OBJECT_ID(N'dbo.RetentionArchives'))
+BEGIN
+    CREATE INDEX IX_RetentionArchives_RunId ON dbo.RetentionArchives (RunId, DatasetName);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RetentionArchives_CreatedUtc' AND object_id = OBJECT_ID(N'dbo.RetentionArchives'))
+BEGIN
+    CREATE INDEX IX_RetentionArchives_CreatedUtc ON dbo.RetentionArchives (CreatedUtc DESC);
 END;
 GO

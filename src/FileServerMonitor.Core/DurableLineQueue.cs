@@ -1,9 +1,22 @@
 namespace FileServerMonitor.Core;
 
 public sealed record DurableLineQueueFlushResult(int SentLines, bool Completed);
+public sealed record DurableLineQueueDrainPlan(int BatchSize, int MaxLines);
 
 public static class DurableLineQueue
 {
+    public static DurableLineQueueDrainPlan CreateDrainPlan(
+        int apiBatchSize,
+        int maxBatches,
+        int maxLines)
+    {
+        var safeBatchSize = Math.Clamp(apiBatchSize, 1, 1_000);
+        var safeBatchCount = Math.Clamp(maxBatches, 1, 100);
+        var safeMaxLines = Math.Max(1, maxLines);
+        var plannedLines = Math.Min(safeMaxLines, safeBatchSize * safeBatchCount);
+        return new DurableLineQueueDrainPlan(safeBatchSize, plannedLines);
+    }
+
     public static async Task<DurableLineQueueFlushResult> FlushAsync(
         string path,
         int batchSize,

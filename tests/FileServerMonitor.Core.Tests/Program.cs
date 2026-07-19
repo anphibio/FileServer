@@ -1,13 +1,18 @@
 using FileServerMonitor.Core;
+using System.Diagnostics;
 
 var tests = new (string Name, Action Test)[]
 {
     ("normaliza campos obrigatorios e defaults", NormalizesRequiredFieldsAndDefaults),
+    ("gera identidade estavel para evento coletado", BuildsStableCollectedEventIdentity),
+    ("lote preserva a primeira evidencia por agente e identidade", EventBatchKeepsFirstEvidencePerAgentIdentity),
+    ("normaliza e preserva evidencia de origem", NormalizesAndPreservesSourceEvidence),
     ("descarta extensao invalida recebida do coletor", DiscardsInvalidCollectorExtension),
     ("dispara alerta de exclusao em massa", RaisesMassDeleteAlert),
     ("dispara alerta de alteracao de permissao", RaisesPermissionChangeAlert),
     ("dispara alerta de ransomware por extensao suspeita", RaisesRansomwareAlertBySuspiciousExtension),
     ("correlaciona USN com Security Log por caminho", CorrelatesUsnWithSecurityLogByPath),
+    ("correlaciona lote massivo por caminho sem perder eventos", CorrelatesMassBatchByPath),
     ("preserva acesso quando Security Log confirma leitura", PreservesAccessWhenSecurityLogConfirmsRead),
     ("preserva leitura real alguns segundos depois da criacao", PreservesRealReadSecondsAfterCreation),
     ("preserva leitura real antes de movimentacao", PreservesRealReadBeforeMove),
@@ -85,6 +90,8 @@ var tests = new (string Name, Action Test)[]
     ("mapa conhecido reloca descendentes quando a pasta e movida", KnownPathMapRelocatesFolderDescendants),
     ("fila duravel descarrega apenas o limite mantendo a ordem", DurableQueueFlushesWithinLimitAndPreservesOrder),
     ("fila duravel preserva lote quando o envio falha", DurableQueuePreservesUnsentBatchAfterFailure),
+    ("fila duravel planeja drenagem pelo lote real da API", DurableQueuePlansDrainByApiBatch),
+    ("arquivo frio compacta lote e registra hash verificavel", ColdArchiveWritesCompressedBatchWithVerifiableHash),
     ("materializacao acumula janelas concorrentes em um unico trabalho", TimelineMaterializationCoalescesConcurrentWindows),
     ("materializacao devolve janela falha sem perder trabalho novo", TimelineMaterializationRetriesFailedWindowWithNewWork),
     ("materializacao mantem janelas distantes em trabalhos separados", TimelineMaterializationKeepsDistantWindowsSeparate),
@@ -99,6 +106,61 @@ var tests = new (string Name, Action Test)[]
     ("inventario calcula comparacao e insight gerencial", InventoryBuildsManagerialInsight)
 };
 
+static void EventBatchKeepsFirstEvidencePerAgentIdentity()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T12:00:00Z");
+    var first = BuildBatchEvent(Guid.NewGuid(), "agent-a", "source-1", @"C:\Corporativo\primeiro.txt", timestamp);
+    var duplicate = BuildBatchEvent(Guid.NewGuid(), "AGENT-A", "SOURCE-1", @"C:\Corporativo\duplicado.txt", timestamp.AddMilliseconds(1));
+    var otherAgent = BuildBatchEvent(Guid.NewGuid(), "agent-b", "source-1", @"C:\Corporativo\outro-agente.txt", timestamp.AddMilliseconds(2));
+    var withoutIdentity = BuildBatchEvent(Guid.NewGuid(), null, null, @"C:\Corporativo\sem-identidade.txt", timestamp.AddMilliseconds(3));
+
+    var selected = FileAuditEventBatch.SelectUniqueSourceEvidence(new[]
+    {
+        first,
+        duplicate,
+        otherAgent,
+        withoutIdentity
+    });
+
+    Assert(selected.Count == 3, "O lote deveria remover somente a evidencia repetida do mesmo agente.");
+    Assert(selected.ElementAt(0).Id == first.Id, "A primeira evidencia deveria ser preservada.");
+    Assert(selected.ElementAt(1).Id == otherAgent.Id, "Outro agente deveria poder usar a mesma identidade de origem.");
+    Assert(selected.ElementAt(2).Id == withoutIdentity.Id, "Evento sem identidade deveria continuar no lote.");
+}
+
+static FileAuditEvent BuildBatchEvent(
+    Guid id,
+    string? agentId,
+    string? sourceEventId,
+    string path,
+    DateTimeOffset timestamp) =>
+    new(
+        Id: id,
+        TimestampUtc: timestamp,
+        Server: "FileServer",
+        Share: "Corporativo",
+        Path: path,
+        PreviousPath: null,
+        ObjectType: "file",
+        Action: "created",
+        User: @"FILESERVER\AnphibiO",
+        Sid: null,
+        SourceHost: null,
+        SourceIp: null,
+        ProcessName: null,
+        FileSizeBytes: 1,
+        Extension: ".txt",
+        Result: "success",
+        Severity: "info",
+        Source: "usn-journal",
+        AgentId: agentId,
+        SourceEventId: sourceEventId,
+        CursorType: "usn",
+        RecordId: null,
+        Usn: 1,
+        Volume: "C:",
+        FileReferenceId: "1");
+
 var failures = new List<string>();
 
 foreach (var (name, test) in tests)
@@ -112,6 +174,67 @@ foreach (var (name, test) in tests)
     {
         failures.Add($"{name}: {ex.Message}");
         Console.Error.WriteLine($"FAIL {name}: {ex}");
+    }
+}
+
+static void ColdArchiveWritesCompressedBatchWithVerifiableHash()
+{
+    var archiveRoot = Path.Combine(Path.GetTempPath(), $"fileserver-monitor-archive-{Guid.NewGuid():N}");
+    var runId = Guid.NewGuid();
+    var firstId = Guid.NewGuid();
+
+    try
+    {
+        var result = ColdArchiveFileWriter.WriteAsync(
+            archiveRoot,
+            "events",
+            runId,
+            1,
+            new IReadOnlyDictionary<string, object?>[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["Id"] = firstId,
+                    ["TimestampUtc"] = DateTime.Parse("2026-01-02T03:04:05Z").ToUniversalTime(),
+                    ["FullPath"] = @"C:\Corporativo\arquivo-01.txt"
+                },
+                new Dictionary<string, object?>
+                {
+                    ["Id"] = Guid.NewGuid(),
+                    ["TimestampUtc"] = DateTime.Parse("2026-01-02T03:04:06Z").ToUniversalTime(),
+                    ["FullPath"] = @"C:\Corporativo\arquivo-02.txt"
+                }
+            },
+            CancellationToken.None).GetAwaiter().GetResult();
+
+        var fullPath = Path.Combine(archiveRoot, result.RelativePath);
+        Assert(File.Exists(fullPath), "O arquivo frio deveria existir depois da gravacao.");
+        Assert(!Path.IsPathRooted(result.RelativePath), "O manifesto deveria armazenar caminho relativo e relocavel.");
+        Assert(result.RecordCount == 2, "O manifesto deveria registrar os dois itens do lote.");
+
+        using var file = File.OpenRead(fullPath);
+        using var gzip = new System.IO.Compression.GZipStream(file, System.IO.Compression.CompressionMode.Decompress);
+        using var reader = new StreamReader(gzip);
+        var lines = new List<string>();
+        while (reader.ReadLine() is { } line)
+        {
+            lines.Add(line);
+        }
+
+        Assert(lines.Count == 2, "O arquivo compactado deveria preservar uma linha JSON por registro.");
+        Assert(lines[0].Contains(firstId.ToString(), StringComparison.OrdinalIgnoreCase), "A primeira evidencia deveria permanecer legivel no arquivo.");
+
+        using var hashStream = File.OpenRead(fullPath);
+        var actualHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(hashStream)).ToLowerInvariant();
+        Assert(result.Sha256.Equals(actualHash, StringComparison.Ordinal), "O hash do manifesto deveria validar o arquivo compactado.");
+        Assert(result.FileSizeBytes == new FileInfo(fullPath).Length, "O tamanho do manifesto deveria refletir o arquivo final.");
+    }
+    finally
+    {
+        if (Directory.Exists(archiveRoot))
+        {
+            Directory.Delete(archiveRoot, recursive: true);
+        }
     }
 }
 
@@ -156,6 +279,84 @@ static void NormalizesRequiredFieldsAndDefaults()
     Assert(normalized.Result == "success", "Resultado default deveria ser success.");
     Assert(normalized.Severity == "info", "Severidade default deveria ser info.");
     Assert(normalized.Source == "manual-ingest", "Origem default deveria ser manual-ingest.");
+}
+
+static void BuildsStableCollectedEventIdentity()
+{
+    var first = SourceEventIdentity.Create(
+        agentId: "fileserver-agent",
+        cursorType: "usn",
+        timestampUtc: DateTimeOffset.Parse("2026-07-19T12:00:00Z"),
+        recordId: null,
+        usn: 123456,
+        volume: "C:",
+        fileReferenceId: "42-7");
+    var repeated = SourceEventIdentity.Create(
+        agentId: " FILESERVER-AGENT ",
+        cursorType: "USN",
+        timestampUtc: DateTimeOffset.Parse("2026-07-19T12:00:00Z"),
+        recordId: null,
+        usn: 123456,
+        volume: "c:",
+        fileReferenceId: "42-7");
+    var nextUsn = SourceEventIdentity.Create(
+        agentId: "fileserver-agent",
+        cursorType: "usn",
+        timestampUtc: DateTimeOffset.Parse("2026-07-19T12:00:00Z"),
+        recordId: null,
+        usn: 123457,
+        volume: "C:",
+        fileReferenceId: "42-7");
+    var reusedCursorAfterReset = SourceEventIdentity.Create(
+        agentId: "fileserver-agent",
+        cursorType: "usn",
+        timestampUtc: DateTimeOffset.Parse("2026-07-20T12:00:00Z"),
+        recordId: null,
+        usn: 123456,
+        volume: "C:",
+        fileReferenceId: "42-7");
+
+    Assert(!string.IsNullOrWhiteSpace(first), "Evento com cursor deveria receber identidade.");
+    Assert(first == repeated, "A identidade deveria ser estavel e ignorar caixa/espacos estruturais.");
+    Assert(first != nextUsn, "Cursores diferentes nao podem compartilhar identidade.");
+    Assert(first != reusedCursorAfterReset, "Cursor reutilizado apos reset nao pode colidir com evento antigo.");
+    Assert(SourceEventIdentity.Create("agent", "manual", DateTimeOffset.UtcNow, null, null, null, null) is null,
+        "Evento sem cursor nao deveria inventar identidade idempotente.");
+}
+
+static void NormalizesAndPreservesSourceEvidence()
+{
+    var normalized = FileAuditEventNormalizer.Normalize(new FileAuditEventInput(
+        TimestampUtc: DateTimeOffset.Parse("2026-07-19T12:00:00Z"),
+        Server: "FileServer",
+        Share: "Corporativo",
+        Path: @"C:\Corporativo\teste.txt",
+        PreviousPath: null,
+        ObjectType: "file",
+        Action: "created",
+        User: @"FILESERVER\AnphibiO",
+        Sid: null,
+        SourceHost: null,
+        SourceIp: null,
+        ProcessName: null,
+        FileSizeBytes: 10,
+        Extension: ".txt",
+        Result: "success",
+        Severity: "info",
+        Source: "usn-journal",
+        AgentId: " fileserver-agent ",
+        CursorType: " USN ",
+        RecordId: null,
+        Usn: 9876,
+        Volume: " c: ",
+        FileReferenceId: " 88-2 "));
+
+    Assert(normalized.AgentId == "fileserver-agent", "AgentId deveria ser normalizado.");
+    Assert(normalized.CursorType == "usn", "CursorType deveria ser normalizado.");
+    Assert(normalized.Usn == 9876, "USN deveria ser preservado.");
+    Assert(normalized.Volume == "C:", "Volume deveria ser normalizado.");
+    Assert(normalized.FileReferenceId == "88-2", "FileReferenceId deveria ser preservado.");
+    Assert(!string.IsNullOrWhiteSpace(normalized.SourceEventId), "Evidencia com cursor deveria gerar SourceEventId.");
 }
 
 static void DiscardsInvalidCollectorExtension()
@@ -250,6 +451,22 @@ static void DurableQueuePreservesUnsentBatchAfterFailure()
             File.Delete(path);
         }
     }
+}
+
+static void DurableQueuePlansDrainByApiBatch()
+{
+    var regular = DurableLineQueue.CreateDrainPlan(
+        apiBatchSize: 500,
+        maxBatches: 10,
+        maxLines: 10_000);
+    var capped = DurableLineQueue.CreateDrainPlan(
+        apiBatchSize: 1_000,
+        maxBatches: 10,
+        maxLines: 3_000);
+
+    Assert(regular.BatchSize == 500, "A drenagem deveria usar o tamanho do lote aceito pela API.");
+    Assert(regular.MaxLines == 5_000, "Dez lotes de 500 deveriam drenar no maximo 5.000 eventos.");
+    Assert(capped.MaxLines == 3_000, "O limite absoluto de eventos deveria prevalecer.");
 }
 
 static void TimelineMaterializationCoalescesConcurrentWindows()
@@ -753,6 +970,45 @@ static void CorrelatesUsnWithSecurityLogByPath()
     Assert(usn.User == "EMPRESA\\maria.silva", "Usuario do USN deveria ser enriquecido pelo Security Log.");
     Assert(usn.ProcessName == "EXCEL.EXE", "Processo deveria ser enriquecido pelo Security Log.");
     Assert(usn.Source == "usn-journal+security-log", "Fonte deveria indicar correlacao.");
+}
+
+static void CorrelatesMassBatchByPath()
+{
+    const int eventCount = 1_000;
+    var timestamp = DateTimeOffset.Parse("2026-07-19T15:00:00Z");
+    var events = new List<CollectedFileEvent>(eventCount * 2);
+
+    for (var index = 0; index < eventCount; index++)
+    {
+        var path = $@"C:\Corporativo\carga\arquivo-{index}.txt";
+        events.Add(BuildCollectedEvent(
+            "security",
+            timestamp,
+            path,
+            @"FILESERVER\AnphibiO",
+            "security-log",
+            "explorer.exe",
+            action: "created_or_appended",
+            recordId: 1_000_000 + index));
+        events.Add(BuildCollectedEvent(
+            "usn",
+            timestamp.AddMilliseconds(100),
+            path,
+            "UNKNOWN",
+            "usn-journal",
+            "fsutil.exe",
+            action: "modified",
+            usn: 2_000_000 + index,
+            fileReferenceId: $"mass-{index}"));
+    }
+
+    var stopwatch = Stopwatch.StartNew();
+    var correlated = new EventCorrelator(TimeSpan.FromSeconds(10)).Correlate(events).ToArray();
+    stopwatch.Stop();
+
+    Assert(correlated.Count(item => item.CursorType == "usn") == eventCount, "O lote massivo deveria preservar todos os eventos USN.");
+    Assert(correlated.Count(item => item.Source == "usn-journal+security-log") == eventCount, "Cada evento USN deveria ser enriquecido pela evidencia de seguranca do mesmo caminho.");
+    Console.WriteLine($"METRIC correlacao-1000x1000={stopwatch.ElapsedMilliseconds}ms");
 }
 
 static void PreservesAccessWhenSecurityLogConfirmsRead()

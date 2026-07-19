@@ -5,8 +5,6 @@ services:
       dockerfile: src/FileServerMonitor.Web/Dockerfile
       args:
         VITE_API_BASE_URL: http://localhost:${APP_API_PORT:-8180}
-        VITE_API_KEY: ${FILESERVER_MONITOR_API_KEY:-}
-        VITE_ACTOR_NAME: ${PUBLIC_WEB_ACTOR_NAME:-web-dev}
     container_name: fileserver-monitor-web
     ports:
       - "${APP_WEB_PORT:-3300}:80"
@@ -25,6 +23,8 @@ services:
       Auth__Enabled: ${AUTH_ENABLED:-false}
       Auth__ApiKey: ${FILESERVER_MONITOR_API_KEY:-}
       Auth__AdminApiKey: ${FILESERVER_MONITOR_ADMIN_API_KEY:-}
+      Auth__AgentApiKey: ${FILESERVER_MONITOR_AGENT_API_KEY:-}
+      Auth__SessionSigningKey: ${FILESERVER_MONITOR_SESSION_SIGNING_KEY:-}
       Cors__AllowedOrigins__0: http://localhost:${APP_WEB_PORT:-3300}
       Cors__AllowedOrigins__1: http://localhost:5173
       Cors__AllowedOrigins__2: http://localhost:4173
@@ -49,9 +49,13 @@ services:
       Retention__AlertsDays: ${RETENTION_ALERTS_DAYS:-365}
       Retention__IntervalHours: ${RETENTION_INTERVAL_HOURS:-24}
       Retention__PurgeBatchSize: ${RETENTION_PURGE_BATCH_SIZE:-10000}
+      Retention__MaxRowsPerRun: ${RETENTION_MAX_ROWS_PER_RUN:-500000}
+      Retention__ArchivePath: /var/lib/fileserver-monitor/archive
       ConnectionStrings__SqlServer: Server=sqlserver,1433;Database=FileServerMonitor;User Id=sa;Password=${SQLSERVER_SA_PASSWORD};TrustServerCertificate=True;
     ports:
       - "${APP_API_PORT:-8180}:8080"
+    volumes:
+      - ${RETENTION_ARCHIVE_HOST_PATH:-retention-archive-data}:/var/lib/fileserver-monitor/archive
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -96,3 +100,4 @@ services:
 
 volumes:
   sqlserver-data:
+  retention-archive-data:

@@ -18,7 +18,14 @@ public sealed record FileAuditEvent(
     string? Extension,
     string Result,
     string Severity,
-    string Source);
+    string Source,
+    string? AgentId = null,
+    string? SourceEventId = null,
+    string? CursorType = null,
+    long? RecordId = null,
+    long? Usn = null,
+    string? Volume = null,
+    string? FileReferenceId = null);
 
 public sealed record FileAuditEventInput(
     DateTimeOffset? TimestampUtc,
@@ -37,15 +44,27 @@ public sealed record FileAuditEventInput(
     string? Extension,
     string? Result,
     string? Severity,
-    string? Source);
+    string? Source,
+    string? AgentId = null,
+    string? CursorType = null,
+    long? RecordId = null,
+    long? Usn = null,
+    string? Volume = null,
+    string? FileReferenceId = null);
 
 public static class FileAuditEventNormalizer
 {
     public static FileAuditEvent Normalize(FileAuditEventInput input)
     {
+        var timestampUtc = input.TimestampUtc ?? DateTimeOffset.UtcNow;
+        var agentId = Clean(input.AgentId);
+        var cursorType = Clean(input.CursorType)?.ToLowerInvariant();
+        var volume = Clean(input.Volume)?.ToUpperInvariant();
+        var fileReferenceId = Clean(input.FileReferenceId);
+
         return new FileAuditEvent(
             Id: Guid.NewGuid(),
-            TimestampUtc: input.TimestampUtc ?? DateTimeOffset.UtcNow,
+            TimestampUtc: timestampUtc,
             Server: Required(input.Server, nameof(input.Server)),
             Share: Required(input.Share, nameof(input.Share)),
             Path: Required(input.Path, nameof(input.Path)),
@@ -61,7 +80,21 @@ public static class FileAuditEventNormalizer
             Extension: NormalizeExtension(input.Extension, input.Path),
             Result: Clean(input.Result) ?? "success",
             Severity: Clean(input.Severity) ?? "info",
-            Source: Clean(input.Source) ?? "manual-ingest");
+            Source: Clean(input.Source) ?? "manual-ingest",
+            AgentId: agentId,
+            SourceEventId: SourceEventIdentity.Create(
+                agentId,
+                cursorType,
+                timestampUtc,
+                input.RecordId,
+                input.Usn,
+                volume,
+                fileReferenceId),
+            CursorType: cursorType,
+            RecordId: input.RecordId,
+            Usn: input.Usn,
+            Volume: volume,
+            FileReferenceId: fileReferenceId);
     }
 
     private static string Required(string value, string fieldName)

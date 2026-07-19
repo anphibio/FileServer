@@ -41,6 +41,9 @@ public sealed class EventCorrelator
             .Where(item => !string.IsNullOrWhiteSpace(item.Path))
             .Where(item => !string.IsNullOrWhiteSpace(item.User) && !item.User.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
             .ToArray();
+        var securityEventsByPath = securityEvents
+            .GroupBy(item => NormalizePath(item.Path), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.OrdinalIgnoreCase);
 
         if (securityEvents.Length == 0)
         {
@@ -58,7 +61,7 @@ public sealed class EventCorrelator
                 continue;
             }
 
-            var matches = FindCompatibleSecurityMatches(item, securityEvents).ToArray();
+            var matches = FindCompatibleSecurityMatches(item, securityEvents, securityEventsByPath).ToArray();
             var match = matches.FirstOrDefault();
 
             if (match is null)
@@ -544,7 +547,8 @@ public sealed class EventCorrelator
 
     private IEnumerable<CollectedFileEvent> FindCompatibleSecurityMatches(
         CollectedFileEvent usnEvent,
-        IReadOnlyCollection<CollectedFileEvent> securityEvents)
+        IReadOnlyCollection<CollectedFileEvent> securityEvents,
+        IReadOnlyDictionary<string, CollectedFileEvent[]> securityEventsByPath)
     {
         var pathCandidates = new[] { NormalizePath(usnEvent.Path), NormalizePath(usnEvent.PreviousPath) }
             .Where(path => !string.IsNullOrWhiteSpace(path))
@@ -556,8 +560,13 @@ public sealed class EventCorrelator
             return Array.Empty<CollectedFileEvent>();
         }
 
-        return securityEvents
-            .Where(item => item.CursorType.Equals("security", StringComparison.OrdinalIgnoreCase))
+        var candidates = usnEvent.Action is "renamed" or "moved"
+            ? securityEvents
+            : pathCandidates
+                .Where(securityEventsByPath.ContainsKey)
+                .SelectMany(path => securityEventsByPath[path]);
+
+        return candidates
             .Select(item => new
             {
                 Event = item,

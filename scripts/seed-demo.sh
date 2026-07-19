@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib-api-auth.sh"
+
 API_BASE_URL="${API_BASE_URL:-http://localhost:8080}"
-API_KEY="${API_KEY:-}"
+HUMAN_API_KEY="$(require_human_api_key)"
+AGENT_API_KEY="$(require_agent_api_key)"
+AGENT_ID="${AGENT_ID:-fs01-agent}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 
-headers=(-H "Content-Type: application/json")
-
-if [ -n "$API_KEY" ]; then
-  headers+=(-H "X-Api-Key: $API_KEY")
-fi
+human_headers=(-H "Content-Type: application/json" -H "X-Api-Key: ${HUMAN_API_KEY}")
+agent_headers=(-H "Content-Type: application/json" -H "X-Api-Key: ${AGENT_API_KEY}" -H "X-Agent-Id: ${AGENT_ID}")
 
 post_json() {
   local path="$1"
   local payload="$2"
+  local scope="${3:-agent}"
+  local -a headers
+  if [[ "${scope}" == "human" ]]; then
+    headers=("${human_headers[@]}")
+  else
+    headers=("${agent_headers[@]}")
+  fi
   local response_file
   response_file="$(mktemp)"
   local status_code
@@ -111,7 +120,7 @@ post_json "/api/monitored-paths" "{
   \"priority\": \"critical\",
   \"owner\": \"Infra / Financeiro\",
   \"notes\": \"Pasta piloto com auditoria NTFS habilitada\"
-}"
+}" human
 
 post_json "/api/monitored-paths" "{
   \"server\": \"FS01\",
@@ -121,7 +130,7 @@ post_json "/api/monitored-paths" "{
   \"priority\": \"high\",
   \"owner\": \"Infra / RH\",
   \"notes\": \"Entrar na segunda onda do piloto\"
-}"
+}" human
 
 printf '3/6 eventos unitários...\n'
 post_json "/api/events" "$(event_json "modified" "EMPRESA\\maria.silva" "\\\\FS01\\Departamentos\\Financeiro\\relatorio-mensal-${RUN_ID}.xlsx" "EXCEL.EXE" ".xlsx")"

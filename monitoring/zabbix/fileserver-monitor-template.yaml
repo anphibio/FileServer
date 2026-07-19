@@ -31,6 +31,9 @@ zabbix_export:
         - macro: '{$FILESERVER_MONITOR_TIMELINE_QUEUE_MAX_AGE}'
           value: '60'
           description: 'Idade maxima esperada para o job mais antigo da timeline, em segundos.'
+        - macro: '{$FILESERVER_MONITOR_RETENTION_MAX_DURATION_MS}'
+          value: '600000'
+          description: 'Duracao maxima esperada para uma execucao de retencao, em milissegundos.'
       items:
         - uuid: 0d0fdcc35bd047e592adcb65fd1c39e8
           name: 'FileServer Monitor: metrics raw'
@@ -951,6 +954,229 @@ zabbix_export:
           tags:
             - tag: Application
               value: 'FileServer Monitor'
+        - uuid: 29819e04dc514679aa93b62ed99d8c22
+          name: 'FileServer Monitor: retention enabled'
+          type: DEPENDENT
+          key: fileserver.retention.enabled
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.enabled
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === true || value === "true" ? 1 : 0;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 96cff7437b6647c4bcf6a2ca8061b820
+          name: 'FileServer Monitor: retention running'
+          type: DEPENDENT
+          key: fileserver.retention.running
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.running
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === true || value === "true" ? 1 : 0;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: f52274ab24fc482f9f4ad4c92c5b6ce9
+          name: 'FileServer Monitor: retention last status'
+          type: DEPENDENT
+          key: fileserver.retention.last_status
+          delay: '0'
+          history: 90d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastRunStatus
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "never" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: afd94bb53a184a888fe76735136b5acf
+          name: 'FileServer Monitor: cold archive available'
+          type: DEPENDENT
+          key: fileserver.retention.archive_available
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveAvailable
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === true || value === "true" ? 1 : 0;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 4d95132e6f574dd4ae529a3044b06ad1
+          name: 'FileServer Monitor: cold archive files'
+          type: DEPENDENT
+          key: fileserver.retention.archive_files
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archiveFiles
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: da81934406af411e81e0dd0cc43786db
+          name: 'FileServer Monitor: cold archive records'
+          type: DEPENDENT
+          key: fileserver.retention.archived_records
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archivedRecords
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 3ebd7d8f40d649d7b52c1bac40729757
+          name: 'FileServer Monitor: cold archive bytes'
+          type: DEPENDENT
+          key: fileserver.retention.archived_bytes
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          units: B
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.archivedBytes
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: da04cdf6a3ea46f88707886a07af0313
+          name: 'FileServer Monitor: retention last duration'
+          type: DEPENDENT
+          key: fileserver.retention.last_duration_ms
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          units: ms
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastDurationMs
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 60135aef57114934a36933c05945f42b
+          name: 'FileServer Monitor: retention deleted raw events'
+          type: DEPENDENT
+          key: fileserver.retention.deleted_events
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastDeletedEvents
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 6370e18983d24eba898088f8f6771933
+          name: 'FileServer Monitor: retention deleted timeline events'
+          type: DEPENDENT
+          key: fileserver.retention.deleted_timeline_events
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastDeletedTimelineEvents
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 6dcaa83b4ae9476a82ed834c4a237cb6
+          name: 'FileServer Monitor: retention deleted alerts'
+          type: DEPENDENT
+          key: fileserver.retention.deleted_alerts
+          delay: '0'
+          history: 90d
+          value_type: UNSIGNED
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastDeletedAlerts
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? 0 : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
+        - uuid: 5733e90001f642bf8f9dd0af9ecb44da
+          name: 'FileServer Monitor: retention last error'
+          type: DEPENDENT
+          key: fileserver.retention.last_error
+          delay: '0'
+          history: 90d
+          trends: '0'
+          value_type: TEXT
+          master_item:
+            key: fileserver.metrics.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.retention.lastError
+            - type: JAVASCRIPT
+              parameters:
+                - 'return value === null || value === "" ? "-" : value;'
+          tags:
+            - tag: Application
+              value: 'FileServer Monitor'
   triggers:
     - uuid: ba8cc84ff4ab4902a416070eb257a817
       expression: 'last(/Template App FileServer Monitor/fileserver.api.status)<>"healthy"'
@@ -1036,3 +1262,15 @@ zabbix_export:
       expression: 'last(/Template App FileServer Monitor/fileserver.inventory.executable_files)>0'
       name: 'FileServer Monitor: executaveis ou scripts encontrados no compartilhamento'
       priority: INFO
+    - uuid: d967b8a1887d4184a5b80853336592c2
+      expression: 'last(/Template App FileServer Monitor/fileserver.retention.last_status)="failed"'
+      name: 'FileServer Monitor: ultima retencao falhou'
+      priority: HIGH
+    - uuid: 754461aff1ce47089e13c15302457c29
+      expression: 'last(/Template App FileServer Monitor/fileserver.retention.last_duration_ms)>{$FILESERVER_MONITOR_RETENTION_MAX_DURATION_MS}'
+      name: 'FileServer Monitor: retencao acima da duracao esperada'
+      priority: WARNING
+    - uuid: 225212887ae3438e85764ac4767c67a3
+      expression: 'last(/Template App FileServer Monitor/fileserver.retention.enabled)=1 and last(/Template App FileServer Monitor/fileserver.retention.archive_available)=0'
+      name: 'FileServer Monitor: retencao ativa sem arquivo frio disponivel'
+      priority: HIGH

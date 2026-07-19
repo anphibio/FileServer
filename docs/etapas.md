@@ -181,6 +181,7 @@ Entregas:
 - Build local da API sem dependencia obrigatoria do SQL Client.
 - Scripts de demo local com API em memoria e seed de dados.
 - Retencao automatica configuravel para eventos e alertas antigos.
+- Arquivamento frio em JSONL GZip com SHA-256 antes da remocao das tabelas operacionais.
 - Cadastro de caminhos monitorados com API, tabela SQL e tela no painel.
 - Relatorio operacional agregado por acao, compartilhamento e usuario.
 - Deteccao de heartbeat atrasado para agentes sem comunicacao recente.
@@ -193,9 +194,9 @@ Status: autenticacao inicial e base de producao implementadas.
 Observacoes:
 
 - `Auth:Enabled=false` por padrao para facilitar desenvolvimento.
-- Quando habilitada, a API exige `X-Api-Key` ou `Authorization: Bearer`.
-- Agente e frontend ja suportam envio da chave.
-- AD/Entra ID permanece como evolucao recomendada antes de producao ampla.
+- Agentes usam `Auth:AgentApiKey` com `X-Agent-Id`; usuarios usam sessao LDAP/AD.
+- O frontend nao recebe chaves administrativas no bundle.
+- A identidade administrativa vem da sessao autenticada.
 - O Compose de producao nao sobe SQL Server local; ele usa `SQLSERVER_CONNECTION_STRING`.
 - Certificados TLS devem ser montados em `docker/certs`.
 - O piloto deve iniciar por pastas controladas antes de expandir para todos os compartilhamentos.
@@ -206,7 +207,7 @@ Observacoes:
 - Validacao local roda com `./scripts/validate.sh`.
 - Build SQL Server pode ser habilitado com `EnableSqlServer=true` ou `VALIDATE_SQLSERVER=true`.
 - Demo local pode ser iniciada com `./scripts/run-api-local.sh` e populada com `./scripts/seed-demo.sh`.
-- Retencao fica desligada por padrao no desenvolvimento e ligada no exemplo de producao.
+- Retencao fica desligada por padrao no desenvolvimento e ligada no exemplo de producao; toda remocao exige arquivo frio persistente e manifesto transacional.
 - Caminhos monitorados podem ser administrados em `/api/monitored-paths` e na aba Caminhos.
 - Dashboard consome `/api/reports/activity-summary` para rankings das ultimas 24 horas.
 - API marca agente como `stale` quando ultrapassa `AGENTS_STALE_MINUTES` sem heartbeat.
@@ -214,14 +215,14 @@ Observacoes:
 - Script `Sync-FileServerAuditFromApi.ps1` aplica auditoria NTFS nos caminhos ativos retornados pela API.
 - Endpoint `/api/admin-audit` lista alteracoes administrativas registradas.
 - Painel web possui aba Auditoria para consultar o log administrativo.
-- Frontend envia `X-Actor` quando `VITE_ACTOR_NAME` ou `PUBLIC_WEB_ACTOR_NAME` esta configurado.
+- Auditoria administrativa usa a identidade da sessao LDAP/AD validada pela API; o frontend nao define o ator por header.
 - API diferencia chave operacional e chave administrativa para acoes sensiveis.
 - CORS da API passa a ser configuravel por ambiente com `PUBLIC_WEB_ORIGIN`.
 - Heartbeat do agente informa fila local pendente e ultimo envio bem-sucedido.
 - API marca agente como `backlog` quando fila local passa de `AGENTS_BACKLOG_WARNING_THRESHOLD`.
 - Eventos podem ser exportados em CSV pela API e pela aba Eventos do painel web.
 - Relatorio operacional aceita filtros por periodo, servidor, compartilhamento, usuario e acao.
-- Painel web possui aba Investigacao para consultar linha do tempo por usuario, caminho, servidor, acao e periodo.
+- A aba Relatorios concentra investigacao por usuario, caminho, servidor, acao e periodo.
 - Regras de alerta podem ser consultadas e ajustadas por API e pela aba Alertas, com persistencia em SQL Server.
 - Regras de alerta aceitam escopo fino por servidor, share e prefixo de caminho para pastas criticas.
 - Regras de alerta aceitam janela de horario com fuso opcional para expediente e fora de expediente.
@@ -231,7 +232,7 @@ Observacoes:
 - Dashboard destaca anomalias por acao, share e usuario comparando o periodo atual com a media historica recente.
 - Dashboard e API exportam alertas e anomalias em CSV para acompanhamento executivo.
 - Dashboard recebeu acabamento visual com cards executivos, subtitulos contextuais e leitura mais rapida dos alertas recentes.
-- Telas de Alertas, Investigacao, Agentes, Caminhos e Auditoria receberam resumos executivos e subtitulos para leitura operacional mais consistente.
+- Telas de Alertas, Relatorios, Agentes, Caminhos e Auditoria receberam resumos executivos e subtitulos para leitura operacional mais consistente.
 - Painel web passou a exibir avisos de sucesso/erro, estado de atualizacao e feedback visual melhor para exportacoes, simulacoes, investigacoes e cadastro de caminhos.
 - Navegacao lateral passou a exibir contadores por area, topo ganhou resumo rapido do ambiente e tabelas receberam leitura visual mais confortavel.
 - Projeto ganhou compose de preview em memoria, arquivo de ambiente e scripts para subir, popular e encerrar a revisao visual local.

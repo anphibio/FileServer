@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data;
 using System.Diagnostics;
 using System.DirectoryServices.Protocols;
 using System.Net;
@@ -27,6 +28,9 @@ builder.Services.AddSingleton<MonitoredPathStore>();
 builder.Services.AddSingleton<AdminAuditStore>();
 builder.Services.AddSingleton<LdapAuthSettingsStore>();
 builder.Services.AddSingleton<RetentionSettingsStore>();
+builder.Services.AddSingleton<RetentionRunStore>();
+builder.Services.AddSingleton<ColdArchiveStore>();
+builder.Services.AddSingleton<RetentionCoordinator>();
 builder.Services.AddSingleton<InventoryScanSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
 builder.Services.AddSingleton<TimelineMaterializationCoordinator>();
@@ -105,6 +109,22 @@ app.Use(async (context, next) =>
 
     var providedKey = AuthHelpers.GetProvidedApiKey(context.Request);
     var requiredRole = AuthHelpers.GetRequiredRole(context.Request);
+    var isAgentEndpoint = AuthHelpers.IsAgentEndpoint(context.Request);
+
+    if (isAgentEndpoint)
+    {
+        if (!authOptions.MatchesAgentKey(providedKey)
+            || string.IsNullOrWhiteSpace(AuthHelpers.GetAgentId(context.Request)))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new ErrorResponse("Credencial de agente invalida."));
+            return;
+        }
+
+        await next(context);
+        return;
+    }
+
     var session = AuthSessionToken.TryValidate(
         AuthHelpers.GetBearerToken(context.Request),
         authOptions.GetSigningSecret());
@@ -165,6 +185,9 @@ app.MapGet("/metrics", async (
     ITimelineMaterializationQueue timelineQueue,
     AgentHealthStore agents,
     RetentionSettingsStore retentionStore,
+    RetentionRunStore retentionRunStore,
+    ColdArchiveStore coldArchiveStore,
+    RetentionCoordinator retentionCoordinator,
     IConfiguration configuration,
     CancellationToken cancellationToken) =>
 {
@@ -187,7 +210,12 @@ app.MapGet("/metrics", async (
         TimelineQueueWarningAgeSeconds: configuration.GetValue("Metrics:TimelineQueueWarningAgeSeconds", 60),
         TimelineQueueCriticalAgeSeconds: configuration.GetValue("Metrics:TimelineQueueCriticalAgeSeconds", 300),
         TimelineQueueCriticalAttempts: configuration.GetValue("Metrics:TimelineQueueCriticalAttempts", 5));
-    var retention = RetentionMetrics.FromSettings(await retentionStore.GetAsync(cancellationToken));
+    var retentionSettings = await retentionStore.GetAsync(cancellationToken);
+    var retention = RetentionMetrics.FromSettings(
+        retentionSettings,
+        await retentionRunStore.GetLatestAsync(cancellationToken),
+        retentionCoordinator.IsRunning,
+        await coldArchiveStore.GetSummaryAsync(0, cancellationToken));
     var api = new ApiMetrics(
         Status: "healthy",
         StorageProvider: repository.ProviderName,
@@ -215,19 +243,25 @@ app.MapPost("/api/events", async (
     FileAuditEventRequest request,
     IEventRepository repository,
     AlertStore alerts,
+    HttpContext httpContext,
     CancellationToken cancellationToken) =>
 {
-    var auditEvent = request.ToAuditEvent();
-    await repository.AddAsync(auditEvent, cancellationToken);
-    var generatedAlerts = await alerts.AnalyzeAsync(new[] { auditEvent }, cancellationToken);
+    var auditEvent = request.ToAuditEvent(AuthHelpers.GetAgentId(httpContext.Request));
+    var accepted = await repository.AddAsync(auditEvent, cancellationToken);
+    var generatedAlerts = accepted
+        ? await alerts.AnalyzeAsync(new[] { auditEvent }, cancellationToken)
+        : Array.Empty<FileServerAlert>();
 
-    return Results.Created($"/api/events/{auditEvent.Id}", new EventIngestResponse(auditEvent, generatedAlerts));
+    return accepted
+        ? Results.Created($"/api/events/{auditEvent.Id}", new EventIngestResponse(true, auditEvent, generatedAlerts))
+        : Results.Ok(new EventIngestResponse(false, auditEvent, generatedAlerts));
 });
 
 app.MapPost("/api/events/batch", async (
     FileAuditEventRequest[] requests,
     IEventRepository repository,
     AlertStore alerts,
+    HttpContext httpContext,
     CancellationToken cancellationToken) =>
 {
     if (requests.Length == 0)
@@ -240,13 +274,15 @@ app.MapPost("/api/events/batch", async (
         return Results.BadRequest(new ErrorResponse("Envie no maximo 1000 eventos por lote."));
     }
 
-    var events = requests.Select(request => request.ToAuditEvent()).ToArray();
-    await repository.AddBatchAsync(events, cancellationToken);
-    var generatedAlerts = await alerts.AnalyzeAsync(events, cancellationToken);
+    var authenticatedAgentId = AuthHelpers.GetAgentId(httpContext.Request);
+    var events = requests.Select(request => request.ToAuditEvent(authenticatedAgentId)).ToArray();
+    var acceptedEvents = await repository.AddBatchAsync(events, cancellationToken);
+    var generatedAlerts = await alerts.AnalyzeAsync(acceptedEvents, cancellationToken);
 
     return Results.Accepted(value: new BatchIngestResponse(
-        events.Length,
-        events.Select(item => item.Id).ToArray(),
+        acceptedEvents.Count,
+        events.Length - acceptedEvents.Count,
+        acceptedEvents.Select(item => item.Id).ToArray(),
         generatedAlerts));
 });
 
@@ -1155,6 +1191,79 @@ app.MapPut("/api/retention/config", async (
         Details: RetentionSettingsResponse.FromSettings(settings)), cancellationToken);
 
     return Results.Ok(RetentionSettingsResponse.FromSettings(settings));
+});
+
+app.MapGet("/api/retention/status", async (
+    RetentionSettingsStore settingsStore,
+    RetentionRunStore runStore,
+    ColdArchiveStore archiveStore,
+    RetentionCoordinator coordinator,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await settingsStore.GetAsync(cancellationToken);
+    var latest = await runStore.GetLatestAsync(cancellationToken);
+    var estimates = await runStore.EstimateAsync(settings, cancellationToken);
+    return Results.Ok(new RetentionStatusResponse(
+        coordinator.IsRunning,
+        RetentionSettingsResponse.FromSettings(settings),
+        latest,
+        estimates,
+        await archiveStore.GetSummaryAsync(10, cancellationToken)));
+});
+
+app.MapGet("/api/retention/archives", async (
+    int? take,
+    ColdArchiveStore archiveStore,
+    CancellationToken cancellationToken) =>
+{
+    return Results.Ok(await archiveStore.GetSummaryAsync(Math.Clamp(take ?? 50, 1, 200), cancellationToken));
+});
+
+app.MapGet("/api/retention/archives/{archiveId:guid}/download", async (
+    Guid archiveId,
+    ColdArchiveStore archiveStore,
+    CancellationToken cancellationToken) =>
+{
+    var archive = await archiveStore.FindAsync(archiveId, cancellationToken);
+    if (archive is null)
+    {
+        return Results.NotFound(new ErrorResponse("Arquivo frio nao encontrado."));
+    }
+
+    var fullPath = archiveStore.ResolveFullPath(archive.RelativePath);
+    if (!File.Exists(fullPath))
+    {
+        return Results.NotFound(new ErrorResponse("O manifesto existe, mas o arquivo frio nao esta disponivel no volume."));
+    }
+
+    return Results.File(
+        fullPath,
+        "application/gzip",
+        Path.GetFileName(fullPath),
+        enableRangeProcessing: true);
+});
+
+app.MapPost("/api/retention/run", async (
+    RetentionCoordinator coordinator,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var result = await coordinator.TryRunAsync("manual", cancellationToken);
+    if (result is null)
+    {
+        return Results.Conflict(new ErrorResponse("Ja existe uma execucao de retencao em andamento."));
+    }
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "retention.run",
+        EntityType: "retention_run",
+        EntityId: result.RunId.ToString(),
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: result), cancellationToken);
+
+    return Results.Ok(result);
 });
 
 app.MapGet("/api/inventory/config", async (
@@ -2348,9 +2457,9 @@ internal interface IEventRepository
 {
     string ProviderName { get; }
 
-    Task AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken);
+    Task<bool> AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken);
 
-    Task AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken);
+    Task<IReadOnlyCollection<FileAuditEvent>> AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken);
 
     Task<FileAuditEvent?> FindAsync(Guid id, CancellationToken cancellationToken);
 
@@ -2362,7 +2471,7 @@ internal interface IEventRepository
 
     Task<BaselineAnomalyResponse> GetBaselineAnomaliesAsync(BaselineAnomalyQuery query, CancellationToken cancellationToken);
 
-    Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
+    Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, int maxRows, CancellationToken cancellationToken);
 }
 
 internal interface ITimelineMaterializationQueue
@@ -2419,7 +2528,7 @@ internal interface ITimelineRepository
 
     Task<TimelineCoverage> GetCoverageAsync(CancellationToken cancellationToken);
 
-    Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, CancellationToken cancellationToken);
+    Task<int> PurgeOlderThanAsync(DateTimeOffset cutoffUtc, int batchSize, int maxRows, CancellationToken cancellationToken);
 }
 
 internal interface IInventoryRepository
@@ -2856,16 +2965,18 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
     public async Task<int> PurgeOlderThanAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
         var totalDeleted = 0;
         var safeBatchSize = Math.Clamp(batchSize, 100, 100_000);
+        var safeMaxRows = Math.Max(1, maxRows);
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
         await EnsureOperationalIndexesAsync(connection, cancellationToken);
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested && totalDeleted < safeMaxRows)
         {
             await using var command = connection.CreateCommand();
             command.CommandText = """
@@ -2875,7 +2986,7 @@ internal sealed class SqlServerTimelineRepository : ITimelineRepository
 
                 SELECT @@ROWCOUNT;
                 """;
-            command.Parameters.AddWithValue("@BatchSize", safeBatchSize);
+            command.Parameters.AddWithValue("@BatchSize", Math.Min(safeBatchSize, safeMaxRows - totalDeleted));
             command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
 
             var deleted = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
@@ -4969,6 +5080,7 @@ internal sealed class SqlServerEventRepository : IEventRepository
     private static readonly TimeSpan MaterializationPadding = TimeSpan.FromSeconds(30);
     private readonly string _connectionString;
     private readonly SqlServerTimelineMaterializationQueue _timelineQueue;
+    private int _evidenceSchemaEnsured;
 
     public SqlServerEventRepository(
         IConfiguration configuration,
@@ -4981,81 +5093,75 @@ internal sealed class SqlServerEventRepository : IEventRepository
 
     public string ProviderName => "SqlServer";
 
-    public async Task AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
+    public async Task<bool> AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
     {
-        await AddBatchAsync(new[] { auditEvent }, cancellationToken);
+        var accepted = await AddBatchAsync(new[] { auditEvent }, cancellationToken);
+        return accepted.Count == 1;
     }
 
-    public async Task AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
+    public async Task<IReadOnlyCollection<FileAuditEvent>> AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
     {
         if (events.Count == 0)
         {
-            return;
+            return Array.Empty<FileAuditEvent>();
         }
+
+        var batch = FileAuditEventBatch.SelectUniqueSourceEvidence(
+            events,
+            item => item.AgentId,
+            item => item.SourceEventId);
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
         await _timelineQueue.EnsureSchemaAsync(connection, cancellationToken);
+        await EnsureEvidenceSchemaAsync(connection, cancellationToken);
 
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
 
         try
         {
-            foreach (var auditEvent in events)
+            await using (var createStage = connection.CreateCommand())
             {
-                await using var command = connection.CreateCommand();
-                command.Transaction = transaction;
-                command.CommandText = """
-                    INSERT INTO dbo.FileAuditEvents
-                    (
-                        Id,
-                        TimestampUtc,
-                        ServerName,
-                        ShareName,
-                        FullPath,
-                        PreviousPath,
-                        ObjectType,
-                        ActionName,
-                        UserName,
-                        Sid,
-                        SourceHost,
-                        SourceIp,
-                        ProcessName,
-                        FileSizeBytes,
-                        Extension,
-                        ResultName,
-                        Severity,
-                        SourceName
-                    )
-                    VALUES
-                    (
-                        @Id,
-                        @TimestampUtc,
-                        @ServerName,
-                        @ShareName,
-                        @FullPath,
-                        @PreviousPath,
-                        @ObjectType,
-                        @ActionName,
-                        @UserName,
-                        @Sid,
-                        @SourceHost,
-                        @SourceIp,
-                        @ProcessName,
-                        @FileSizeBytes,
-                        @Extension,
-                        @ResultName,
-                        @Severity,
-                        @SourceName
-                    );
-                    """;
-
-                AddEventParameters(command, auditEvent);
-                await command.ExecuteNonQueryAsync(cancellationToken);
+                createStage.Transaction = transaction;
+                createStage.CommandText = CreateEventBatchStageSql;
+                await createStage.ExecuteNonQueryAsync(cancellationToken);
             }
 
+            using var batchTable = BuildEventBatchTable(batch);
+            using (var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.CheckConstraints, transaction))
+            {
+                bulkCopy.DestinationTableName = "#IncomingFileAuditEvents";
+                bulkCopy.BatchSize = batch.Count;
+                bulkCopy.BulkCopyTimeout = 120;
+
+                foreach (DataColumn column in batchTable.Columns)
+                {
+                    bulkCopy.ColumnMappings.Add(column.ColumnName, column.ColumnName);
+                }
+
+                await bulkCopy.WriteToServerAsync(batchTable, cancellationToken);
+            }
+
+            var acceptedIds = new HashSet<Guid>();
+            await using (var insert = connection.CreateCommand())
+            {
+                insert.Transaction = transaction;
+                insert.CommandTimeout = 120;
+                insert.CommandText = InsertEventBatchSql;
+
+                await using var reader = await insert.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    acceptedIds.Add(reader.GetGuid(0));
+                }
+            }
+
+            var accepted = batch
+                .Where(item => acceptedIds.Contains(item.Id))
+                .ToArray();
+
             var materializationWindow = TimelineMaterializationWindow.FromTimestamps(
-                events.Select(item => item.TimestampUtc),
+                accepted.Select(item => item.TimestampUtc),
                 MaterializationPadding);
             if (materializationWindow is not null)
             {
@@ -5067,12 +5173,174 @@ internal sealed class SqlServerEventRepository : IEventRepository
             }
 
             await transaction.CommitAsync(cancellationToken);
+            return accepted;
         }
         catch
         {
             await transaction.RollbackAsync(cancellationToken);
             throw;
         }
+    }
+
+    private const string CreateEventBatchStageSql = """
+        CREATE TABLE #IncomingFileAuditEvents
+        (
+            Id UNIQUEIDENTIFIER NOT NULL,
+            TimestampUtc DATETIME2(3) NOT NULL,
+            ServerName NVARCHAR(128) NOT NULL,
+            ShareName NVARCHAR(256) NOT NULL,
+            FullPath NVARCHAR(2048) NOT NULL,
+            PreviousPath NVARCHAR(2048) NULL,
+            ObjectType NVARCHAR(32) NOT NULL,
+            ActionName NVARCHAR(64) NOT NULL,
+            UserName NVARCHAR(256) NOT NULL,
+            Sid NVARCHAR(256) NULL,
+            SourceHost NVARCHAR(256) NULL,
+            SourceIp NVARCHAR(64) NULL,
+            ProcessName NVARCHAR(256) NULL,
+            FileSizeBytes BIGINT NULL,
+            Extension NVARCHAR(64) NULL,
+            ResultName NVARCHAR(64) NOT NULL,
+            Severity NVARCHAR(32) NOT NULL,
+            SourceName NVARCHAR(128) NOT NULL,
+            AgentId NVARCHAR(128) NULL,
+            SourceEventId CHAR(64) NULL,
+            CursorType NVARCHAR(32) NULL,
+            SourceRecordId BIGINT NULL,
+            SourceUsn BIGINT NULL,
+            SourceVolume NVARCHAR(32) NULL,
+            FileReferenceId NVARCHAR(128) NULL
+        );
+        """;
+
+    private const string InsertEventBatchSql = """
+        INSERT INTO dbo.FileAuditEvents
+        (
+            Id,
+            TimestampUtc,
+            ServerName,
+            ShareName,
+            FullPath,
+            PreviousPath,
+            ObjectType,
+            ActionName,
+            UserName,
+            Sid,
+            SourceHost,
+            SourceIp,
+            ProcessName,
+            FileSizeBytes,
+            Extension,
+            ResultName,
+            Severity,
+            SourceName,
+            AgentId,
+            SourceEventId,
+            CursorType,
+            SourceRecordId,
+            SourceUsn,
+            SourceVolume,
+            FileReferenceId
+        )
+        OUTPUT inserted.Id
+        SELECT
+            source.Id,
+            source.TimestampUtc,
+            source.ServerName,
+            source.ShareName,
+            source.FullPath,
+            source.PreviousPath,
+            source.ObjectType,
+            source.ActionName,
+            source.UserName,
+            source.Sid,
+            source.SourceHost,
+            source.SourceIp,
+            source.ProcessName,
+            source.FileSizeBytes,
+            source.Extension,
+            source.ResultName,
+            source.Severity,
+            source.SourceName,
+            source.AgentId,
+            source.SourceEventId,
+            source.CursorType,
+            source.SourceRecordId,
+            source.SourceUsn,
+            source.SourceVolume,
+            source.FileReferenceId
+        FROM #IncomingFileAuditEvents source
+        WHERE source.AgentId IS NULL
+           OR source.SourceEventId IS NULL
+           OR NOT EXISTS
+           (
+               SELECT 1
+               FROM dbo.FileAuditEvents existing WITH (UPDLOCK, HOLDLOCK)
+               WHERE existing.AgentId = source.AgentId
+                 AND existing.SourceEventId = source.SourceEventId
+           );
+        """;
+
+    private static DataTable BuildEventBatchTable(IReadOnlyList<FileAuditEvent> events)
+    {
+        var table = new DataTable();
+        table.Columns.Add("Id", typeof(Guid));
+        table.Columns.Add("TimestampUtc", typeof(DateTime));
+        table.Columns.Add("ServerName", typeof(string));
+        table.Columns.Add("ShareName", typeof(string));
+        table.Columns.Add("FullPath", typeof(string));
+        table.Columns.Add("PreviousPath", typeof(string));
+        table.Columns.Add("ObjectType", typeof(string));
+        table.Columns.Add("ActionName", typeof(string));
+        table.Columns.Add("UserName", typeof(string));
+        table.Columns.Add("Sid", typeof(string));
+        table.Columns.Add("SourceHost", typeof(string));
+        table.Columns.Add("SourceIp", typeof(string));
+        table.Columns.Add("ProcessName", typeof(string));
+        table.Columns.Add("FileSizeBytes", typeof(long));
+        table.Columns.Add("Extension", typeof(string));
+        table.Columns.Add("ResultName", typeof(string));
+        table.Columns.Add("Severity", typeof(string));
+        table.Columns.Add("SourceName", typeof(string));
+        table.Columns.Add("AgentId", typeof(string));
+        table.Columns.Add("SourceEventId", typeof(string));
+        table.Columns.Add("CursorType", typeof(string));
+        table.Columns.Add("SourceRecordId", typeof(long));
+        table.Columns.Add("SourceUsn", typeof(long));
+        table.Columns.Add("SourceVolume", typeof(string));
+        table.Columns.Add("FileReferenceId", typeof(string));
+
+        foreach (var auditEvent in events)
+        {
+            table.Rows.Add(
+                auditEvent.Id,
+                auditEvent.TimestampUtc.UtcDateTime,
+                auditEvent.Server,
+                auditEvent.Share,
+                auditEvent.Path,
+                DbValue(auditEvent.PreviousPath),
+                auditEvent.ObjectType,
+                auditEvent.Action,
+                auditEvent.User,
+                DbValue(auditEvent.Sid),
+                DbValue(auditEvent.SourceHost),
+                DbValue(auditEvent.SourceIp),
+                DbValue(auditEvent.ProcessName),
+                DbValue(auditEvent.FileSizeBytes),
+                DbValue(auditEvent.Extension),
+                auditEvent.Result,
+                auditEvent.Severity,
+                auditEvent.Source,
+                DbValue(auditEvent.AgentId),
+                DbValue(auditEvent.SourceEventId),
+                DbValue(auditEvent.CursorType),
+                DbValue(auditEvent.RecordId),
+                DbValue(auditEvent.Usn),
+                DbValue(auditEvent.Volume),
+                DbValue(auditEvent.FileReferenceId));
+        }
+
+        return table;
     }
 
     public async Task<FileAuditEvent?> FindAsync(Guid id, CancellationToken cancellationToken)
@@ -5100,7 +5368,14 @@ internal sealed class SqlServerEventRepository : IEventRepository
                 Extension,
                 ResultName,
                 Severity,
-                SourceName
+                SourceName,
+                AgentId,
+                SourceEventId,
+                CursorType,
+                SourceRecordId,
+                SourceUsn,
+                SourceVolume,
+                FileReferenceId
             FROM dbo.FileAuditEvents
             WHERE Id = @Id;
             """;
@@ -5163,15 +5438,17 @@ internal sealed class SqlServerEventRepository : IEventRepository
     public async Task<int> PurgeOlderThanAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
         var totalDeleted = 0;
         var safeBatchSize = Math.Clamp(batchSize, 100, 100_000);
+        var safeMaxRows = Math.Max(1, maxRows);
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested && totalDeleted < safeMaxRows)
         {
             await using var command = connection.CreateCommand();
             command.CommandText = """
@@ -5181,7 +5458,7 @@ internal sealed class SqlServerEventRepository : IEventRepository
 
                 SELECT @@ROWCOUNT;
                 """;
-            command.Parameters.AddWithValue("@BatchSize", safeBatchSize);
+            command.Parameters.AddWithValue("@BatchSize", Math.Min(safeBatchSize, safeMaxRows - totalDeleted));
             command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
 
             var deleted = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
@@ -5370,7 +5647,14 @@ internal sealed class SqlServerEventRepository : IEventRepository
                 Extension,
                 ResultName,
                 Severity,
-                SourceName
+                SourceName,
+                AgentId,
+                SourceEventId,
+                CursorType,
+                SourceRecordId,
+                SourceUsn,
+                SourceVolume,
+                FileReferenceId
             FROM dbo.FileAuditEvents
             {{where}}
             ORDER BY TimestampUtc DESC;
@@ -5590,26 +5874,38 @@ internal sealed class SqlServerEventRepository : IEventRepository
         return $"WHERE {string.Join(" AND ", predicates)}";
     }
 
-    private static void AddEventParameters(SqlCommand command, FileAuditEvent auditEvent)
+    private async Task EnsureEvidenceSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
     {
-        command.Parameters.AddWithValue("@Id", auditEvent.Id);
-        command.Parameters.AddWithValue("@TimestampUtc", auditEvent.TimestampUtc.UtcDateTime);
-        command.Parameters.AddWithValue("@ServerName", auditEvent.Server);
-        command.Parameters.AddWithValue("@ShareName", auditEvent.Share);
-        command.Parameters.AddWithValue("@FullPath", auditEvent.Path);
-        command.Parameters.AddWithValue("@PreviousPath", DbValue(auditEvent.PreviousPath));
-        command.Parameters.AddWithValue("@ObjectType", auditEvent.ObjectType);
-        command.Parameters.AddWithValue("@ActionName", auditEvent.Action);
-        command.Parameters.AddWithValue("@UserName", auditEvent.User);
-        command.Parameters.AddWithValue("@Sid", DbValue(auditEvent.Sid));
-        command.Parameters.AddWithValue("@SourceHost", DbValue(auditEvent.SourceHost));
-        command.Parameters.AddWithValue("@SourceIp", DbValue(auditEvent.SourceIp));
-        command.Parameters.AddWithValue("@ProcessName", DbValue(auditEvent.ProcessName));
-        command.Parameters.AddWithValue("@FileSizeBytes", DbValue(auditEvent.FileSizeBytes));
-        command.Parameters.AddWithValue("@Extension", DbValue(auditEvent.Extension));
-        command.Parameters.AddWithValue("@ResultName", auditEvent.Result);
-        command.Parameters.AddWithValue("@Severity", auditEvent.Severity);
-        command.Parameters.AddWithValue("@SourceName", auditEvent.Source);
+        if (Volatile.Read(ref _evidenceSchemaEnsured) == 1)
+        {
+            return;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'AgentId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD AgentId NVARCHAR(128) NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceEventId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceEventId CHAR(64) NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'CursorType') IS NULL ALTER TABLE dbo.FileAuditEvents ADD CursorType NVARCHAR(32) NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceRecordId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceRecordId BIGINT NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceUsn') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceUsn BIGINT NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'SourceVolume') IS NULL ALTER TABLE dbo.FileAuditEvents ADD SourceVolume NVARCHAR(32) NULL;
+            IF COL_LENGTH(N'dbo.FileAuditEvents', N'FileReferenceId') IS NULL ALTER TABLE dbo.FileAuditEvents ADD FileReferenceId NVARCHAR(128) NULL;
+
+            IF NOT EXISTS
+            (
+                SELECT 1
+                FROM sys.indexes
+                WHERE name = N'UX_FileAuditEvents_Agent_SourceEvent'
+                  AND object_id = OBJECT_ID(N'dbo.FileAuditEvents')
+            )
+            BEGIN
+                CREATE UNIQUE INDEX UX_FileAuditEvents_Agent_SourceEvent
+                    ON dbo.FileAuditEvents (AgentId, SourceEventId)
+                    WHERE AgentId IS NOT NULL AND SourceEventId IS NOT NULL;
+            END;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+        Volatile.Write(ref _evidenceSchemaEnsured, 1);
     }
 
     private static FileAuditEvent ReadEvent(SqlDataReader reader)
@@ -5632,7 +5928,14 @@ internal sealed class SqlServerEventRepository : IEventRepository
             Extension: ReadNullableString(reader, "Extension"),
             Result: reader.GetString(reader.GetOrdinal("ResultName")),
             Severity: reader.GetString(reader.GetOrdinal("Severity")),
-            Source: reader.GetString(reader.GetOrdinal("SourceName")));
+            Source: reader.GetString(reader.GetOrdinal("SourceName")),
+            AgentId: ReadNullableString(reader, "AgentId"),
+            SourceEventId: ReadNullableString(reader, "SourceEventId"),
+            CursorType: ReadNullableString(reader, "CursorType"),
+            RecordId: ReadNullableLong(reader, "SourceRecordId"),
+            Usn: ReadNullableLong(reader, "SourceUsn"),
+            Volume: ReadNullableString(reader, "SourceVolume"),
+            FileReferenceId: ReadNullableString(reader, "FileReferenceId"));
     }
 
     private static string? ReadNullableString(SqlDataReader reader, string name)
@@ -5898,11 +6201,13 @@ internal sealed class InMemoryTimelineRepository : ITimelineRepository
     public Task<int> PurgeOlderThanAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
         var deleted = 0;
         var idsToRemove = _events.Values
             .Where(item => item.TimestampUtc < cutoffUtc)
+            .Take(Math.Max(1, maxRows))
             .Select(item => item.Id)
             .ToArray();
 
@@ -6295,6 +6600,7 @@ internal sealed class InMemoryEventRepository : IEventRepository
 {
     private static readonly TimeSpan MaterializationPadding = TimeSpan.FromSeconds(30);
     private readonly ConcurrentQueue<FileAuditEvent> _events = new();
+    private readonly ConcurrentDictionary<string, Guid> _sourceEvents = new(StringComparer.Ordinal);
     private readonly int _maxEvents;
     private readonly ITimelineMaterializationQueue _timelineQueue;
 
@@ -6308,20 +6614,30 @@ internal sealed class InMemoryEventRepository : IEventRepository
 
     public string ProviderName => "InMemory";
 
-    public async Task AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
+    public async Task<bool> AddAsync(FileAuditEvent auditEvent, CancellationToken cancellationToken)
     {
-        Add(auditEvent);
-        await EnqueueTimelineAsync(new[] { auditEvent }, cancellationToken);
-    }
-
-    public async Task AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
-    {
-        foreach (var auditEvent in events)
+        if (!Add(auditEvent))
         {
-            Add(auditEvent);
+            return false;
         }
 
-        await EnqueueTimelineAsync(events, cancellationToken);
+        await EnqueueTimelineAsync(new[] { auditEvent }, cancellationToken);
+        return true;
+    }
+
+    public async Task<IReadOnlyCollection<FileAuditEvent>> AddBatchAsync(IReadOnlyCollection<FileAuditEvent> events, CancellationToken cancellationToken)
+    {
+        var accepted = new List<FileAuditEvent>(events.Count);
+        foreach (var auditEvent in events)
+        {
+            if (Add(auditEvent))
+            {
+                accepted.Add(auditEvent);
+            }
+        }
+
+        await EnqueueTimelineAsync(accepted, cancellationToken);
+        return accepted;
     }
 
     private Task EnqueueTimelineAsync(
@@ -6527,14 +6843,22 @@ internal sealed class InMemoryEventRepository : IEventRepository
     public Task<int> PurgeOlderThanAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
         var deleted = 0;
 
-        while (_events.TryPeek(out var auditEvent) && auditEvent.TimestampUtc < cutoffUtc)
+        while (deleted < Math.Max(1, maxRows)
+               && _events.TryPeek(out var auditEvent)
+               && auditEvent.TimestampUtc < cutoffUtc)
         {
-            if (_events.TryDequeue(out _))
+            if (_events.TryDequeue(out var removed))
             {
+                if (removed.SourceEventId is not null)
+                {
+                    _sourceEvents.TryRemove(removed.SourceEventId, out _);
+                }
+
                 deleted++;
             }
         }
@@ -6542,13 +6866,25 @@ internal sealed class InMemoryEventRepository : IEventRepository
         return Task.FromResult(deleted);
     }
 
-    private void Add(FileAuditEvent auditEvent)
+    private bool Add(FileAuditEvent auditEvent)
     {
+        if (auditEvent.SourceEventId is not null
+            && !_sourceEvents.TryAdd(auditEvent.SourceEventId, auditEvent.Id))
+        {
+            return false;
+        }
+
         _events.Enqueue(auditEvent);
 
-        while (_events.Count > _maxEvents && _events.TryDequeue(out _))
+        while (_events.Count > _maxEvents && _events.TryDequeue(out var removed))
         {
+            if (removed.SourceEventId is not null)
+            {
+                _sourceEvents.TryRemove(removed.SourceEventId, out _);
+            }
         }
+
+        return true;
     }
 
     private static IReadOnlyCollection<ActivitySummaryItem> Summarize(
@@ -7592,10 +7928,10 @@ internal static class AdminAuditHelpers
 {
     public static string GetActor(HttpContext context)
     {
-        if (context.Request.Headers.TryGetValue("X-Actor", out var actor)
-            && !string.IsNullOrWhiteSpace(actor.FirstOrDefault()))
+        if (context.User.Identity?.IsAuthenticated == true
+            && !string.IsNullOrWhiteSpace(context.User.Identity.Name))
         {
-            return actor.First()!;
+            return context.User.Identity.Name;
         }
 
         if (context.Request.Headers.TryGetValue("X-Agent-Id", out var agentId)
@@ -8453,16 +8789,17 @@ internal sealed class AlertStore
     public async Task<int> PurgeOlderThanAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
 #if SQLSERVER
         if (_persistAlerts)
         {
-            return await PurgeSqlAsync(cutoffUtc, batchSize, cancellationToken);
+            return await PurgeSqlAsync(cutoffUtc, batchSize, maxRows, cancellationToken);
         }
 #endif
 
-        return PurgeMemory(cutoffUtc);
+        return PurgeMemory(cutoffUtc, maxRows);
     }
 
     private IReadOnlyCollection<FileServerAlert> QueryMemory(AlertQuery query)
@@ -8503,11 +8840,14 @@ internal sealed class AlertStore
         return updated;
     }
 
-    private int PurgeMemory(DateTimeOffset cutoffUtc)
+    private int PurgeMemory(DateTimeOffset cutoffUtc, int maxRows)
     {
         var deleted = 0;
 
-        foreach (var alert in _alerts.Values.Where(item => item.CreatedUtc < cutoffUtc).ToArray())
+        foreach (var alert in _alerts.Values
+                     .Where(item => item.CreatedUtc < cutoffUtc)
+                     .Take(Math.Max(1, maxRows))
+                     .ToArray())
         {
             if (_alerts.TryRemove(alert.Id, out _))
             {
@@ -8718,15 +9058,17 @@ internal sealed class AlertStore
     private async Task<int> PurgeSqlAsync(
         DateTimeOffset cutoffUtc,
         int batchSize,
+        int maxRows,
         CancellationToken cancellationToken)
     {
         var totalDeleted = 0;
         var safeBatchSize = Math.Clamp(batchSize, 100, 100_000);
+        var safeMaxRows = Math.Max(1, maxRows);
 
         await using var connection = CreateSqlConnection();
         await connection.OpenAsync(cancellationToken);
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested && totalDeleted < safeMaxRows)
         {
             await using var command = connection.CreateCommand();
             command.CommandText = """
@@ -8736,7 +9078,7 @@ internal sealed class AlertStore
 
                 SELECT @@ROWCOUNT;
                 """;
-            command.Parameters.AddWithValue("@BatchSize", safeBatchSize);
+            command.Parameters.AddWithValue("@BatchSize", Math.Min(safeBatchSize, safeMaxRows - totalDeleted));
             command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
 
             var deleted = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
@@ -9229,7 +9571,8 @@ internal sealed class RetentionSettingsStore
             TimelineDays: configuration.GetValue<int?>("Retention:TimelineDays"),
             AlertsDays: configuration.GetValue<int?>("Retention:AlertsDays"),
             IntervalHours: configuration.GetValue<int?>("Retention:IntervalHours"),
-            PurgeBatchSize: configuration.GetValue<int?>("Retention:PurgeBatchSize")));
+            PurgeBatchSize: configuration.GetValue<int?>("Retention:PurgeBatchSize"),
+            MaxRowsPerRun: configuration.GetValue<int?>("Retention:MaxRowsPerRun")));
     }
 
     public async Task<RetentionOptions> GetAsync(CancellationToken cancellationToken)
@@ -9276,6 +9619,7 @@ internal sealed class RetentionSettingsStore
             AlertsDays: alertsDays,
             IntervalHours: Math.Clamp(request.IntervalHours ?? 24, 1, 168),
             PurgeBatchSize: Math.Clamp(request.PurgeBatchSize ?? 10_000, 100, 100_000),
+            MaxRowsPerRun: Math.Clamp(request.MaxRowsPerRun ?? 500_000, 1_000, 5_000_000),
             UpdatedUtc: DateTimeOffset.UtcNow);
     }
 
@@ -9295,6 +9639,7 @@ internal sealed class RetentionSettingsStore
                 AlertsDays,
                 IntervalHours,
                 PurgeBatchSize,
+                MaxRowsPerRun,
                 UpdatedUtc
             FROM dbo.RetentionSettings
             WHERE Id = 1;
@@ -9323,6 +9668,7 @@ internal sealed class RetentionSettingsStore
                     AlertsDays = @AlertsDays,
                     IntervalHours = @IntervalHours,
                     PurgeBatchSize = @PurgeBatchSize,
+                    MaxRowsPerRun = @MaxRowsPerRun,
                     UpdatedUtc = @UpdatedUtc
             WHEN NOT MATCHED THEN
                 INSERT
@@ -9334,6 +9680,7 @@ internal sealed class RetentionSettingsStore
                     AlertsDays,
                     IntervalHours,
                     PurgeBatchSize,
+                    MaxRowsPerRun,
                     UpdatedUtc
                 )
                 VALUES
@@ -9345,6 +9692,7 @@ internal sealed class RetentionSettingsStore
                     @AlertsDays,
                     @IntervalHours,
                     @PurgeBatchSize,
+                    @MaxRowsPerRun,
                     @UpdatedUtc
                 );
             """;
@@ -9367,8 +9715,15 @@ internal sealed class RetentionSettingsStore
                     AlertsDays INT NOT NULL,
                     IntervalHours INT NOT NULL,
                     PurgeBatchSize INT NOT NULL,
+                    MaxRowsPerRun INT NOT NULL CONSTRAINT DF_RetentionSettings_MaxRowsPerRun DEFAULT 500000,
                     UpdatedUtc DATETIME2(3) NOT NULL
                 );
+            END;
+
+            IF COL_LENGTH(N'dbo.RetentionSettings', N'MaxRowsPerRun') IS NULL
+            BEGIN
+                ALTER TABLE dbo.RetentionSettings
+                ADD MaxRowsPerRun INT NOT NULL CONSTRAINT DF_RetentionSettings_MaxRowsPerRun_Upgrade DEFAULT 500000;
             END;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -9392,6 +9747,7 @@ internal sealed class RetentionSettingsStore
         command.Parameters.AddWithValue("@AlertsDays", settings.AlertsDays);
         command.Parameters.AddWithValue("@IntervalHours", settings.IntervalHours);
         command.Parameters.AddWithValue("@PurgeBatchSize", settings.PurgeBatchSize);
+        command.Parameters.AddWithValue("@MaxRowsPerRun", settings.MaxRowsPerRun);
         command.Parameters.AddWithValue("@UpdatedUtc", settings.UpdatedUtc.UtcDateTime);
     }
 
@@ -9404,6 +9760,7 @@ internal sealed class RetentionSettingsStore
             AlertsDays: reader.GetInt32(reader.GetOrdinal("AlertsDays")),
             IntervalHours: reader.GetInt32(reader.GetOrdinal("IntervalHours")),
             PurgeBatchSize: reader.GetInt32(reader.GetOrdinal("PurgeBatchSize")),
+            MaxRowsPerRun: reader.GetInt32(reader.GetOrdinal("MaxRowsPerRun")),
             UpdatedUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("UpdatedUtc")), DateTimeKind.Utc)));
     }
 #endif
@@ -10036,25 +10393,828 @@ internal sealed class TimelineMaterializationWorker : BackgroundService
     }
 }
 
+internal sealed class RetentionRunStore
+{
+    private readonly ConcurrentQueue<RetentionRunRecord> _runs = new();
+#if SQLSERVER
+    private readonly bool _persist;
+    private readonly string? _connectionString;
+#endif
+
+    public RetentionRunStore(IConfiguration configuration)
+    {
+#if SQLSERVER
+        _persist = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+    }
+
+    public async Task<RetentionRunRecord> StartAsync(
+        RetentionOptions options,
+        string trigger,
+        CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var run = new RetentionRunRecord(
+            Guid.NewGuid(),
+            trigger,
+            "running",
+            now,
+            null,
+            now.AddDays(-options.EventsDays),
+            now.AddDays(-options.TimelineDays),
+            now.AddDays(-options.AlertsDays),
+            0,
+            0,
+            0,
+            0,
+            null);
+        _runs.Enqueue(run);
+
+#if SQLSERVER
+        if (_persist)
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO dbo.RetentionRuns
+                (
+                    RunId, TriggerName, StatusName, StartedUtc, CompletedUtc,
+                    EventsCutoffUtc, TimelineCutoffUtc, AlertsCutoffUtc,
+                    DeletedEvents, DeletedTimelineEvents, DeletedAlerts, DurationMs, ErrorMessage
+                )
+                VALUES
+                (
+                    @RunId, @TriggerName, @StatusName, @StartedUtc, NULL,
+                    @EventsCutoffUtc, @TimelineCutoffUtc, @AlertsCutoffUtc,
+                    0, 0, 0, 0, NULL
+                );
+                """;
+            AddRunParameters(command, run);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+#endif
+
+        return run;
+    }
+
+    public async Task<RetentionRunRecord> CompleteAsync(
+        RetentionRunRecord run,
+        string status,
+        int deletedEvents,
+        int deletedTimelineEvents,
+        int deletedAlerts,
+        long durationMs,
+        string? error,
+        CancellationToken cancellationToken)
+    {
+        var completed = run with
+        {
+            Status = status,
+            CompletedUtc = DateTimeOffset.UtcNow,
+            DeletedEvents = deletedEvents,
+            DeletedTimelineEvents = deletedTimelineEvents,
+            DeletedAlerts = deletedAlerts,
+            DurationMs = durationMs,
+            Error = string.IsNullOrWhiteSpace(error) ? null : error[..Math.Min(error.Length, 2048)]
+        };
+        _runs.Enqueue(completed);
+
+#if SQLSERVER
+        if (_persist)
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE dbo.RetentionRuns
+                SET StatusName = @StatusName,
+                    CompletedUtc = @CompletedUtc,
+                    DeletedEvents = @DeletedEvents,
+                    DeletedTimelineEvents = @DeletedTimelineEvents,
+                    DeletedAlerts = @DeletedAlerts,
+                    DurationMs = @DurationMs,
+                    ErrorMessage = @ErrorMessage
+                WHERE RunId = @RunId;
+                """;
+            command.Parameters.AddWithValue("@RunId", completed.RunId);
+            command.Parameters.AddWithValue("@StatusName", completed.Status);
+            command.Parameters.AddWithValue("@CompletedUtc", completed.CompletedUtc!.Value.UtcDateTime);
+            command.Parameters.AddWithValue("@DeletedEvents", completed.DeletedEvents);
+            command.Parameters.AddWithValue("@DeletedTimelineEvents", completed.DeletedTimelineEvents);
+            command.Parameters.AddWithValue("@DeletedAlerts", completed.DeletedAlerts);
+            command.Parameters.AddWithValue("@DurationMs", completed.DurationMs);
+            command.Parameters.AddWithValue("@ErrorMessage", DbValue(completed.Error));
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+#endif
+
+        return completed;
+    }
+
+    public async Task<RetentionRunRecord?> GetLatestAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persist)
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT TOP (1)
+                    RunId, TriggerName, StatusName, StartedUtc, CompletedUtc,
+                    EventsCutoffUtc, TimelineCutoffUtc, AlertsCutoffUtc,
+                    DeletedEvents, DeletedTimelineEvents, DeletedAlerts, DurationMs, ErrorMessage
+                FROM dbo.RetentionRuns
+                ORDER BY StartedUtc DESC;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            return await reader.ReadAsync(cancellationToken) ? ReadRun(reader) : null;
+        }
+#endif
+
+        return _runs.LastOrDefault();
+    }
+
+    public async Task<RetentionEstimate> EstimateAsync(
+        RetentionOptions options,
+        CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persist)
+        {
+            var now = DateTimeOffset.UtcNow;
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT
+                    (SELECT COUNT_BIG(*) FROM dbo.FileAuditEvents WHERE TimestampUtc < @EventsCutoffUtc) AS EligibleEvents,
+                    (SELECT COUNT_BIG(*) FROM dbo.FileAuditTimelineEvents WHERE TimestampUtc < @TimelineCutoffUtc) AS EligibleTimelineEvents,
+                    (SELECT COUNT_BIG(*) FROM dbo.FileServerAlerts WHERE CreatedUtc < @AlertsCutoffUtc) AS EligibleAlerts;
+                """;
+            command.Parameters.AddWithValue("@EventsCutoffUtc", now.AddDays(-options.EventsDays).UtcDateTime);
+            command.Parameters.AddWithValue("@TimelineCutoffUtc", now.AddDays(-options.TimelineDays).UtcDateTime);
+            command.Parameters.AddWithValue("@AlertsCutoffUtc", now.AddDays(-options.AlertsDays).UtcDateTime);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                return new RetentionEstimate(
+                    Convert.ToInt64(reader["EligibleEvents"]),
+                    Convert.ToInt64(reader["EligibleTimelineEvents"]),
+                    Convert.ToInt64(reader["EligibleAlerts"]),
+                    now);
+            }
+        }
+#endif
+
+        return new RetentionEstimate(0, 0, 0, DateTimeOffset.UtcNow);
+    }
+
+#if SQLSERVER
+    private SqlConnection CreateConnection() => new(_connectionString
+        ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada."));
+
+    private static async Task EnsureSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.RetentionRuns', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.RetentionRuns
+                (
+                    RunId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionRuns PRIMARY KEY,
+                    TriggerName NVARCHAR(32) NOT NULL,
+                    StatusName NVARCHAR(32) NOT NULL,
+                    StartedUtc DATETIME2(3) NOT NULL,
+                    CompletedUtc DATETIME2(3) NULL,
+                    EventsCutoffUtc DATETIME2(3) NOT NULL,
+                    TimelineCutoffUtc DATETIME2(3) NOT NULL,
+                    AlertsCutoffUtc DATETIME2(3) NOT NULL,
+                    DeletedEvents INT NOT NULL,
+                    DeletedTimelineEvents INT NOT NULL,
+                    DeletedAlerts INT NOT NULL,
+                    DurationMs BIGINT NOT NULL,
+                    ErrorMessage NVARCHAR(2048) NULL
+                );
+
+                CREATE INDEX IX_RetentionRuns_StartedUtc ON dbo.RetentionRuns (StartedUtc DESC);
+            END;
+
+            UPDATE dbo.RetentionRuns
+            SET StatusName = N'failed',
+                CompletedUtc = COALESCE(CompletedUtc, SYSUTCDATETIME()),
+                ErrorMessage = COALESCE(ErrorMessage, N'Execucao interrompida antes da conclusao.')
+            WHERE StatusName = N'running'
+              AND StartedUtc < DATEADD(HOUR, -6, SYSUTCDATETIME());
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static void AddRunParameters(SqlCommand command, RetentionRunRecord run)
+    {
+        command.Parameters.AddWithValue("@RunId", run.RunId);
+        command.Parameters.AddWithValue("@TriggerName", run.Trigger);
+        command.Parameters.AddWithValue("@StatusName", run.Status);
+        command.Parameters.AddWithValue("@StartedUtc", run.StartedUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@EventsCutoffUtc", run.EventsCutoffUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@TimelineCutoffUtc", run.TimelineCutoffUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@AlertsCutoffUtc", run.AlertsCutoffUtc.UtcDateTime);
+    }
+
+    private static RetentionRunRecord ReadRun(SqlDataReader reader)
+    {
+        return new RetentionRunRecord(
+            reader.GetGuid(reader.GetOrdinal("RunId")),
+            reader.GetString(reader.GetOrdinal("TriggerName")),
+            reader.GetString(reader.GetOrdinal("StatusName")),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("StartedUtc"))),
+            reader.IsDBNull(reader.GetOrdinal("CompletedUtc")) ? null : ReadUtc(reader.GetDateTime(reader.GetOrdinal("CompletedUtc"))),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("EventsCutoffUtc"))),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("TimelineCutoffUtc"))),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("AlertsCutoffUtc"))),
+            reader.GetInt32(reader.GetOrdinal("DeletedEvents")),
+            reader.GetInt32(reader.GetOrdinal("DeletedTimelineEvents")),
+            reader.GetInt32(reader.GetOrdinal("DeletedAlerts")),
+            reader.GetInt64(reader.GetOrdinal("DurationMs")),
+            reader.IsDBNull(reader.GetOrdinal("ErrorMessage")) ? null : reader.GetString(reader.GetOrdinal("ErrorMessage")));
+    }
+
+    private static DateTimeOffset ReadUtc(DateTime value) =>
+        new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+#endif
+
+    private static object DbValue(object? value) => value ?? DBNull.Value;
+}
+
+internal sealed class ColdArchiveStore
+{
+    private readonly string _archiveRoot;
+#if SQLSERVER
+    private readonly string? _connectionString;
+    private readonly bool _available;
+    private readonly SemaphoreSlim _schemaGate = new(1, 1);
+    private bool _schemaEnsured;
+#endif
+
+    public ColdArchiveStore(IConfiguration configuration)
+    {
+        _archiveRoot = Path.GetFullPath(configuration.GetValue(
+            "Retention:ArchivePath",
+            "/var/lib/fileserver-monitor/archive"));
+#if SQLSERVER
+        _available = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+    }
+
+    public string ArchiveRoot => _archiveRoot;
+
+    public bool IsAvailable
+    {
+        get
+        {
+#if SQLSERVER
+            return _available;
+#else
+            return false;
+#endif
+        }
+    }
+
+    public async Task<ColdArchiveBatchResult> ArchiveAndDeleteAsync(
+        string dataset,
+        DateTimeOffset cutoffUtc,
+        int batchSize,
+        int maxRows,
+        Guid runId,
+        CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            throw new InvalidOperationException("O arquivamento frio exige o provedor SQL Server.");
+        }
+
+        Directory.CreateDirectory(_archiveRoot);
+        var definition = ResolveDataset(dataset);
+        var safeBatchSize = Math.Clamp(batchSize, 100, 100_000);
+        var safeMaxRows = Math.Max(1, maxRows);
+        var archivedRecords = 0;
+        var archivedBytes = 0L;
+        var files = 0;
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+
+        while (!cancellationToken.IsCancellationRequested && archivedRecords < safeMaxRows)
+        {
+            var requested = Math.Min(safeBatchSize, safeMaxRows - archivedRecords);
+            var batch = await ReadBatchAsync(connection, definition, cutoffUtc, requested, cancellationToken);
+            if (batch.Records.Count == 0)
+            {
+                break;
+            }
+
+            var archiveFile = await ColdArchiveFileWriter.WriteAsync(
+                _archiveRoot,
+                definition.Name,
+                runId,
+                files + 1,
+                batch.Records,
+                cancellationToken);
+            var committed = false;
+            var commitAttempted = false;
+
+            try
+            {
+                await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
+                var deleted = await DeleteBatchAsync(
+                    connection,
+                    transaction,
+                    definition,
+                    batch.Ids,
+                    cancellationToken);
+
+                if (deleted != batch.Ids.Count)
+                {
+                    throw new InvalidOperationException(
+                        $"O lote {archiveFile.ArchiveId} arquivou {batch.Ids.Count} registro(s), mas somente {deleted} permaneciam disponiveis para remocao.");
+                }
+
+                await InsertManifestAsync(
+                    connection,
+                    transaction,
+                    runId,
+                    cutoffUtc,
+                    archiveFile,
+                    cancellationToken);
+                commitAttempted = true;
+                await transaction.CommitAsync(CancellationToken.None);
+                committed = true;
+
+                archivedRecords += deleted;
+                archivedBytes += archiveFile.FileSizeBytes;
+                files++;
+            }
+            finally
+            {
+                if (!committed && !commitAttempted)
+                {
+                    DeleteArchiveFile(archiveFile.RelativePath);
+                }
+            }
+
+            if (batch.Records.Count < requested)
+            {
+                break;
+            }
+        }
+
+        return new ColdArchiveBatchResult(archivedRecords, archivedBytes, files);
+#else
+        await Task.CompletedTask;
+        throw new InvalidOperationException("O arquivamento frio nao esta disponivel neste build.");
+#endif
+    }
+
+    public async Task<ColdArchiveSummary> GetSummaryAsync(int take, CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            return ColdArchiveSummary.Empty(IsAvailable, _archiveRoot);
+        }
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                COUNT_BIG(1) AS ArchiveFiles,
+                COALESCE(SUM(CONVERT(BIGINT, RecordCount)), 0) AS ArchivedRecords,
+                COALESCE(SUM(FileSizeBytes), 0) AS ArchivedBytes,
+                MAX(CreatedUtc) AS LastArchiveUtc
+            FROM dbo.RetentionArchives;
+
+            SELECT TOP (@Take)
+                ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc
+            FROM dbo.RetentionArchives
+            WHERE @Take > 0
+            ORDER BY CreatedUtc DESC;
+            """;
+        command.Parameters.AddWithValue("@Take", Math.Clamp(take, 0, 200));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+        var archiveFiles = Convert.ToInt64(reader["ArchiveFiles"]);
+        var archivedRecords = Convert.ToInt64(reader["ArchivedRecords"]);
+        var archivedBytes = Convert.ToInt64(reader["ArchivedBytes"]);
+        var lastArchiveUtc = reader["LastArchiveUtc"] == DBNull.Value
+            ? (DateTimeOffset?)null
+            : ReadUtc((DateTime)reader["LastArchiveUtc"]);
+
+        await reader.NextResultAsync(cancellationToken);
+        var recent = new List<ColdArchiveManifest>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            recent.Add(ReadManifest(reader));
+        }
+
+        return new ColdArchiveSummary(
+            IsAvailable,
+            _archiveRoot,
+            archiveFiles,
+            archivedRecords,
+            archivedBytes,
+            lastArchiveUtc,
+            recent);
+#else
+        await Task.CompletedTask;
+        return ColdArchiveSummary.Empty(IsAvailable, _archiveRoot);
+#endif
+    }
+
+    public async Task<ColdArchiveManifest?> FindAsync(Guid archiveId, CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (!_available)
+        {
+            return null;
+        }
+
+        await using var connection = CreateConnection();
+        await connection.OpenAsync(cancellationToken);
+        await EnsureSchemaAsync(connection, cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (1)
+                ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc
+            FROM dbo.RetentionArchives
+            WHERE ArchiveId = @ArchiveId;
+            """;
+        command.Parameters.AddWithValue("@ArchiveId", archiveId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadManifest(reader) : null;
+#else
+        await Task.CompletedTask;
+        return null;
+#endif
+    }
+
+    public string ResolveFullPath(string relativePath)
+    {
+        var normalizedRelativePath = relativePath.Replace('/', Path.DirectorySeparatorChar);
+        var fullPath = Path.GetFullPath(Path.Combine(_archiveRoot, normalizedRelativePath));
+        var rootPrefix = _archiveRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(rootPrefix, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("O manifesto aponta para fora do volume de arquivamento.");
+        }
+
+        return fullPath;
+    }
+
+#if SQLSERVER
+    private SqlConnection CreateConnection() => new(_connectionString
+        ?? throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada."));
+
+    private async Task EnsureSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        if (_schemaEnsured)
+        {
+            return;
+        }
+
+        await _schemaGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_schemaEnsured)
+            {
+                return;
+            }
+
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                IF OBJECT_ID(N'dbo.RetentionArchives', N'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.RetentionArchives
+                    (
+                        ArchiveId UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_RetentionArchives PRIMARY KEY,
+                        RunId UNIQUEIDENTIFIER NOT NULL,
+                        DatasetName NVARCHAR(32) NOT NULL,
+                        RelativePath NVARCHAR(1024) NOT NULL,
+                        CutoffUtc DATETIME2(3) NOT NULL,
+                        RecordCount INT NOT NULL,
+                        FileSizeBytes BIGINT NOT NULL,
+                        Sha256 CHAR(64) NOT NULL,
+                        CreatedUtc DATETIME2(3) NOT NULL
+                    );
+
+                    CREATE INDEX IX_RetentionArchives_RunId ON dbo.RetentionArchives (RunId, DatasetName);
+                    CREATE INDEX IX_RetentionArchives_CreatedUtc ON dbo.RetentionArchives (CreatedUtc DESC);
+                END;
+                """;
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            _schemaEnsured = true;
+        }
+        finally
+        {
+            _schemaGate.Release();
+        }
+    }
+
+    private static async Task<ColdArchiveReadBatch> ReadBatchAsync(
+        SqlConnection connection,
+        ColdArchiveDataset definition,
+        DateTimeOffset cutoffUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT TOP (@BatchSize) *
+            FROM {definition.TableName} WITH (READPAST)
+            WHERE {definition.TimestampColumn} < @CutoffUtc
+            ORDER BY {definition.TimestampColumn}, Id;
+            """;
+        command.Parameters.AddWithValue("@BatchSize", batchSize);
+        command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var records = new List<IReadOnlyDictionary<string, object?>>(batchSize);
+        var ids = new List<Guid>(batchSize);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var record = new Dictionary<string, object?>(reader.FieldCount, StringComparer.Ordinal);
+            for (var index = 0; index < reader.FieldCount; index++)
+            {
+                var value = reader.IsDBNull(index) ? null : reader.GetValue(index);
+                record[reader.GetName(index)] = value is DateTime dateTime
+                    ? DateTime.SpecifyKind(dateTime, DateTimeKind.Utc)
+                    : value;
+            }
+
+            if (record["Id"] is not Guid id)
+            {
+                throw new InvalidOperationException($"O conjunto {definition.Name} retornou um identificador invalido.");
+            }
+
+            ids.Add(id);
+            records.Add(record);
+        }
+
+        return new ColdArchiveReadBatch(records, ids);
+    }
+
+    private static async Task<int> DeleteBatchAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        ColdArchiveDataset definition,
+        IReadOnlyCollection<Guid> ids,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            DELETE FROM {definition.TableName}
+            WHERE Id IN
+            (
+                SELECT TRY_CONVERT(UNIQUEIDENTIFIER, [value])
+                FROM OPENJSON(@IdsJson)
+            );
+
+            SELECT @@ROWCOUNT;
+            """;
+        command.Parameters.Add(new SqlParameter("@IdsJson", SqlDbType.NVarChar, -1)
+        {
+            Value = JsonSerializer.Serialize(ids)
+        });
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    private static async Task InsertManifestAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        Guid runId,
+        DateTimeOffset cutoffUtc,
+        ColdArchiveFile archiveFile,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO dbo.RetentionArchives
+            (
+                ArchiveId, RunId, DatasetName, RelativePath, CutoffUtc,
+                RecordCount, FileSizeBytes, Sha256, CreatedUtc
+            )
+            VALUES
+            (
+                @ArchiveId, @RunId, @DatasetName, @RelativePath, @CutoffUtc,
+                @RecordCount, @FileSizeBytes, @Sha256, @CreatedUtc
+            );
+            """;
+        command.Parameters.AddWithValue("@ArchiveId", archiveFile.ArchiveId);
+        command.Parameters.AddWithValue("@RunId", runId);
+        command.Parameters.AddWithValue("@DatasetName", archiveFile.Dataset);
+        command.Parameters.AddWithValue("@RelativePath", archiveFile.RelativePath);
+        command.Parameters.AddWithValue("@CutoffUtc", cutoffUtc.UtcDateTime);
+        command.Parameters.AddWithValue("@RecordCount", archiveFile.RecordCount);
+        command.Parameters.AddWithValue("@FileSizeBytes", archiveFile.FileSizeBytes);
+        command.Parameters.AddWithValue("@Sha256", archiveFile.Sha256);
+        command.Parameters.AddWithValue("@CreatedUtc", archiveFile.CreatedUtc.UtcDateTime);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static ColdArchiveManifest ReadManifest(SqlDataReader reader)
+    {
+        return new ColdArchiveManifest(
+            reader.GetGuid(reader.GetOrdinal("ArchiveId")),
+            reader.GetGuid(reader.GetOrdinal("RunId")),
+            reader.GetString(reader.GetOrdinal("DatasetName")),
+            reader.GetString(reader.GetOrdinal("RelativePath")),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("CutoffUtc"))),
+            reader.GetInt32(reader.GetOrdinal("RecordCount")),
+            reader.GetInt64(reader.GetOrdinal("FileSizeBytes")),
+            reader.GetString(reader.GetOrdinal("Sha256")),
+            ReadUtc(reader.GetDateTime(reader.GetOrdinal("CreatedUtc"))));
+    }
+
+    private static ColdArchiveDataset ResolveDataset(string dataset) => dataset.Trim().ToLowerInvariant() switch
+    {
+        "events" => new ColdArchiveDataset("events", "dbo.FileAuditEvents", "TimestampUtc"),
+        "timeline" => new ColdArchiveDataset("timeline", "dbo.FileAuditTimelineEvents", "TimestampUtc"),
+        "alerts" => new ColdArchiveDataset("alerts", "dbo.FileServerAlerts", "CreatedUtc"),
+        _ => throw new ArgumentOutOfRangeException(nameof(dataset), dataset, "Conjunto de arquivamento desconhecido.")
+    };
+
+    private void DeleteArchiveFile(string relativePath)
+    {
+        var fullPath = ResolveFullPath(relativePath);
+        if (File.Exists(fullPath))
+        {
+            File.Delete(fullPath);
+        }
+    }
+
+    private static DateTimeOffset ReadUtc(DateTime value) =>
+        new(DateTime.SpecifyKind(value, DateTimeKind.Utc));
+
+    private sealed record ColdArchiveDataset(string Name, string TableName, string TimestampColumn);
+
+    private sealed record ColdArchiveReadBatch(
+        IReadOnlyCollection<IReadOnlyDictionary<string, object?>> Records,
+        IReadOnlyCollection<Guid> Ids);
+#endif
+}
+
+internal sealed class RetentionCoordinator
+{
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly ColdArchiveStore _archive;
+    private readonly RetentionSettingsStore _settings;
+    private readonly RetentionRunStore _runs;
+    private readonly ILogger<RetentionCoordinator> _logger;
+
+    public RetentionCoordinator(
+        ColdArchiveStore archive,
+        RetentionSettingsStore settings,
+        RetentionRunStore runs,
+        ILogger<RetentionCoordinator> logger)
+    {
+        _archive = archive;
+        _settings = settings;
+        _runs = runs;
+        _logger = logger;
+    }
+
+    public bool IsRunning => _gate.CurrentCount == 0;
+
+    public async Task<RetentionRunRecord?> TryRunAsync(string trigger, CancellationToken cancellationToken)
+    {
+        if (!await _gate.WaitAsync(0, cancellationToken))
+        {
+            return null;
+        }
+
+        RetentionRunRecord? run = null;
+        var events = new ColdArchiveBatchResult(0, 0, 0);
+        var timeline = new ColdArchiveBatchResult(0, 0, 0);
+        var alerts = new ColdArchiveBatchResult(0, 0, 0);
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            var options = await _settings.GetAsync(cancellationToken);
+            run = await _runs.StartAsync(options, trigger, cancellationToken);
+            events = await _archive.ArchiveAndDeleteAsync(
+                "events",
+                run.EventsCutoffUtc,
+                options.PurgeBatchSize,
+                options.MaxRowsPerRun,
+                run.RunId,
+                cancellationToken);
+            timeline = await _archive.ArchiveAndDeleteAsync(
+                "timeline",
+                run.TimelineCutoffUtc,
+                options.PurgeBatchSize,
+                options.MaxRowsPerRun,
+                run.RunId,
+                cancellationToken);
+            alerts = await _archive.ArchiveAndDeleteAsync(
+                "alerts",
+                run.AlertsCutoffUtc,
+                options.PurgeBatchSize,
+                options.MaxRowsPerRun,
+                run.RunId,
+                cancellationToken);
+            stopwatch.Stop();
+
+            var completed = await _runs.CompleteAsync(
+                run,
+                "completed",
+                events.ArchivedRecords,
+                timeline.ArchivedRecords,
+                alerts.ArchivedRecords,
+                stopwatch.ElapsedMilliseconds,
+                null,
+                CancellationToken.None);
+            _logger.LogInformation(
+                "Retencao {RunId} concluida em {DurationMs} ms. Arquivados e removidos: brutos {Events}, timeline {Timeline}, alertas {Alerts}; {ArchiveFiles} arquivo(s), {ArchiveBytes} byte(s).",
+                completed.RunId,
+                completed.DurationMs,
+                completed.DeletedEvents,
+                completed.DeletedTimelineEvents,
+                completed.DeletedAlerts,
+                events.Files + timeline.Files + alerts.Files,
+                events.ArchivedBytes + timeline.ArchivedBytes + alerts.ArchivedBytes);
+            return completed;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (run is not null)
+            {
+                await _runs.CompleteAsync(
+                    run,
+                    "cancelled",
+                    events.ArchivedRecords,
+                    timeline.ArchivedRecords,
+                    alerts.ArchivedRecords,
+                    stopwatch.ElapsedMilliseconds,
+                    "Execucao cancelada.",
+                    CancellationToken.None);
+            }
+            throw;
+        }
+        catch (Exception ex)
+        {
+            stopwatch.Stop();
+            _logger.LogError(ex, "Falha ao executar retencao {RunId}.", run?.RunId);
+            if (run is null)
+            {
+                throw;
+            }
+            return await _runs.CompleteAsync(
+                run,
+                "failed",
+                events.ArchivedRecords,
+                timeline.ArchivedRecords,
+                alerts.ArchivedRecords,
+                stopwatch.ElapsedMilliseconds,
+                ex.Message,
+                CancellationToken.None);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+}
+
 internal sealed class RetentionWorker : BackgroundService
 {
-    private readonly IEventRepository _events;
-    private readonly ITimelineRepository _timeline;
-    private readonly AlertStore _alerts;
     private readonly RetentionSettingsStore _settings;
+    private readonly RetentionCoordinator _coordinator;
     private readonly ILogger<RetentionWorker> _logger;
 
     public RetentionWorker(
-        IEventRepository events,
-        ITimelineRepository timeline,
-        AlertStore alerts,
         RetentionSettingsStore settings,
+        RetentionCoordinator coordinator,
         ILogger<RetentionWorker> logger)
     {
-        _events = events;
-        _timeline = timeline;
-        _alerts = alerts;
         _settings = settings;
+        _coordinator = coordinator;
         _logger = logger;
     }
 
@@ -10066,7 +11226,18 @@ internal sealed class RetentionWorker : BackgroundService
 
             if (options.Enabled)
             {
-                await RunOnceAsync(options, stoppingToken);
+                try
+                {
+                    await _coordinator.TryRunAsync("automatic", stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Falha ao iniciar a retencao automatica.");
+                }
             }
             else
             {
@@ -10080,36 +11251,6 @@ internal sealed class RetentionWorker : BackgroundService
         }
     }
 
-    private async Task RunOnceAsync(RetentionOptions options, CancellationToken cancellationToken)
-    {
-        var eventCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.EventsDays));
-        var timelineCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.TimelineDays));
-        var alertCutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(1, options.AlertsDays));
-        var batchSize = Math.Clamp(options.PurgeBatchSize, 100, 100_000);
-
-        try
-        {
-            var deletedEvents = await _events.PurgeOlderThanAsync(eventCutoff, batchSize, cancellationToken);
-            var deletedTimelineEvents = await _timeline.PurgeOlderThanAsync(timelineCutoff, batchSize, cancellationToken);
-            var deletedAlerts = await _alerts.PurgeOlderThanAsync(alertCutoff, batchSize, cancellationToken);
-
-            if (deletedEvents > 0 || deletedTimelineEvents > 0 || deletedAlerts > 0)
-            {
-                _logger.LogInformation(
-                    "Retencao executada. Eventos brutos removidos: {DeletedEvents}. Timeline removida: {DeletedTimelineEvents}. Alertas removidos: {DeletedAlerts}.",
-                    deletedEvents,
-                    deletedTimelineEvents,
-                    deletedAlerts);
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Falha ao executar retencao automatica.");
-        }
-    }
 }
 
 internal sealed record MonitorOptions
@@ -10898,14 +12039,21 @@ internal static class AuthSessionToken
     }
 }
 
-internal sealed record AuthOptions(bool Enabled, string? ApiKey, string? AdminApiKey)
+internal sealed record AuthOptions(
+    bool Enabled,
+    string? ApiKey,
+    string? AdminApiKey,
+    string? AgentApiKey,
+    string? SessionSigningKey)
 {
     public static AuthOptions FromConfiguration(IConfiguration configuration)
     {
         return new AuthOptions(
             Enabled: configuration.GetValue("Auth:Enabled", false),
             ApiKey: configuration.GetValue<string>("Auth:ApiKey"),
-            AdminApiKey: configuration.GetValue<string>("Auth:AdminApiKey"));
+            AdminApiKey: configuration.GetValue<string>("Auth:AdminApiKey"),
+            AgentApiKey: configuration.GetValue<string>("Auth:AgentApiKey"),
+            SessionSigningKey: configuration.GetValue<string>("Auth:SessionSigningKey"));
     }
 
     public bool MatchesAnyKey(string? providedKey)
@@ -10919,11 +12067,21 @@ internal sealed record AuthOptions(bool Enabled, string? ApiKey, string? AdminAp
         return Matches(GetEffectiveAdminApiKey(), providedKey);
     }
 
+    public bool MatchesAgentKey(string? providedKey)
+    {
+        return Matches(GetEffectiveAgentApiKey(), providedKey);
+    }
+
+    public string? GetEffectiveAgentApiKey() =>
+        string.IsNullOrWhiteSpace(AgentApiKey) ? ApiKey : AgentApiKey;
+
     public string GetSigningSecret()
     {
-        return GetEffectiveAdminApiKey()
+        return !string.IsNullOrWhiteSpace(SessionSigningKey)
+            ? SessionSigningKey
+            : GetEffectiveAdminApiKey()
             ?? ApiKey
-            ?? "fileserver-monitor-local-session-development-secret";
+            ?? throw new InvalidOperationException("Auth:SessionSigningKey deve ser configurada quando a autenticacao estiver habilitada.");
     }
 
     public string? GetEffectiveAdminApiKey()
@@ -10933,13 +12091,36 @@ internal sealed record AuthOptions(bool Enabled, string? ApiKey, string? AdminAp
 
     private static bool Matches(string? expectedKey, string? providedKey)
     {
-        return !string.IsNullOrWhiteSpace(expectedKey)
-            && expectedKey.Equals(providedKey, StringComparison.Ordinal);
+        if (string.IsNullOrWhiteSpace(expectedKey) || string.IsNullOrWhiteSpace(providedKey))
+        {
+            return false;
+        }
+
+        return CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(expectedKey),
+            Encoding.UTF8.GetBytes(providedKey));
     }
 }
 
 internal static class AuthHelpers
 {
+    public static bool IsAgentEndpoint(HttpRequest request)
+    {
+        if (request.Path.StartsWithSegments("/api/events") && HttpMethods.IsPost(request.Method))
+        {
+            return !request.Path.StartsWithSegments("/api/events/timeline/rebuild");
+        }
+
+        if (request.Path.StartsWithSegments("/api/agents/heartbeat")
+            || request.Path.StartsWithSegments("/api/agents/config"))
+        {
+            return true;
+        }
+
+        return request.Path.StartsWithSegments("/api/inventory/snapshots")
+            && HttpMethods.IsPost(request.Method);
+    }
+
     public static bool IsAnonymousPath(PathString path)
     {
         return path == "/"
@@ -10961,7 +12142,7 @@ internal static class AuthHelpers
             return AuthRole.Admin;
         }
 
-        if (request.Path.StartsWithSegments("/api/retention/config"))
+        if (request.Path.StartsWithSegments("/api/retention"))
         {
             return AuthRole.Admin;
         }
@@ -11033,6 +12214,13 @@ internal static class AuthHelpers
         return null;
     }
 
+    public static string? GetAgentId(HttpRequest request)
+    {
+        return request.Headers.TryGetValue("X-Agent-Id", out var agentId)
+            ? agentId.FirstOrDefault()?.Trim()
+            : null;
+    }
+
     public static string? GetBearerToken(HttpRequest request)
     {
         var authorization = request.Headers.Authorization.FirstOrDefault();
@@ -11068,6 +12256,7 @@ internal sealed record RetentionOptions(
     int AlertsDays,
     int IntervalHours,
     int PurgeBatchSize,
+    int MaxRowsPerRun,
     DateTimeOffset UpdatedUtc);
 
 internal sealed record RetentionSettingsRequest(
@@ -11076,7 +12265,8 @@ internal sealed record RetentionSettingsRequest(
     int? TimelineDays,
     int? AlertsDays,
     int? IntervalHours,
-    int? PurgeBatchSize);
+    int? PurgeBatchSize,
+    int? MaxRowsPerRun);
 
 internal sealed record RetentionSettingsResponse(
     bool Enabled,
@@ -11085,6 +12275,7 @@ internal sealed record RetentionSettingsResponse(
     int AlertsDays,
     int IntervalHours,
     int PurgeBatchSize,
+    int MaxRowsPerRun,
     DateTimeOffset UpdatedUtc)
 {
     public static RetentionSettingsResponse FromSettings(RetentionOptions settings)
@@ -11096,9 +12287,67 @@ internal sealed record RetentionSettingsResponse(
             settings.AlertsDays,
             settings.IntervalHours,
             settings.PurgeBatchSize,
+            settings.MaxRowsPerRun,
             settings.UpdatedUtc);
     }
 }
+
+internal sealed record RetentionRunRecord(
+    Guid RunId,
+    string Trigger,
+    string Status,
+    DateTimeOffset StartedUtc,
+    DateTimeOffset? CompletedUtc,
+    DateTimeOffset EventsCutoffUtc,
+    DateTimeOffset TimelineCutoffUtc,
+    DateTimeOffset AlertsCutoffUtc,
+    int DeletedEvents,
+    int DeletedTimelineEvents,
+    int DeletedAlerts,
+    long DurationMs,
+    string? Error);
+
+internal sealed record RetentionEstimate(
+    long EligibleEvents,
+    long EligibleTimelineEvents,
+    long EligibleAlerts,
+    DateTimeOffset GeneratedUtc);
+
+internal sealed record ColdArchiveBatchResult(
+    int ArchivedRecords,
+    long ArchivedBytes,
+    int Files);
+
+internal sealed record ColdArchiveManifest(
+    Guid ArchiveId,
+    Guid RunId,
+    string Dataset,
+    string RelativePath,
+    DateTimeOffset CutoffUtc,
+    int RecordCount,
+    long FileSizeBytes,
+    string Sha256,
+    DateTimeOffset CreatedUtc);
+
+internal sealed record ColdArchiveSummary(
+    bool Available,
+    string ArchiveRoot,
+    long ArchiveFiles,
+    long ArchivedRecords,
+    long ArchivedBytes,
+    DateTimeOffset? LastArchiveUtc,
+    IReadOnlyCollection<ColdArchiveManifest> RecentArchives)
+{
+    public static ColdArchiveSummary Empty(bool available, string archiveRoot) =>
+        new(available, archiveRoot, 0, 0, 0, null, Array.Empty<ColdArchiveManifest>());
+}
+
+internal sealed record RetentionStatusResponse(
+    bool Running,
+    RetentionSettingsResponse Settings,
+    RetentionRunRecord? LatestRun,
+    RetentionEstimate Estimate,
+    ColdArchiveSummary Archive);
 
 internal sealed record InventoryScanOptions(
     bool Enabled,
@@ -11177,7 +12426,14 @@ internal sealed record FileAuditEvent(
     string? Extension,
     string Result,
     string Severity,
-    string Source);
+    string Source,
+    string? AgentId = null,
+    string? SourceEventId = null,
+    string? CursorType = null,
+    long? RecordId = null,
+    long? Usn = null,
+    string? Volume = null,
+    string? FileReferenceId = null);
 
 internal sealed record FileAuditDisplayEvent(
     Guid Id,
@@ -11318,11 +12574,28 @@ internal sealed record FileAuditEventRequest(
     string? Extension,
     string? Result,
     string? Severity,
-    string? Source)
+    string? Source,
+    string? AgentId = null,
+    string? CursorType = null,
+    long? RecordId = null,
+    long? Usn = null,
+    string? Volume = null,
+    string? FileReferenceId = null)
 {
-    public FileAuditEvent ToAuditEvent()
+    public FileAuditEvent ToAuditEvent(string? authenticatedAgentId = null)
     {
         FileServerMonitor.Core.FileAuditEvent normalized;
+
+        if (!string.IsNullOrWhiteSpace(authenticatedAgentId)
+            && !string.IsNullOrWhiteSpace(AgentId)
+            && !authenticatedAgentId.Equals(AgentId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new BadHttpRequestException("AgentId do evento nao corresponde a identidade autenticada.");
+        }
+
+        var effectiveAgentId = string.IsNullOrWhiteSpace(authenticatedAgentId)
+            ? AgentId
+            : authenticatedAgentId;
 
         try
         {
@@ -11344,7 +12617,13 @@ internal sealed record FileAuditEventRequest(
                     Extension,
                     Result,
                     Severity,
-                    Source));
+                    Source,
+                    effectiveAgentId,
+                    CursorType,
+                    RecordId,
+                    Usn,
+                    Volume,
+                    FileReferenceId));
         }
         catch (ArgumentException ex)
         {
@@ -11369,7 +12648,14 @@ internal sealed record FileAuditEventRequest(
             Extension: normalized.Extension,
             Result: normalized.Result,
             Severity: normalized.Severity,
-            Source: normalized.Source);
+            Source: normalized.Source,
+            AgentId: normalized.AgentId,
+            SourceEventId: normalized.SourceEventId,
+            CursorType: normalized.CursorType,
+            RecordId: normalized.RecordId,
+            Usn: normalized.Usn,
+            Volume: normalized.Volume,
+            FileReferenceId: normalized.FileReferenceId);
     }
 }
 
@@ -11957,23 +13243,55 @@ internal sealed record AgentMetricsItem(
 
 internal sealed record RetentionMetrics(
     bool Enabled,
+    bool Running,
     int EventsDays,
     int TimelineDays,
     int AlertsDays,
     int IntervalHours,
     int PurgeBatchSize,
-    DateTimeOffset UpdatedUtc)
+    int MaxRowsPerRun,
+    DateTimeOffset UpdatedUtc,
+    DateTimeOffset? LastRunUtc,
+    string? LastRunStatus,
+    int LastDeletedEvents,
+    int LastDeletedTimelineEvents,
+    int LastDeletedAlerts,
+    long? LastDurationMs,
+    string? LastError,
+    bool ArchiveAvailable,
+    long ArchiveFiles,
+    long ArchivedRecords,
+    long ArchivedBytes,
+    DateTimeOffset? LastArchiveUtc)
 {
-    public static RetentionMetrics FromSettings(RetentionOptions settings)
+    public static RetentionMetrics FromSettings(
+        RetentionOptions settings,
+        RetentionRunRecord? latest,
+        bool running,
+        ColdArchiveSummary archive)
     {
         return new RetentionMetrics(
             settings.Enabled,
+            running,
             settings.EventsDays,
             settings.TimelineDays,
             settings.AlertsDays,
             settings.IntervalHours,
             settings.PurgeBatchSize,
-            settings.UpdatedUtc);
+            settings.MaxRowsPerRun,
+            settings.UpdatedUtc,
+            latest?.StartedUtc,
+            latest?.Status,
+            latest?.DeletedEvents ?? 0,
+            latest?.DeletedTimelineEvents ?? 0,
+            latest?.DeletedAlerts ?? 0,
+            latest?.DurationMs,
+            latest?.Error,
+            archive.Available,
+            archive.ArchiveFiles,
+            archive.ArchivedRecords,
+            archive.ArchivedBytes,
+            archive.LastArchiveUtc);
     }
 }
 
@@ -11987,10 +13305,11 @@ internal sealed record MetricsThresholds(
     int TimelineQueueCriticalAgeSeconds,
     int TimelineQueueCriticalAttempts);
 
-internal sealed record EventIngestResponse(FileAuditEvent Event, IReadOnlyCollection<FileServerAlert> Alerts);
+internal sealed record EventIngestResponse(bool Accepted, FileAuditEvent Event, IReadOnlyCollection<FileServerAlert> Alerts);
 
 internal sealed record BatchIngestResponse(
     int AcceptedEvents,
+    int DuplicateEvents,
     Guid[] EventIds,
     IReadOnlyCollection<FileServerAlert> Alerts);
 

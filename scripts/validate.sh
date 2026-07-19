@@ -31,6 +31,11 @@ printf 'OK compose de producao\n'
 section "Core Tests"
 ./scripts/run-tests.sh
 
+section "Web Build"
+npm --prefix src/FileServerMonitor.Web ci
+npm --prefix src/FileServerMonitor.Web run build
+printf 'OK frontend\n'
+
 section "Agent Build"
 dotnet build src/FileServerMonitor.Agent/FileServerMonitor.Agent.csproj --no-restore
 

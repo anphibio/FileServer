@@ -54,6 +54,8 @@ internal sealed class FileServerAgent
         {
             _httpClient.DefaultRequestHeaders.Add("X-Api-Key", options.ApiKey);
         }
+
+        _httpClient.DefaultRequestHeaders.Add("X-Agent-Id", options.AgentId);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken, bool handleConsoleCancel)
@@ -159,15 +161,17 @@ internal sealed class FileServerAgent
                 return;
             }
 
-            var events = eventsToSend.Select(item => item.ToApiRequest()).ToArray();
-            var sent = await TrySendBatchAsync(events, cancellationToken);
+            var events = eventsToSend.Select(item => item.ToApiRequest(_options.AgentId)).ToArray();
+            var sentCount = await TrySendBatchAsync(events, cancellationToken);
 
-            if (!sent)
+            if (sentCount < events.Length)
             {
-                await AppendQueueAsync(eventsToSend, cancellationToken);
+                var unsentEvents = eventsToSend.Skip(sentCount).ToArray();
+                await AppendQueueAsync(unsentEvents, cancellationToken);
                 AdvanceState(collected.Concat(result.CursorAdvances).ToArray());
                 _state.Save(_options.StateFile);
-                queuedEvents = eventsToSend.Length;
+                sentEvents = sentCount;
+                queuedEvents = unsentEvents.Length;
                 return;
             }
 
@@ -716,10 +720,14 @@ internal sealed class FileServerAgent
         }
 
         var sentEvents = 0;
+        var drainPlan = FileServerMonitor.Core.DurableLineQueue.CreateDrainPlan(
+            _options.ApiBatchSize,
+            _options.QueueFlushBatchesPerCycle,
+            _options.QueueFlushMaxEventsPerCycle);
         var result = await FileServerMonitor.Core.DurableLineQueue.FlushAsync(
             _options.QueueFile,
-            _options.BatchSize,
-            _options.QueueFlushMaxEventsPerCycle,
+            drainPlan.BatchSize,
+            drainPlan.MaxLines,
             async (lines, token) =>
             {
                 var queued = lines
@@ -734,7 +742,8 @@ internal sealed class FileServerAgent
                     return false;
                 }
 
-                if (!await TrySendBatchAsync(queued.Select(item => item.ToApiRequest()).ToArray(), token))
+                var requests = queued.Select(item => item.ToApiRequest(_options.AgentId)).ToArray();
+                if (await TrySendBatchAsync(requests, token) != requests.Length)
                 {
                     return false;
                 }
@@ -757,13 +766,14 @@ internal sealed class FileServerAgent
         Console.WriteLine($"Fila local: enviados={sentEvents}; pendente={(result.Completed ? 0 : "sim")}.");
     }
 
-    private async Task<bool> TrySendBatchAsync(FileAuditEventRequest[] events, CancellationToken cancellationToken)
+    private async Task<int> TrySendBatchAsync(FileAuditEventRequest[] events, CancellationToken cancellationToken)
     {
         if (events.Length == 0)
         {
-            return true;
+            return 0;
         }
 
+        var sentCount = 0;
         try
         {
             foreach (var chunk in events.Chunk(_options.ApiBatchSize))
@@ -772,20 +782,21 @@ internal sealed class FileServerAgent
 
                 if (response.IsSuccessStatusCode)
                 {
+                    sentCount += chunk.Length;
                     continue;
                 }
 
                 var body = await response.Content.ReadAsStringAsync(cancellationToken);
                 Console.Error.WriteLine($"API rejeitou lote: {(int)response.StatusCode} {body}");
-                return false;
+                return sentCount;
             }
 
-            return true;
+            return sentCount;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
             Console.Error.WriteLine($"API indisponivel: {ex.Message}");
-            return false;
+            return sentCount;
         }
     }
 
@@ -1282,7 +1293,7 @@ internal sealed record AgentOptions(
                 : 120,
             ApiBatchSize = options.ApiBatchSize is >= 10 and <= 1_000
                 ? options.ApiBatchSize
-                : 500,
+                : 1_000,
             BatchSize = options.BatchSize is > 0 and <= 1000 ? options.BatchSize : 200,
             QueueFlushBatchesPerCycle = options.QueueFlushBatchesPerCycle is > 0 and <= 100 ? options.QueueFlushBatchesPerCycle : 10,
             QueueFlushMaxEventsPerCycle = options.QueueFlushMaxEventsPerCycle is >= 100 and <= 100_000
@@ -1473,7 +1484,7 @@ internal sealed record CollectedFileEvent(
         ? $"usn:{Volume}:{Usn}"
         : $"security:{RecordId}";
 
-    public FileAuditEventRequest ToApiRequest()
+    public FileAuditEventRequest ToApiRequest(string agentId)
     {
         return new FileAuditEventRequest(
             TimestampUtc,
@@ -1492,7 +1503,13 @@ internal sealed record CollectedFileEvent(
             Extension,
             Result,
             Severity,
-            Source);
+            Source,
+            agentId,
+            CursorType,
+            RecordId,
+            Usn,
+            Volume,
+            FileReferenceId);
     }
 }
 
@@ -1513,7 +1530,13 @@ internal sealed record FileAuditEventRequest(
     string? Extension,
     string Result,
     string Severity,
-    string Source);
+    string Source,
+    string AgentId,
+    string CursorType,
+    long? RecordId,
+    long? Usn,
+    string? Volume,
+    string? FileReferenceId);
 
 internal sealed record InventorySnapshotStartRequest(
     string Server,
