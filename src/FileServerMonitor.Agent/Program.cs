@@ -1,9 +1,14 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json.Serialization;
+using FileServerMonitor.Core;
 
 var configPath = args.FirstOrDefault(arg => arg.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
     ?? "appsettings.agent.json";
@@ -23,6 +28,9 @@ else
 
 internal sealed class FileServerAgent
 {
+    private static readonly ConcurrentDictionary<string, string> IdentityCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -32,6 +40,10 @@ internal sealed class FileServerAgent
     private readonly AgentOptions _options;
     private readonly AgentState _state;
     private readonly HttpClient _httpClient;
+    private readonly HttpClient _heartbeatHttpClient;
+    private readonly SemaphoreSlim _queueGate = new(1, 1);
+    private readonly SemaphoreSlim _stateGate = new(1, 1);
+    private readonly SemaphoreSlim _deliverySignal = new(0, 1);
     private AgentConfigResponse? _remoteConfig;
     private DateTimeOffset? _lastRemoteConfigFetchUtc;
     private FileServerMonitor.Core.AgentCycleMetrics? _lastCycle;
@@ -39,6 +51,9 @@ internal sealed class FileServerAgent
     private DateTimeOffset? _lastInventoryScanRequestUtc;
     private Task? _inventoryScanTask;
     private int _sentFromQueueSinceLastCollection;
+    private int _pendingQueueEvents;
+    private string? _collectionError;
+    private string? _deliveryError;
 
     public FileServerAgent(AgentOptions options, AgentState state)
     {
@@ -49,19 +64,27 @@ internal sealed class FileServerAgent
             BaseAddress = new Uri(options.ApiBaseUrl),
             Timeout = TimeSpan.FromSeconds(options.ApiRequestTimeoutSeconds)
         };
+        _heartbeatHttpClient = new HttpClient
+        {
+            BaseAddress = new Uri(options.ApiBaseUrl),
+            Timeout = TimeSpan.FromSeconds(options.HeartbeatRequestTimeoutSeconds)
+        };
 
         if (!string.IsNullOrWhiteSpace(options.ApiKey))
         {
             _httpClient.DefaultRequestHeaders.Add("X-Api-Key", options.ApiKey);
+            _heartbeatHttpClient.DefaultRequestHeaders.Add("X-Api-Key", options.ApiKey);
         }
 
         _httpClient.DefaultRequestHeaders.Add("X-Agent-Id", options.AgentId);
+        _heartbeatHttpClient.DefaultRequestHeaders.Add("X-Agent-Id", options.AgentId);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken, bool handleConsoleCancel)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_options.StateFile) ?? ".");
         Directory.CreateDirectory(Path.GetDirectoryName(_options.QueueFile) ?? ".");
+        _pendingQueueEvents = FileServerMonitor.Core.CheckpointedLineQueue.CountPendingLines(_options.QueueFile);
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         ConsoleCancelEventHandler? cancelHandler = null;
@@ -78,6 +101,11 @@ internal sealed class FileServerAgent
         }
 
         Console.WriteLine($"FileServerMonitor.Agent iniciado. AgentId={_options.AgentId}; Server={_options.Server}; Api={_options.ApiBaseUrl}");
+        Console.WriteLine($"Fila local: {_pendingQueueEvents} evento(s) pendente(s) na inicializacao.");
+
+        var heartbeatTask = RunHeartbeatLoopAsync(cts.Token);
+        var deliveryTask = RunDeliveryLoopAsync(cts.Token);
+        SignalDelivery();
 
         try
         {
@@ -87,10 +115,9 @@ internal sealed class FileServerAgent
                 try
                 {
                     await RefreshRemoteConfigAsync(cts.Token);
-                    await FlushQueueAsync(cts.Token);
-                    await CollectAndSendAsync(cts.Token);
+                    await CollectAndQueueAsync(cts.Token);
                     TryStartInventoryScan(cts.Token);
-                    await SendHeartbeatAsync("running", null, cts.Token);
+                    _collectionError = null;
                 }
                 catch (OperationCanceledException) when (cts.IsCancellationRequested)
                 {
@@ -103,25 +130,31 @@ internal sealed class FileServerAgent
                     {
                         _lastCycle = BuildErrorCycle(cycleStartedUtc, ex);
                     }
-
-                    await SendHeartbeatAsync("degraded", ex.Message, CancellationToken.None);
+                    _collectionError = ex.Message;
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(_options.PollIntervalSeconds), cts.Token);
+                var elapsed = DateTimeOffset.UtcNow - cycleStartedUtc;
+                var delay = FileServerMonitor.Core.AgentPollingSchedule.CalculateDelay(
+                    TimeSpan.FromSeconds(_options.PollIntervalSeconds),
+                    elapsed);
+                await Task.Delay(delay, cts.Token);
             }
         }
         finally
         {
+            cts.Cancel();
             if (cancelHandler is not null)
             {
                 Console.CancelKeyPress -= cancelHandler;
             }
 
+            await AwaitBackgroundTaskAsync(deliveryTask);
+            await AwaitBackgroundTaskAsync(heartbeatTask);
             await SendHeartbeatAsync("stopped", "Agente finalizado.", CancellationToken.None);
         }
     }
 
-    private async Task CollectAndSendAsync(CancellationToken cancellationToken)
+    private async Task CollectAndQueueAsync(CancellationToken cancellationToken)
     {
         var cycleStartedUtc = DateTimeOffset.UtcNow;
         var stopwatch = Stopwatch.StartNew();
@@ -140,12 +173,9 @@ internal sealed class FileServerAgent
 
             if (collected.Length == 0)
             {
-                AdvanceState(result.CursorAdvances);
-                _state.Save(_options.StateFile);
+                await SaveStateAsync(() => AdvanceState(result.CursorAdvances), cancellationToken);
                 return;
             }
-
-            _state.LastCollectedEventUtc = MaxTimestamp(collected, _state.LastCollectedEventUtc);
 
             var eventsToSend = _options.SendSecurityLogEvents
                 ? collected
@@ -155,30 +185,21 @@ internal sealed class FileServerAgent
 
             if (eventsToSend.Length == 0)
             {
-                AdvanceState(collected.Concat(result.CursorAdvances).ToArray());
-                _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
-                _state.Save(_options.StateFile);
+                await SaveStateAsync(() =>
+                {
+                    _state.LastCollectedEventUtc = MaxTimestamp(collected, _state.LastCollectedEventUtc);
+                    AdvanceState(collected.Concat(result.CursorAdvances).ToArray());
+                }, cancellationToken);
                 return;
             }
 
-            var events = eventsToSend.Select(item => item.ToApiRequest(_options.AgentId)).ToArray();
-            var sentCount = await TrySendBatchAsync(events, cancellationToken);
-
-            if (sentCount < events.Length)
+            await AppendQueueAsync(eventsToSend, cancellationToken);
+            await SaveStateAsync(() =>
             {
-                var unsentEvents = eventsToSend.Skip(sentCount).ToArray();
-                await AppendQueueAsync(unsentEvents, cancellationToken);
+                _state.LastCollectedEventUtc = MaxTimestamp(collected, _state.LastCollectedEventUtc);
                 AdvanceState(collected.Concat(result.CursorAdvances).ToArray());
-                _state.Save(_options.StateFile);
-                sentEvents = sentCount;
-                queuedEvents = unsentEvents.Length;
-                return;
-            }
-
-            sentEvents = eventsToSend.Length;
-            AdvanceState(collected.Concat(result.CursorAdvances).ToArray());
-            _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
-            _state.Save(_options.StateFile);
+            }, cancellationToken);
+            queuedEvents = eventsToSend.Length;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -320,7 +341,7 @@ internal sealed class FileServerAgent
             try
             {
                 directoryInfo = new DirectoryInfo(current);
-                directoryItem = BuildInventoryItem(root, rootPath, directoryInfo, "folder", settings.IncludeLastAccessTime, error: null);
+                directoryItem = BuildInventoryItem(root, rootPath, directoryInfo, "folder", settings, error: null);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
             {
@@ -373,7 +394,7 @@ internal sealed class FileServerAgent
                 try
                 {
                     fileInfo = new FileInfo(child);
-                    fileItem = BuildInventoryItem(root, rootPath, fileInfo, "file", settings.IncludeLastAccessTime, error: null);
+                    fileItem = BuildInventoryItem(root, rootPath, fileInfo, "file", settings, error: null);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
                 {
@@ -391,10 +412,17 @@ internal sealed class FileServerAgent
         string rootPath,
         FileSystemInfo info,
         string itemType,
-        bool includeLastAccessTime,
+        InventoryScanOptions settings,
         string? error)
     {
         var sizeBytes = info is FileInfo fileInfo ? fileInfo.Length : 0;
+        var acl = itemType == "folder" && settings.CollectDirectoryAcl && OperatingSystem.IsWindows()
+            ? ReadDirectoryAcl(
+                (DirectoryInfo)info,
+                new FileInventoryAclPolicy(
+                    settings.ExpectedBroadReadPrincipals,
+                    settings.ExpectedBroadWritePrincipals))
+            : new FileInventoryAclAssessment(false, null, false, "not_collected", null, null, null);
         return new InventoryItemRequest(
             ScannedAtUtc: DateTimeOffset.UtcNow,
             Server: string.IsNullOrWhiteSpace(root.Server) ? _options.Server : root.Server,
@@ -407,8 +435,68 @@ internal sealed class FileServerAgent
             SizeBytes: sizeBytes,
             CreatedUtc: ToUtc(info.CreationTimeUtc),
             ModifiedUtc: ToUtc(info.LastWriteTimeUtc),
-            AccessedUtc: includeLastAccessTime ? ToUtc(info.LastAccessTimeUtc) : null,
-            Error: error);
+            AccessedUtc: settings.IncludeLastAccessTime ? ToUtc(info.LastAccessTimeUtc) : null,
+            Error: error,
+            AclCollected: acl.Collected,
+            AclOwner: acl.Owner,
+            AclInheritanceProtected: acl.InheritanceProtected,
+            AclRiskLevel: acl.RiskLevel,
+            BroadAccessPrincipals: acl.BroadAccessPrincipals,
+            BroadAccessRights: acl.BroadAccessRights,
+            AclError: acl.Error);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static FileInventoryAclAssessment ReadDirectoryAcl(
+        DirectoryInfo directory,
+        FileInventoryAclPolicy policy)
+    {
+        try
+        {
+            var security = directory.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+            var owner = ResolveIdentity(security.GetOwner(typeof(SecurityIdentifier)));
+            var entries = security
+                .GetAccessRules(includeExplicit: true, includeInherited: true, targetType: typeof(SecurityIdentifier))
+                .OfType<FileSystemAccessRule>()
+                .Select(rule => new FileInventoryAclEntryInput(
+                    Principal: ResolveIdentity(rule.IdentityReference),
+                    Sid: rule.IdentityReference is SecurityIdentifier sid ? sid.Value : null,
+                    Rights: rule.FileSystemRights.ToString(),
+                    AccessType: rule.AccessControlType.ToString(),
+                    IsInherited: rule.IsInherited))
+                .ToArray();
+
+            return FileInventoryAclClassifier.Assess(owner, security.AreAccessRulesProtected, entries, error: null, policy);
+        }
+        catch (Exception ex) when (ex is IOException
+            or UnauthorizedAccessException
+            or System.Security.SecurityException
+            or IdentityNotMappedException
+            or PlatformNotSupportedException)
+        {
+            return FileInventoryAclClassifier.Assess(null, false, Array.Empty<FileInventoryAclEntryInput>(), ex.Message);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static string? ResolveIdentity(IdentityReference? identity)
+    {
+        if (identity is null)
+        {
+            return null;
+        }
+
+        return IdentityCache.GetOrAdd(identity.Value, _ =>
+        {
+            try
+            {
+                return identity.Translate(typeof(NTAccount)).Value;
+            }
+            catch (IdentityNotMappedException)
+            {
+                return identity.Value;
+            }
+        });
     }
 
     private InventoryItemRequest BuildInventoryError(
@@ -431,7 +519,14 @@ internal sealed class FileServerAgent
             CreatedUtc: null,
             ModifiedUtc: null,
             AccessedUtc: null,
-            Error: error);
+            Error: error,
+            AclCollected: false,
+            AclOwner: null,
+            AclInheritanceProtected: false,
+            AclRiskLevel: "error",
+            BroadAccessPrincipals: null,
+            BroadAccessRights: null,
+            AclError: itemType == "folder" ? error : null);
     }
 
     private async Task<InventorySnapshotStartResponse> StartInventorySnapshotAsync(
@@ -712,58 +807,125 @@ internal sealed class FileServerAgent
         return normalizedVolume;
     }
 
-    private async Task FlushQueueAsync(CancellationToken cancellationToken)
+    private async Task RunHeartbeatLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var error = string.Join(" | ", new[] { _collectionError, _deliveryError }
+                .Where(item => !string.IsNullOrWhiteSpace(item)));
+            await SendHeartbeatAsync(
+                string.IsNullOrWhiteSpace(error) ? "running" : "degraded",
+                string.IsNullOrWhiteSpace(error) ? null : error,
+                cancellationToken);
+
+            await Task.Delay(TimeSpan.FromSeconds(_options.HeartbeatIntervalSeconds), cancellationToken);
+        }
+    }
+
+    private async Task RunDeliveryLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (Volatile.Read(ref _pendingQueueEvents) <= 0)
+                {
+                    _deliveryError = null;
+                    await WaitForDeliveryAsync(_options.QueueRetrySeconds, cancellationToken);
+                    continue;
+                }
+
+                var result = await FlushQueueAsync(cancellationToken);
+                if (result.SentLines > 0)
+                {
+                    _deliveryError = null;
+                }
+
+                if (result.SentLines > 0 && !result.Completed)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(_options.QueueDrainPauseMilliseconds), cancellationToken);
+                    continue;
+                }
+
+                if (!result.Completed)
+                {
+                    await WaitForDeliveryAsync(_options.QueueRetrySeconds, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _deliveryError = $"Falha ao drenar fila: {ex.Message}";
+                Console.Error.WriteLine(_deliveryError);
+                await WaitForDeliveryAsync(_options.QueueRetrySeconds, cancellationToken);
+            }
+        }
+    }
+
+    private async Task<FileServerMonitor.Core.CheckpointedLineQueueFlushResult> FlushQueueAsync(CancellationToken cancellationToken)
     {
         if (!File.Exists(_options.QueueFile))
         {
-            return;
+            Interlocked.Exchange(ref _pendingQueueEvents, 0);
+            return new FileServerMonitor.Core.CheckpointedLineQueueFlushResult(0, true, 0);
         }
 
+        await _queueGate.WaitAsync(cancellationToken);
         var sentEvents = 0;
-        var drainPlan = FileServerMonitor.Core.DurableLineQueue.CreateDrainPlan(
-            _options.ApiBatchSize,
-            _options.QueueFlushBatchesPerCycle,
-            _options.QueueFlushMaxEventsPerCycle);
-        var result = await FileServerMonitor.Core.DurableLineQueue.FlushAsync(
-            _options.QueueFile,
-            drainPlan.BatchSize,
-            drainPlan.MaxLines,
-            async (lines, token) =>
-            {
-                var queued = lines
-                    .Select(line => JsonSerializer.Deserialize<CollectedFileEvent>(line, JsonOptions))
-                    .Where(item => item is not null)
-                    .Cast<CollectedFileEvent>()
-                    .ToArray();
-
-                if (queued.Length != lines.Count)
+        FileServerMonitor.Core.CheckpointedLineQueueFlushResult result;
+        try
+        {
+            var drainPlan = FileServerMonitor.Core.DurableLineQueue.CreateDrainPlan(
+                _options.ApiBatchSize,
+                _options.QueueFlushBatchesPerCycle,
+                _options.QueueFlushMaxEventsPerCycle);
+            result = await FileServerMonitor.Core.CheckpointedLineQueue.FlushAsync(
+                _options.QueueFile,
+                drainPlan.BatchSize,
+                drainPlan.MaxLines,
+                async (lines, token) =>
                 {
-                    Console.Error.WriteLine("Fila local contem evento invalido; mantendo lote para nova tentativa.");
-                    return false;
-                }
+                    var queued = lines
+                        .Select(line => JsonSerializer.Deserialize<CollectedFileEvent>(line, JsonOptions))
+                        .Where(item => item is not null)
+                        .Cast<CollectedFileEvent>()
+                        .ToArray();
 
-                var requests = queued.Select(item => item.ToApiRequest(_options.AgentId)).ToArray();
-                if (await TrySendBatchAsync(requests, token) != requests.Length)
-                {
-                    return false;
-                }
+                    if (queued.Length != lines.Count)
+                    {
+                        Console.Error.WriteLine("Fila local contem evento invalido; mantendo lote para nova tentativa.");
+                        return false;
+                    }
 
-                // Mantem compatibilidade com filas antigas, criadas antes do cursor passar a avancar no enqueue.
-                AdvanceState(queued);
-                sentEvents += queued.Length;
-                return true;
-            },
-            cancellationToken);
+                    var requests = queued.Select(item => item.ToApiRequest(_options.AgentId)).ToArray();
+                    if (await TrySendBatchAsync(requests, token) != requests.Length)
+                    {
+                        return false;
+                    }
+
+                    sentEvents += queued.Length;
+                    return true;
+                },
+                cancellationToken);
+        }
+        finally
+        {
+            _queueGate.Release();
+        }
 
         if (sentEvents <= 0)
         {
-            return;
+            return result;
         }
 
-        _sentFromQueueSinceLastCollection += sentEvents;
-        _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow;
-        _state.Save(_options.StateFile);
-        Console.WriteLine($"Fila local: enviados={sentEvents}; pendente={(result.Completed ? 0 : "sim")}.");
+        Interlocked.Add(ref _sentFromQueueSinceLastCollection, sentEvents);
+        UpdatePendingQueueCount(sentEvents, result.Completed);
+        await SaveStateAsync(() => _state.LastSuccessfulSendUtc = DateTimeOffset.UtcNow, cancellationToken);
+        Console.WriteLine($"Fila local: enviados={sentEvents}; pendente={Volatile.Read(ref _pendingQueueEvents)}.");
+        return result;
     }
 
     private async Task<int> TrySendBatchAsync(FileAuditEventRequest[] events, CancellationToken cancellationToken)
@@ -802,28 +964,48 @@ internal sealed class FileServerAgent
 
     private async Task AppendQueueAsync(IReadOnlyCollection<CollectedFileEvent> events, CancellationToken cancellationToken)
     {
-        var lines = events.Select(item => JsonSerializer.Serialize(item, JsonOptions));
-        await File.AppendAllLinesAsync(_options.QueueFile, lines, cancellationToken);
+        var lines = events.Select(item => JsonSerializer.Serialize(item, JsonOptions)).ToArray();
+        await _queueGate.WaitAsync(cancellationToken);
+        try
+        {
+            await FileServerMonitor.Core.CheckpointedLineQueue.AppendAsync(_options.QueueFile, lines, cancellationToken);
+            Interlocked.Add(ref _pendingQueueEvents, lines.Length);
+        }
+        finally
+        {
+            _queueGate.Release();
+        }
+
+        SignalDelivery();
     }
 
     private async Task SendHeartbeatAsync(string status, string? message, CancellationToken cancellationToken)
     {
-        var heartbeat = new AgentHeartbeatRequest(
-            AgentId: _options.AgentId,
-            Server: _options.Server,
-            Status: status,
-            Version: typeof(FileServerAgent).Assembly.GetName().Version?.ToString() ?? "dev",
-            LastRecordId: _state.LastRecordId,
-            LastUsnByVolume: _state.LastUsnByVolume,
-            Message: message ?? BuildHeartbeatMessage(),
-            PendingQueueEvents: CountPendingQueueEvents(),
-            LastSuccessfulSendUtc: _state.LastSuccessfulSendUtc,
-            LastCollectedEventUtc: _state.LastCollectedEventUtc,
-            LastCycle: _lastCycle);
+        AgentHeartbeatRequest heartbeat;
+        await _stateGate.WaitAsync(cancellationToken);
+        try
+        {
+            heartbeat = new AgentHeartbeatRequest(
+                AgentId: _options.AgentId,
+                Server: _options.Server,
+                Status: status,
+                Version: typeof(FileServerAgent).Assembly.GetName().Version?.ToString() ?? "dev",
+                LastRecordId: _state.LastRecordId,
+                LastUsnByVolume: new Dictionary<string, long>(_state.LastUsnByVolume, StringComparer.OrdinalIgnoreCase),
+                Message: message ?? BuildHeartbeatMessage(),
+                PendingQueueEvents: Volatile.Read(ref _pendingQueueEvents),
+                LastSuccessfulSendUtc: _state.LastSuccessfulSendUtc,
+                LastCollectedEventUtc: _state.LastCollectedEventUtc,
+                LastCycle: _lastCycle);
+        }
+        finally
+        {
+            _stateGate.Release();
+        }
 
         try
         {
-            using var response = await _httpClient.PostAsJsonAsync("/api/agents/heartbeat", heartbeat, JsonOptions, cancellationToken);
+            using var response = await _heartbeatHttpClient.PostAsJsonAsync("/api/agents/heartbeat", heartbeat, JsonOptions, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -833,6 +1015,70 @@ internal sealed class FileServerAgent
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
             Console.Error.WriteLine($"API indisponivel para heartbeat: {ex.Message}");
+        }
+    }
+
+    private async Task SaveStateAsync(Action mutation, CancellationToken cancellationToken)
+    {
+        await _stateGate.WaitAsync(cancellationToken);
+        try
+        {
+            mutation();
+            _state.Save(_options.StateFile);
+        }
+        finally
+        {
+            _stateGate.Release();
+        }
+    }
+
+    private async Task WaitForDeliveryAsync(int seconds, CancellationToken cancellationToken)
+    {
+        await _deliverySignal.WaitAsync(TimeSpan.FromSeconds(Math.Max(1, seconds)), cancellationToken);
+    }
+
+    private void SignalDelivery()
+    {
+        if (_deliverySignal.CurrentCount == 0)
+        {
+            try
+            {
+                _deliverySignal.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // Outro produtor ja deixou um sinal pendente para o consumidor.
+            }
+        }
+    }
+
+    private void UpdatePendingQueueCount(int sentEvents, bool completed)
+    {
+        if (completed)
+        {
+            Interlocked.Exchange(ref _pendingQueueEvents, 0);
+            return;
+        }
+
+        int current;
+        int updated;
+        do
+        {
+            current = Volatile.Read(ref _pendingQueueEvents);
+            updated = Math.Max(0, current - sentEvents);
+        }
+        while (Interlocked.CompareExchange(ref _pendingQueueEvents, updated, current) != current);
+    }
+
+    private static async Task AwaitBackgroundTaskAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+            // Encerramento coordenado do servico.
         }
     }
 
@@ -902,6 +1148,9 @@ internal sealed class FileServerAgent
                 BatchSize: remote.BatchSize,
                 MaxItemsPerScan: remote.MaxItemsPerScan,
                 IncludeLastAccessTime: remote.IncludeLastAccessTime,
+                CollectDirectoryAcl: remote.CollectDirectoryAcl,
+                ExpectedBroadReadPrincipals: remote.ExpectedBroadReadPrincipals ?? Array.Empty<string>(),
+                ExpectedBroadWritePrincipals: remote.ExpectedBroadWritePrincipals ?? Array.Empty<string>(),
                 WindowStartLocal: remote.WindowStartLocal,
                 WindowEndLocal: remote.WindowEndLocal,
                 RunRequestedUtc: remote.RunRequestedUtc,
@@ -1008,24 +1257,6 @@ internal sealed class FileServerAgent
             SentEvents: sentEvents,
             QueuedEvents: queuedEvents,
             Error: error);
-    }
-
-    private int CountPendingQueueEvents()
-    {
-        if (!File.Exists(_options.QueueFile))
-        {
-            return 0;
-        }
-
-        try
-        {
-            return File.ReadLines(_options.QueueFile)
-                .Count(line => !string.IsNullOrWhiteSpace(line));
-        }
-        catch (IOException)
-        {
-            return -1;
-        }
     }
 
     private static FileServerMonitor.Core.CollectedFileEvent ToCoreEvent(CollectedFileEvent item)
@@ -1246,12 +1477,16 @@ internal sealed record AgentOptions(
     string Server,
     string ApiBaseUrl,
     int ApiRequestTimeoutSeconds,
+    int HeartbeatRequestTimeoutSeconds,
     int ApiBatchSize,
     string? ApiKey,
     int PollIntervalSeconds,
+    int HeartbeatIntervalSeconds,
     int BatchSize,
     int QueueFlushBatchesPerCycle,
     int QueueFlushMaxEventsPerCycle,
+    int QueueRetrySeconds,
+    int QueueDrainPauseMilliseconds,
     bool EnableSecurityLogCollector,
     bool EnableUsnJournalCollector,
     bool EnableCorrelation,
@@ -1291,6 +1526,12 @@ internal sealed record AgentOptions(
             ApiRequestTimeoutSeconds = options.ApiRequestTimeoutSeconds is >= 30 and <= 600
                 ? options.ApiRequestTimeoutSeconds
                 : 120,
+            HeartbeatRequestTimeoutSeconds = options.HeartbeatRequestTimeoutSeconds is >= 5 and <= 60
+                ? options.HeartbeatRequestTimeoutSeconds
+                : 10,
+            HeartbeatIntervalSeconds = options.HeartbeatIntervalSeconds is >= 5 and <= 300
+                ? options.HeartbeatIntervalSeconds
+                : 15,
             ApiBatchSize = options.ApiBatchSize is >= 10 and <= 1_000
                 ? options.ApiBatchSize
                 : 1_000,
@@ -1299,6 +1540,12 @@ internal sealed record AgentOptions(
             QueueFlushMaxEventsPerCycle = options.QueueFlushMaxEventsPerCycle is >= 100 and <= 100_000
                 ? options.QueueFlushMaxEventsPerCycle
                 : 10_000,
+            QueueRetrySeconds = options.QueueRetrySeconds is >= 1 and <= 300
+                ? options.QueueRetrySeconds
+                : 5,
+            QueueDrainPauseMilliseconds = options.QueueDrainPauseMilliseconds is >= 10 and <= 5_000
+                ? options.QueueDrainPauseMilliseconds
+                : 50,
             CorrelationWindowSeconds = options.CorrelationWindowSeconds is > 0 and <= 300 ? options.CorrelationWindowSeconds : 10,
             RemoteConfigRefreshMinutes = options.RemoteConfigRefreshMinutes is > 0 and <= 1440 ? options.RemoteConfigRefreshMinutes : 5,
             UsnVolumes = options.UsnVolumes is null || options.UsnVolumes.Length == 0 ? new[] { "D:" } : options.UsnVolumes,
@@ -1322,6 +1569,9 @@ internal sealed record AgentOptions(
                 BatchSize: 500,
                 MaxItemsPerScan: 0,
                 IncludeLastAccessTime: false,
+                CollectDirectoryAcl: false,
+                ExpectedBroadReadPrincipals: Array.Empty<string>(),
+                ExpectedBroadWritePrincipals: Array.Empty<string>(),
                 WindowStartLocal: "01:00",
                 WindowEndLocal: "05:00",
                 RunRequestedUtc: null,
@@ -1332,6 +1582,8 @@ internal sealed record AgentOptions(
         {
             IntervalHours = options.IntervalHours <= 0 ? 24 : options.IntervalHours,
             BatchSize = options.BatchSize is >= 100 and <= 2000 ? options.BatchSize : 500,
+            ExpectedBroadReadPrincipals = options.ExpectedBroadReadPrincipals ?? Array.Empty<string>(),
+            ExpectedBroadWritePrincipals = options.ExpectedBroadWritePrincipals ?? Array.Empty<string>(),
             Roots = options.Roots ?? Array.Empty<InventoryScanRoot>()
         };
     }
@@ -1355,6 +1607,9 @@ internal sealed record InventoryScanOptions(
     int BatchSize,
     int MaxItemsPerScan,
     bool IncludeLastAccessTime,
+    bool CollectDirectoryAcl,
+    string[] ExpectedBroadReadPrincipals,
+    string[] ExpectedBroadWritePrincipals,
     string? WindowStartLocal,
     string? WindowEndLocal,
     DateTimeOffset? RunRequestedUtc,
@@ -1379,6 +1634,9 @@ internal sealed record InventoryScanSettingsResponse(
     int BatchSize,
     int MaxItemsPerScan,
     bool IncludeLastAccessTime,
+    bool CollectDirectoryAcl,
+    string[]? ExpectedBroadReadPrincipals,
+    string[]? ExpectedBroadWritePrincipals,
     string? WindowStartLocal,
     string? WindowEndLocal,
     string RootPath,
@@ -1572,7 +1830,14 @@ internal sealed record InventoryItemRequest(
     DateTimeOffset? CreatedUtc,
     DateTimeOffset? ModifiedUtc,
     DateTimeOffset? AccessedUtc,
-    string? Error);
+    string? Error,
+    bool AclCollected,
+    string? AclOwner,
+    bool AclInheritanceProtected,
+    string AclRiskLevel,
+    string? BroadAccessPrincipals,
+    string? BroadAccessRights,
+    string? AclError);
 
 internal sealed record InventorySnapshotCompleteRequest(string Status, string? Error);
 

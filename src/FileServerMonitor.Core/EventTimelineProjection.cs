@@ -41,6 +41,7 @@ public sealed class EventTimelineProjector
         var consumed = new HashSet<int>();
         var emittedSemanticKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var display = new List<FileAuditDisplayEvent>();
+        var evidenceIndex = new ProjectionEvidenceIndex(ordered);
 
         for (var index = 0; index < ordered.Length; index++)
         {
@@ -50,12 +51,7 @@ public sealed class EventTimelineProjector
             }
 
             var current = ordered[index];
-            var clusterAll = ordered
-                .Select((Event, Index) => new ClusterItem(Event, Index))
-                .Where(item => string.Equals(item.Event.Server, current.Server, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(item.Event.Share, current.Share, StringComparison.OrdinalIgnoreCase))
-                .Where(item => (item.Event.TimestampUtc - current.TimestampUtc).Duration() <= CorrelationWindow)
-                .ToArray();
+            var clusterAll = evidenceIndex.GetRelevant(current);
             var cluster = clusterAll
                 .Where(item => !consumed.Contains(item.Index))
                 .ToArray();
@@ -122,23 +118,27 @@ public sealed class EventTimelineProjector
         var syntheticDescendantMoves = SynthesizeLikelyDescendantMoves(syntheticCreations).ToArray();
         var syntheticDeletes = SynthesizeLikelyDescendantDeletions(syntheticDescendantMoves).ToArray();
         var promotedCreations = PromoteLikelyInitialCreations(syntheticDeletes).ToArray();
+        var evidenceIndex = new DisplayEvidenceIndex(promotedCreations);
 
         var filtered = promotedCreations
             .Where(item =>
-                !IsTransientDisplayNoise(item)
-                && !IsRedundantDisplayPermissionEcho(item, promotedCreations)
-                && !IsPermissionEchoDuringDelete(item, promotedCreations)
-                && !IsRedundantDisplayDeleted(item, promotedCreations)
-                && !IsRedundantDisplayDeletedDuplicate(item, promotedCreations)
-                && !IsRedundantDisplayProvisionalDelete(item, promotedCreations)
-                && !IsSuspiciousMoveEcho(item, promotedCreations)
-                && !IsRedundantDisplayFolderChangedEcho(item, promotedCreations)
-                && !ShouldSuppressProvisionalCreate(item, promotedCreations)
-                && !IsRedundantDisplayRenameAfterCreate(item, promotedCreations)
-                && !IsRedundantDisplayCreateEcho(item, promotedCreations)
-                && !IsRedundantDisplayCreatedDuplicate(item, promotedCreations)
-                && !IsRedundantDisplayAccessedEcho(item, promotedCreations)
-                && !IsRedundantDisplayChangedEcho(item, promotedCreations));
+            {
+                var related = evidenceIndex.GetRelevant(item);
+                return !IsTransientDisplayNoise(item)
+                    && !IsRedundantDisplayPermissionEcho(item, related)
+                    && !IsPermissionEchoDuringDelete(item, related)
+                    && !IsRedundantDisplayDeleted(item, related)
+                    && !IsRedundantDisplayDeletedDuplicate(item, related)
+                    && !IsRedundantDisplayProvisionalDelete(item, related)
+                    && !IsSuspiciousMoveEcho(item, related)
+                    && !IsRedundantDisplayFolderChangedEcho(item, related)
+                    && !ShouldSuppressProvisionalCreate(item, related)
+                    && !IsRedundantDisplayRenameAfterCreate(item, related)
+                    && !IsRedundantDisplayCreateEcho(item, related)
+                    && !IsRedundantDisplayCreatedDuplicate(item, related)
+                    && !IsRedundantDisplayAccessedEcho(item, related)
+                    && !IsRedundantDisplayChangedEcho(item, related);
+            });
 
         return CollapseSemanticDisplayDuplicates(filtered)
             .OrderByDescending(item => item.TimestampUtc)
@@ -1398,63 +1398,72 @@ public sealed class EventTimelineProjector
             return false;
         }
 
-        var itemResolvedPath = ResolvePathThroughEarlierFolderMoves(item.Path, item.TimestampUtc, all);
-        if (!PathsReferToSameItem(itemResolvedPath, item.Path)
-            && all.Any(candidate =>
+        var nearbyDeletes = all
+            .Where(candidate =>
                 candidate.Id != item.Id
                 && candidate.Action == "deleted"
-                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5)
-                && PathsReferToSameItem(candidate.Path, itemResolvedPath)))
+                && (candidate.TimestampUtc - item.TimestampUtc).Duration() <= TimeSpan.FromSeconds(5))
+            .ToArray();
+        foreach (var candidate in nearbyDeletes.Where(candidate => PathsReferToSameItem(candidate.Path, item.Path)))
+        {
+            if (ShouldPreferDeletedCandidate(item, candidate))
+            {
+                return true;
+            }
+        }
+
+        var itemResolvedPath = ResolvePathThroughEarlierFolderMoves(item.Path, item.TimestampUtc, all);
+        if (PathsReferToSameItem(itemResolvedPath, item.Path))
+        {
+            return false;
+        }
+
+        if (nearbyDeletes.Any(candidate => PathsReferToSameItem(candidate.Path, itemResolvedPath)))
         {
             return true;
         }
 
-        return all.Any(candidate =>
+        foreach (var candidate in nearbyDeletes)
         {
-            if (candidate.Id == item.Id || candidate.Action != "deleted")
+            var candidateResolvedPath = ResolvePathThroughEarlierFolderMoves(candidate.Path, candidate.TimestampUtc, all);
+            if (!PathsReferToSameItem(candidateResolvedPath, itemResolvedPath))
             {
-                return false;
+                continue;
             }
 
-            if ((candidate.TimestampUtc - item.TimestampUtc).Duration() > TimeSpan.FromSeconds(5))
+            var candidateMatchesResolved = NormalizePath(candidate.Path) == NormalizePath(candidateResolvedPath);
+            var itemMatchesResolved = NormalizePath(item.Path) == NormalizePath(itemResolvedPath);
+            if (candidateMatchesResolved != itemMatchesResolved)
             {
-                return false;
+                return candidateMatchesResolved;
             }
 
-            var sameDirectPath = PathsReferToSameItem(candidate.Path, item.Path);
-            var sameResolvedPath = PathsReferToSameItem(
-                ResolvePathThroughEarlierFolderMoves(candidate.Path, candidate.TimestampUtc, all),
-                itemResolvedPath);
-            if (!sameDirectPath && !sameResolvedPath)
+            if (ShouldPreferDeletedCandidate(item, candidate))
             {
-                return false;
+                return true;
             }
+        }
 
-            if (!sameDirectPath && sameResolvedPath)
-            {
-                var candidateResolvedPath = ResolvePathThroughEarlierFolderMoves(candidate.Path, candidate.TimestampUtc, all);
-                var candidateMatchesResolved = NormalizePath(candidate.Path) == NormalizePath(candidateResolvedPath);
-                var itemMatchesResolved = NormalizePath(item.Path) == NormalizePath(itemResolvedPath);
-                if (candidateMatchesResolved != itemMatchesResolved)
-                {
-                    return candidateMatchesResolved;
-                }
-            }
+        return false;
+    }
 
-            if (HasReplacementCharacter(item.Path) != HasReplacementCharacter(candidate.Path))
-            {
-                return HasReplacementCharacter(item.Path);
-            }
+    private static bool ShouldPreferDeletedCandidate(
+        FileAuditDisplayEvent item,
+        FileAuditDisplayEvent candidate)
+    {
+        if (HasReplacementCharacter(item.Path) != HasReplacementCharacter(candidate.Path))
+        {
+            return HasReplacementCharacter(item.Path);
+        }
 
-            var candidateWeight = GetEventWeight(candidate);
-            var itemWeight = GetEventWeight(item);
-            if (candidateWeight != itemWeight)
-            {
-                return candidateWeight > itemWeight;
-            }
+        var candidateWeight = GetEventWeight(candidate);
+        var itemWeight = GetEventWeight(item);
+        if (candidateWeight != itemWeight)
+        {
+            return candidateWeight > itemWeight;
+        }
 
-            return candidate.TimestampUtc < item.TimestampUtc;
-        });
+        return candidate.TimestampUtc < item.TimestampUtc;
     }
 
     private static bool IsRedundantDisplayProvisionalDelete(FileAuditDisplayEvent item, IReadOnlyCollection<FileAuditDisplayEvent> all)
@@ -2671,6 +2680,239 @@ public sealed class EventTimelineProjector
     }
 
     private sealed record ClusterItem(FileAuditEvent Event, int Index);
+
+    private sealed class ProjectionEvidenceIndex
+    {
+        private const int MaximumAmbiguousShapeEvidence = 128;
+        private readonly ClusterItem[] _all;
+        private readonly Dictionary<string, List<ClusterItem>> _byPath = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<ClusterItem>> _byShape = new(StringComparer.Ordinal);
+
+        public ProjectionEvidenceIndex(IReadOnlyList<FileAuditEvent> ordered)
+        {
+            _all = ordered.Select((item, index) => new ClusterItem(item, index)).ToArray();
+            foreach (var item in _all)
+            {
+                Add(_byPath, PathKey(item.Event, item.Event.Path), item);
+                if (!string.IsNullOrWhiteSpace(item.Event.PreviousPath))
+                {
+                    Add(_byPath, PathKey(item.Event, item.Event.PreviousPath), item);
+                }
+
+                Add(_byShape, ShapeKey(item.Event), item);
+            }
+        }
+
+        public ClusterItem[] GetRelevant(FileAuditEvent current)
+        {
+            if (IsShareRootPath(current)
+                || current.ObjectType is "folder" or "directory"
+                || IsLikelyFolderPath(current.Path)
+                || HasReplacementCharacter(current.Path)
+                || HasReplacementCharacter(current.PreviousPath))
+            {
+                return FilterByScopeAndTime(_all, current);
+            }
+
+            var candidates = new Dictionary<int, ClusterItem>();
+            AddCandidates(candidates, _byPath, PathKey(current, current.Path));
+            if (!string.IsNullOrWhiteSpace(current.PreviousPath))
+            {
+                AddCandidates(candidates, _byPath, PathKey(current, current.PreviousPath));
+            }
+
+            var parentPath = GetParentPath(current.Path);
+            if (!string.IsNullOrWhiteSpace(parentPath))
+            {
+                AddCandidates(candidates, _byPath, PathKey(current, parentPath));
+            }
+
+            var needsShapeEvidence = current.Source.Contains("windows-security-log", StringComparison.OrdinalIgnoreCase)
+                && current.Action is "accessed" or "deleted"
+                || current.Action is "renamed" or "moved"
+                    && PathsReferToSameItem(current.PreviousPath, current.Path);
+            if (needsShapeEvidence)
+            {
+                AddShapeCandidates(candidates, ShapeKey(current));
+            }
+
+            return FilterByScopeAndTime(candidates.Values, current);
+        }
+
+        private static ClusterItem[] FilterByScopeAndTime(
+            IEnumerable<ClusterItem> candidates,
+            FileAuditEvent current)
+        {
+            return candidates
+                .Where(item => string.Equals(item.Event.Server, current.Server, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(item.Event.Share, current.Share, StringComparison.OrdinalIgnoreCase))
+                .Where(item => (item.Event.TimestampUtc - current.TimestampUtc).Duration() <= CorrelationWindow)
+                .OrderBy(item => item.Index)
+                .ToArray();
+        }
+
+        private static void AddCandidates(
+            IDictionary<int, ClusterItem> target,
+            IReadOnlyDictionary<string, List<ClusterItem>> source,
+            string key)
+        {
+            if (!source.TryGetValue(key, out var items))
+            {
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                target.TryAdd(item.Index, item);
+            }
+        }
+
+        private void AddShapeCandidates(IDictionary<int, ClusterItem> target, string key)
+        {
+            if (!_byShape.TryGetValue(key, out var items)
+                || items.Count > MaximumAmbiguousShapeEvidence)
+            {
+                return;
+            }
+
+            foreach (var item in items)
+            {
+                target.TryAdd(item.Index, item);
+            }
+        }
+
+        private static void Add(
+            IDictionary<string, List<ClusterItem>> index,
+            string key,
+            ClusterItem item)
+        {
+            if (!index.TryGetValue(key, out var items))
+            {
+                items = [];
+                index[key] = items;
+            }
+
+            items.Add(item);
+        }
+
+        private static string PathKey(FileAuditEvent item, string? path) =>
+            $"{item.Server.Trim().ToLowerInvariant()}\u001f{item.Share.Trim().ToLowerInvariant()}\u001f{NormalizePath(path)}";
+
+        private static string ShapeKey(FileAuditEvent item) =>
+            $"{item.Server.Trim().ToLowerInvariant()}\u001f{item.Share.Trim().ToLowerInvariant()}\u001f{NormalizeUser(item.User)}\u001f{item.ObjectType.Trim().ToLowerInvariant()}\u001f{GetPathExtension(item.Path)}";
+    }
+
+    private sealed class DisplayEvidenceIndex
+    {
+        private readonly FileAuditDisplayEvent[] _all;
+        private readonly FileAuditDisplayEvent[] _folderMoves;
+        private readonly Dictionary<string, List<FileAuditDisplayEvent>> _byPath = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<FileAuditDisplayEvent>> _byParentExtension = new(StringComparer.Ordinal);
+
+        public DisplayEvidenceIndex(IReadOnlyCollection<FileAuditDisplayEvent> events)
+        {
+            _all = events.ToArray();
+            _folderMoves = _all
+                .Where(item => item.Action == "moved" && IsFolderEvent(item))
+                .ToArray();
+            foreach (var item in _all)
+            {
+                Add(_byPath, PathKey(item, item.Path), item);
+                if (!string.IsNullOrWhiteSpace(item.PreviousPath))
+                {
+                    Add(_byPath, PathKey(item, item.PreviousPath), item);
+                }
+
+                Add(_byParentExtension, ParentExtensionKey(item), item);
+            }
+        }
+
+        public IReadOnlyCollection<FileAuditDisplayEvent> GetRelevant(FileAuditDisplayEvent item)
+        {
+            if (IsShareRootDisplayPath(item)
+                || IsFolderEvent(item)
+                || HasReplacementCharacter(item.Path)
+                || HasReplacementCharacter(item.PreviousPath))
+            {
+                return _all;
+            }
+
+            var related = new Dictionary<Guid, FileAuditDisplayEvent>();
+            AddCandidates(related, _byPath, PathKey(item, item.Path));
+            if (!string.IsNullOrWhiteSpace(item.PreviousPath))
+            {
+                AddCandidates(related, _byPath, PathKey(item, item.PreviousPath));
+            }
+
+            if (item.Action == "deleted")
+            {
+                foreach (var folderMove in _folderMoves)
+                {
+                    related.TryAdd(folderMove.Id, folderMove);
+                    if (string.IsNullOrWhiteSpace(folderMove.PreviousPath))
+                    {
+                        continue;
+                    }
+
+                    var relocatedPath = TryRelocatePath(item.Path, folderMove.PreviousPath, folderMove.Path);
+                    if (!PathsReferToSameItem(relocatedPath, item.Path))
+                    {
+                        AddCandidates(related, _byPath, PathKey(item, relocatedPath));
+                    }
+
+                    var previousPath = TryRelocatePath(item.Path, folderMove.Path, folderMove.PreviousPath);
+                    if (!PathsReferToSameItem(previousPath, item.Path))
+                    {
+                        AddCandidates(related, _byPath, PathKey(item, previousPath));
+                    }
+                }
+            }
+
+            if (IsProvisionalDocumentName(item.Path)
+                || IsProvisionalDocumentName(item.PreviousPath ?? ""))
+            {
+                AddCandidates(related, _byParentExtension, ParentExtensionKey(item));
+            }
+
+            return related.Values.ToArray();
+        }
+
+        private static void AddCandidates(
+            IDictionary<Guid, FileAuditDisplayEvent> target,
+            IReadOnlyDictionary<string, List<FileAuditDisplayEvent>> source,
+            string key)
+        {
+            if (!source.TryGetValue(key, out var candidates))
+            {
+                return;
+            }
+
+            foreach (var candidate in candidates)
+            {
+                target.TryAdd(candidate.Id, candidate);
+            }
+        }
+
+        private static void Add(
+            IDictionary<string, List<FileAuditDisplayEvent>> index,
+            string key,
+            FileAuditDisplayEvent item)
+        {
+            if (!index.TryGetValue(key, out var items))
+            {
+                items = [];
+                index[key] = items;
+            }
+
+            items.Add(item);
+        }
+
+        private static string PathKey(FileAuditDisplayEvent item, string? path) =>
+            $"{item.Server.Trim().ToLowerInvariant()}\u001f{item.Share.Trim().ToLowerInvariant()}\u001f{NormalizePath(path)}";
+
+        private static string ParentExtensionKey(FileAuditDisplayEvent item) =>
+            $"{item.Server.Trim().ToLowerInvariant()}\u001f{item.Share.Trim().ToLowerInvariant()}\u001f{NormalizePath(GetParentPath(item.Path))}\u001f{GetPathExtension(item.Path)}";
+    }
 
     private sealed record TransitionResult(IReadOnlyCollection<int> ConsumedIndexes, FileAuditDisplayEvent Event);
 }

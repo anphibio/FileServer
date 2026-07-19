@@ -3594,6 +3594,10 @@ dd {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.form-grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .form-grid.four {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
@@ -3611,6 +3615,41 @@ dd {
 .retention-form .auth-status-card {
   border: 1px solid #dce5ef;
   background: #f8fbfe;
+}
+
+.acl-policy-section {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid #d7e2ed;
+  border-radius: 8px;
+  background: #f8fbfe;
+}
+
+.acl-policy-section > div:first-child {
+  display: grid;
+  gap: 5px;
+}
+
+.acl-policy-section p,
+.acl-policy-section small {
+  margin: 0;
+  color: #5d7088;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.acl-policy-section textarea {
+  width: 100%;
+  min-height: 112px;
+  resize: vertical;
+  border: 1px solid #cdd8e5;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #ffffff;
+  color: #182234;
+  font: inherit;
+  line-height: 1.45;
 }
 
 .retention-archive-history {
@@ -5032,6 +5071,7 @@ dd {
   .inventory-action-strip,
   .inventory-scan-meta,
   .form-grid.three,
+  .form-grid.two,
   .form-grid.four,
   .form-grid.five {
     grid-template-columns: 1fr;

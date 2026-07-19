@@ -58,6 +58,34 @@ public sealed record TimelineMaterializationJob(
     Guid Id,
     TimelineMaterializationWindow Window);
 
+public sealed record TimelineMaterializationJobTiming(
+    DateTimeOffset CreatedUtc,
+    DateTimeOffset AvailableUtc,
+    bool IsRetry);
+
+public static class TimelineMaterializationDebounce
+{
+    public static DateTimeOffset GetReadyUtc(
+        IEnumerable<TimelineMaterializationJobTiming> jobs,
+        TimeSpan maxDebounce)
+    {
+        var ordered = jobs.OrderBy(item => item.CreatedUtc).ToArray();
+        if (ordered.Length == 0)
+        {
+            throw new ArgumentException("At least one materialization job is required.", nameof(jobs));
+        }
+
+        var availableUtc = ordered.Max(item => item.AvailableUtc);
+        if (ordered.Any(item => item.IsRetry) || maxDebounce <= TimeSpan.Zero)
+        {
+            return availableUtc;
+        }
+
+        var maximumUtc = ordered[0].CreatedUtc + maxDebounce;
+        return availableUtc <= maximumUtc ? availableUtc : maximumUtc;
+    }
+}
+
 public sealed record TimelineMaterializationLease(
     Guid LeaseId,
     IReadOnlyList<Guid> JobIds,

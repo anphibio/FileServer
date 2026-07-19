@@ -242,3 +242,9 @@ Observacoes:
 - Arquivo frio ganhou leitura com validacao de SHA-256 e contagem antes de qualquer restauracao.
 - Restauracao administrativa e transacional passou a ignorar duplicados e registrar historico auditavel.
 - Ciclo de vida ganhou segundo volume, backup verificado e expiracao do primario bloqueada por padrao.
+- Agente passou a isolar heartbeat, coleta e entrega, com fila por cursor e drenagem continua para suportar explosoes de eventos sem reescrever todo o backlog.
+- Materializacao SQL passou a consolidar rajadas por silencio com espera maxima, e o projetor da timeline usa indice de evidencias por caminho para evitar comparacoes quadraticas entre arquivos independentes.
+- Inventario passou a coletar opcionalmente proprietario e ACL somente das pastas, com classificacao de escrita ampla, heranca interrompida e falhas de leitura no Core.
+- API materializa os indicadores de governanca de ACL por snapshot e a interface apresenta totais, riscos prioritarios e investigacao das pastas afetadas.
+- Traducao de SID para conta usa cache no agente para reduzir consultas repetidas ao dominio durante scans extensos.
+- Politica de ACL esperada separa aprovacao de leitura e escrita por compartilhamento, mantendo a evidencia aprovada no snapshot sem poluir a fila de risco.

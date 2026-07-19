@@ -204,6 +204,9 @@ type InventoryScanConfig = {
   batchSize: number;
   maxItemsPerScan: number;
   includeLastAccessTime: boolean;
+  collectDirectoryAcl: boolean;
+  expectedBroadReadPrincipals: string[];
+  expectedBroadWritePrincipals: string[];
   windowStartLocal: string;
   windowEndLocal: string;
   rootPath: string;
@@ -502,6 +505,7 @@ type InventorySummary = {
   insight: InventoryManagerialInsight;
   executiveOverview: InventoryExecutiveOverview;
   recommendations: InventoryRecommendation[];
+  aclRisks: InventoryAclRiskCandidate[];
 };
 
 type InventorySnapshot = {
@@ -537,6 +541,13 @@ type InventoryItem = {
   accessedUtc?: string | null;
   status: string;
   error?: string | null;
+  aclCollected: boolean;
+  aclOwner?: string | null;
+  aclInheritanceProtected: boolean;
+  aclRiskLevel: string;
+  broadAccessPrincipals?: string | null;
+  broadAccessRights?: string | null;
+  aclError?: string | null;
 };
 
 type InventoryGovernanceMetrics = {
@@ -550,6 +561,22 @@ type InventoryGovernanceMetrics = {
   largeFileBytes: number;
   executableFileCount: number;
   executableFileBytes: number;
+  aclCollectedFolderCount: number;
+  aclErrorFolderCount: number;
+  inheritanceProtectedFolderCount: number;
+  broadAccessFolderCount: number;
+  expectedAclFolderCount: number;
+  criticalAclFolderCount: number;
+};
+
+type InventoryAclRiskCandidate = {
+  path: string;
+  owner?: string | null;
+  inheritanceProtected: boolean;
+  riskLevel: string;
+  broadAccessPrincipals?: string | null;
+  broadAccessRights?: string | null;
+  error?: string | null;
 };
 
 type InventoryTopFolder = {
@@ -1425,6 +1452,42 @@ function InventoryScanConfigPanel({ onNotify }: { onNotify: (notice: Notice | nu
           <input type="checkbox" checked={config.includeLastAccessTime} onChange={(event) => update("includeLastAccessTime", event.target.checked)} />
           Coletar data de último acesso
         </label>
+
+        <label className="check-row">
+          <input type="checkbox" checked={config.collectDirectoryAcl} onChange={(event) => update("collectDirectoryAcl", event.target.checked)} />
+          Coletar proprietário e permissões das pastas
+        </label>
+
+        {config.collectDirectoryAcl ? (
+          <section className="acl-policy-section" aria-label="Política de permissões esperadas">
+            <div>
+              <strong>Calibração de acesso amplo</strong>
+              <p>Informe uma conta ou SID por linha. As permissões continuam auditáveis, mas deixam a fila de risco quando correspondem exatamente ao nível aprovado.</p>
+            </div>
+            <div className="form-grid two">
+              <label>
+                Acesso amplo esperado para leitura
+                <textarea
+                  value={(config.expectedBroadReadPrincipals ?? []).join("\n")}
+                  onChange={(event) => update("expectedBroadReadPrincipals", parsePrincipalLines(event.target.value))}
+                  placeholder={"S-1-5-11\nTCEAL\\Domain Users"}
+                  rows={4}
+                />
+                <small>Não aprova escrita, alteração ou exclusão.</small>
+              </label>
+              <label>
+                Acesso amplo esperado para escrita
+                <textarea
+                  value={(config.expectedBroadWritePrincipals ?? []).join("\n")}
+                  onChange={(event) => update("expectedBroadWritePrincipals", parsePrincipalLines(event.target.value))}
+                  placeholder={"S-1-5-32-545\nTCEAL\\Grupo_Colaboracao"}
+                  rows={4}
+                />
+                <small>Use somente quando a escrita ampla fizer parte da política aprovada.</small>
+              </label>
+            </div>
+          </section>
+        ) : null}
 
         <div className="form-grid three">
           <label>
@@ -4356,6 +4419,10 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
           <p>Contagens do snapshot atual para orientar revisão técnica e correção de cobertura.</p>
         </div>
         <section className="inventory-action-strip" aria-label="Indicadores de risco">
+          <InventoryActionMetric icon={<ShieldAlert size={19} />} label="ACL crítica" value={summary.governance.criticalAclFolderCount} detail={`${summary.governance.broadAccessFolderCount.toLocaleString("pt-BR")} pasta(s) com acesso amplo`} tone={summary.governance.criticalAclFolderCount > 0 ? "danger" : "neutral"} />
+          <InventoryActionMetric icon={<ShieldCheck size={19} />} label="ACL esperada" value={summary.governance.expectedAclFolderCount} detail="Cobertas pela política aprovada" tone="neutral" />
+          <InventoryActionMetric icon={<FolderTree size={19} />} label="Herança interrompida" value={summary.governance.inheritanceProtectedFolderCount} detail="Pastas com ACL protegida" tone={summary.governance.inheritanceProtectedFolderCount > 0 ? "warning" : "neutral"} />
+          <InventoryActionMetric icon={<ShieldCheck size={19} />} label="ACLs avaliadas" value={summary.governance.aclCollectedFolderCount} detail={`${summary.governance.aclErrorFolderCount.toLocaleString("pt-BR")} falha(s) de leitura`} tone={summary.governance.aclErrorFolderCount > 0 ? "warning" : "neutral"} />
           <InventoryActionMetric icon={<ShieldAlert size={19} />} label="Executáveis e scripts" value={summary.governance.executableFileCount} detail={formatBytes(summary.governance.executableFileBytes)} tone="danger" />
           <InventoryActionMetric icon={<AlertTriangle size={19} />} label="Erros de leitura" value={summary.errorCount} detail="Itens sem catalogação completa no último scan" tone={summary.errorCount > 0 ? "danger" : "neutral"} />
           <InventoryActionMetric icon={<Files size={19} />} label="Arquivos acima de 1 GB" value={summary.governance.largeFileCount} detail={formatBytes(summary.governance.largeFileBytes)} tone="warning" />
@@ -4438,7 +4505,8 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
               ["executable", "Executáveis/scripts"],
               ["large", "Arquivos grandes"],
               ["inactive365", "Inativos +365d"],
-              ["errors", "Erros de leitura"]
+              ["errors", "Erros de leitura"],
+              ["acl-risk", "Riscos de permissão"]
             ].map(([kind, label]) => (
               <button
                 key={kind}
@@ -4467,6 +4535,8 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
                     <th>Modificado</th>
                     <th>Acessado</th>
                     <th>Status</th>
+                    <th>Proprietário</th>
+                    <th>Permissão ampla</th>
                     <th>Caminho</th>
                   </tr>
                 </thead>
@@ -4479,10 +4549,12 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
                       <td>{item.modifiedUtc ? formatDate(item.modifiedUtc) : "-"}</td>
                       <td>{item.accessedUtc ? formatDate(item.accessedUtc) : "-"}</td>
                       <td>
-                        <span className={`status ${item.status === "active" ? "ok" : "attention"}`}>
-                          {item.status === "active" ? "ativo" : item.status}
+                        <span className={`status ${item.aclRiskLevel === "critical" || item.status !== "active" ? "attention" : "ok"}`}>
+                          {item.aclRiskLevel && item.aclRiskLevel !== "not_collected" ? formatAclRisk(item.aclRiskLevel) : item.status === "active" ? "ativo" : item.status}
                         </span>
                       </td>
+                      <td>{item.aclOwner || "-"}</td>
+                      <td title={item.broadAccessRights || undefined}>{item.broadAccessPrincipals || item.aclError || "-"}</td>
                       <td title={item.path}>{item.path}</td>
                     </tr>
                   ))}
@@ -4559,6 +4631,41 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
               maxValue={Math.max(...summary.topInactiveFiles.map((item) => item.ageDays ?? 0), 1)}
               getBarValue={(item) => item.ageDays ?? 0}
             />
+          </Panel>
+        )}
+
+        {activeInventoryTab === "risk" && (
+          <Panel title="Governança de permissões" subtitle="Pastas com escrita ampla, herança interrompida ou falha de leitura da ACL.">
+            {summary.aclRisks?.length ? (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Risco</th>
+                      <th>Pasta</th>
+                      <th>Proprietário</th>
+                      <th>Principal amplo</th>
+                      <th>Direitos</th>
+                      <th>Herança</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summary.aclRisks.map((item) => (
+                      <tr key={item.path}>
+                        <td><span className={`status ${item.riskLevel === "critical" || item.riskLevel === "error" ? "attention" : "ok"}`}>{formatAclRisk(item.riskLevel)}</span></td>
+                        <td title={item.path}>{item.path}</td>
+                        <td>{item.owner || "Não identificado"}</td>
+                        <td>{item.broadAccessPrincipals || item.error || "-"}</td>
+                        <td>{item.broadAccessRights || "-"}</td>
+                        <td>{item.inheritanceProtected ? "Interrompida" : "Herdada"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <EmptyState text={summary.governance.aclCollectedFolderCount > 0 ? "Nenhuma pasta com risco de ACL no snapshot atual." : "A coleta de ACL ainda não foi executada neste inventário."} />
+            )}
           </Panel>
         )}
 
@@ -4653,6 +4760,26 @@ function formatInventoryStatus(status: string) {
   }
 
   return status;
+}
+
+function formatAclRisk(risk: string) {
+  const labels: Record<string, string> = {
+    clear: "sem sinal",
+    expected: "esperada",
+    attention: "atenção",
+    critical: "crítico",
+    error: "não lida",
+    not_collected: "não coletada"
+  };
+  return labels[risk.toLowerCase()] ?? risk;
+}
+
+function parsePrincipalLines(value: string) {
+  return Array.from(new Set(value
+    .split(/[;\r\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)))
+    .slice(0, 64);
 }
 
 function InventoryActionMetric({

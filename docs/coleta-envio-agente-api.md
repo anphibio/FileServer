@@ -91,20 +91,15 @@ Para o piloto de correlacao mais forte, especialmente renomeacoes e movimentacoe
 
 ## Ciclo de vida do agente
 
-O loop principal fica em `FileServerAgent.RunAsync`.
+O coordenador principal fica em `FileServerAgent.RunAsync` e mantem tres fluxos independentes:
 
-Em cada ciclo, ele executa esta sequencia:
+1. coleta configuracao, Security Log e USN, correlaciona e persiste o resultado na fila local;
+2. entrega continuamente os lotes pendentes para a API, com pausa e repeticao controladas;
+3. envia heartbeat por um cliente HTTP e timeout proprios.
 
-1. busca configuracao remota na API, se estiver habilitada;
-2. envia heartbeat informando que esta rodando;
-3. tenta reenviar eventos que ficaram na fila local;
-4. coleta novos eventos;
-5. correlaciona e filtra;
-6. envia lote para a API;
-7. grava o estado local;
-8. espera o proximo intervalo.
+O cursor de coleta avanca somente depois que o evento esta duravel na fila. Se algum erro acontecer, o processo continua e o heartbeat reporta `degraded` sem depender da conclusao do coletor ou da drenagem.
 
-Se algum erro acontecer durante a coleta, ele nao encerra o processo. Ele registra a falha, envia heartbeat com status `degraded` e tenta novamente no proximo ciclo.
+`pollIntervalSeconds` representa o intervalo desejado entre inicios de coleta. Quando um ciclo demora mais que esse valor por haver muitos eventos, o agente inicia o proximo lote apos uma cedencia curta, sem somar outra espera completa ao atraso.
 
 Ao finalizar, envia heartbeat com status `stopped`.
 
@@ -284,7 +279,7 @@ Esse arquivo guarda:
 
 Esse estado evita reler tudo a cada ciclo.
 
-Importante: o estado so avanca depois que o lote e enviado com sucesso para a API, ou quando nao ha evento habilitado para envio.
+Importante: o estado so avanca depois que o lote esta persistido na fila local, ou quando nao ha evento habilitado para envio. A entrega pode ocorrer depois sem bloquear a proxima coleta.
 
 ## Fila local de contingencia
 
@@ -296,13 +291,13 @@ Ele grava os eventos no arquivo:
 
 Cada linha e um evento JSON.
 
-No proximo ciclo, antes de coletar novos eventos, ele tenta enviar a fila local.
+Um consumidor independente tenta enviar a fila continuamente, sem bloquear heartbeat ou leitura dos proximos cursores.
 
 Quando o envio da fila da certo:
 
-1. remove da fila os eventos enviados;
-2. avanca os cursores;
-3. atualiza `LastSuccessfulSendUtc`.
+1. confirma o deslocamento do lote em `pending-events.ndjson.cursor`;
+2. mantem os eventos seguintes na ordem FIFO sem reescrever todo o backlog;
+3. atualiza `LastSuccessfulSendUtc` e a contagem pendente em memoria.
 
 O heartbeat tambem informa quantos eventos estao pendentes na fila.
 
@@ -602,7 +597,9 @@ Se o ambiente auditar apenas escrita/exclusao, acesso de leitura pode nao aparec
 
 A API persiste o lote bruto e a janela temporal de materializacao na mesma transacao SQL antes de responder ao agente. Um worker em segundo plano reivindica esse trabalho com lease temporario e materializa a timeline com as regras do Core.
 
-As janelas sobrepostas sao acumuladas; janelas temporalmente distantes permanecem separadas. A materializacao aguarda um curto periodo para absorver rajadas, com espera maxima para nao ficar bloqueada por trafego continuo.
+As janelas sobrepostas sao acumuladas; janelas temporalmente distantes permanecem separadas. A fila SQL usa uma janela movel de silencio: cada lote novo relacionado posterga o inicio do mesmo trabalho, mas a espera total tem um limite. Isso evita reconstruir repetidamente uma janela que ainda esta recebendo milhares de eventos sem ficar bloqueado por trafego continuo.
+
+O projetor do Core indexa evidencias relacionadas por servidor, compartilhamento e caminho. Eventos independentes deixam de comparar toda a rajada entre si; eventos de pasta continuam recebendo o contexto amplo necessario para sintetizar movimentos e exclusoes dos descendentes. Os testes de regressao incluem rajadas de 2.000 criacoes e 1.000 ciclos completos de criacao e exclusao para impedir o retorno ao custo quadratico.
 
 No SQL Server, a fila fica em `dbo.TimelineMaterializationJobs`. Um trabalho concluido e removido; uma falha o devolve para `pending`. Se a API cair durante a correlacao, o lease expira e outra instancia ou o processo reiniciado retoma o trabalho automaticamente. Assim, nao existe uma janela entre gravar o evento bruto e registrar que a timeline precisa ser atualizada.
 
@@ -617,6 +614,54 @@ Consequencias operacionais:
 - `POST /api/events/timeline/rebuild` permite reconstruir manualmente um periodo quando necessario.
 
 O frontend apenas consulta e renderiza a timeline entregue pela API/Core; ele nao deve reimplementar heuristicas de correlacao.
+
+## Scan de inventario e ACL de diretorios
+
+O inventario e executado pelo mesmo agente, mas e um fluxo separado da coleta
+continua de eventos. A configuracao remota `collectDirectoryAcl` controla a
+leitura de permissoes e permanece `false` por padrao.
+
+A calibracao aceita duas listas estruturadas:
+
+- `expectedBroadReadPrincipals`: SIDs ou contas autorizadas somente para
+  leitura ampla;
+- `expectedBroadWritePrincipals`: SIDs ou contas cuja escrita ampla foi
+  formalmente aprovada.
+
+Uma aprovacao de leitura nunca cobre escrita. Quando todas as regras amplas da
+pasta correspondem ao nivel configurado, o item recebe `expected`. A evidencia
+continua no snapshot e nos indicadores, mas sai da fila de risco. Qualquer regra
+adicional nao aprovada volta a elevar a pasta para `attention` ou `critical`.
+
+Quando ativada:
+
+1. o agente enumera arquivos e pastas normalmente;
+2. para cada pasta, le proprietario, protecao de heranca e regras de acesso;
+3. o Core classifica identidades de acesso amplo e o nivel de risco;
+4. a API persiste o resultado junto ao item do snapshot;
+5. o resumo e a investigacao `acl-risk` servem os dados ja materializados ao
+   frontend.
+
+A leitura nao e executada individualmente nos arquivos. Essa escolha reduz o
+custo em compartilhamentos de varios terabytes e ainda cobre o principal
+modelo de administracao NTFS, no qual as permissoes sao herdadas das pastas.
+As traducoes de SID para conta ficam em cache durante a vida do agente.
+
+Identidades amplas reconhecidas inicialmente:
+
+- `S-1-1-0` (`Everyone`);
+- `S-1-5-11` (`Authenticated Users`);
+- `S-1-5-32-545` (`BUILTIN\\Users`);
+- grupos com SID terminado em `-513` (`Domain Users`).
+
+Regras `Deny` nao sao tratadas como exposicao ampla. Escrita ampla gera risco
+critico; leitura ampla ou heranca interrompida gera atencao. Falhas de leitura
+ficam registradas e nao interrompem o restante do scan.
+
+Limite conhecido: esta primeira versao classifica a ACL declarada e nao expande
+recursivamente grupos do Active Directory. A expansao de membros deve ser uma
+etapa posterior e controlada, pois pode elevar muito o custo e exigir uma
+credencial de consulta dedicada.
 
 ## Checklist operacional
 

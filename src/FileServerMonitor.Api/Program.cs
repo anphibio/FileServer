@@ -3665,7 +3665,14 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                         ModifiedUtc,
                         AccessedUtc,
                         StatusName,
-                        ErrorText
+                        ErrorText,
+                        AclCollected,
+                        AclOwner,
+                        AclInheritanceProtected,
+                        AclRiskLevel,
+                        BroadAccessPrincipals,
+                        BroadAccessRights,
+                        AclErrorText
                     )
                     VALUES
                     (
@@ -3686,7 +3693,14 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                         @ModifiedUtc,
                         @AccessedUtc,
                         @StatusName,
-                        @ErrorText
+                        @ErrorText,
+                        @AclCollected,
+                        @AclOwner,
+                        @AclInheritanceProtected,
+                        @AclRiskLevel,
+                        @BroadAccessPrincipals,
+                        @BroadAccessRights,
+                        @AclErrorText
                     );
                     """;
                 AddItemParameters(command, item with { SnapshotId = snapshotId });
@@ -3827,6 +3841,12 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                 predicates.Add("(StatusName <> N'active' OR ErrorText IS NOT NULL)");
                 orderBy = "FullPath ASC";
                 break;
+            case "acl-risk":
+                predicates.Add("ItemType = N'folder'");
+                predicates.Add("StatusName = N'active'");
+                predicates.Add("AclRiskLevel IN (N'critical', N'attention', N'error')");
+                orderBy = "CASE AclRiskLevel WHEN N'critical' THEN 0 WHEN N'error' THEN 1 ELSE 2 END, FullPath ASC";
+                break;
             default:
                 predicates.Add("StatusName = N'active'");
                 break;
@@ -3849,7 +3869,9 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             SELECT TOP (@Take)
                 Id, SnapshotId, ScannedAtUtc, ServerName, ShareName, RootPath, FullPath,
                 RelativePath, ItemName, ItemType, Extension, SizeBytes, Depth,
-                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText
+                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText,
+                AclCollected, AclOwner, AclInheritanceProtected, AclRiskLevel,
+                BroadAccessPrincipals, BroadAccessRights, AclErrorText
             FROM dbo.FileInventoryItems
             WHERE {{string.Join(" AND ", predicates)}}
             ORDER BY {{orderBy}};
@@ -3941,10 +3963,30 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                     AccessedUtc DATETIME2 NULL,
                     StatusName NVARCHAR(32) NOT NULL,
                     ErrorText NVARCHAR(2048) NULL,
+                    AclCollected BIT NOT NULL CONSTRAINT DF_FileInventoryItems_AclCollected DEFAULT 0,
+                    AclOwner NVARCHAR(512) NULL,
+                    AclInheritanceProtected BIT NOT NULL CONSTRAINT DF_FileInventoryItems_AclInheritanceProtected DEFAULT 0,
+                    AclRiskLevel NVARCHAR(32) NOT NULL CONSTRAINT DF_FileInventoryItems_AclRiskLevel DEFAULT N'not_collected',
+                    BroadAccessPrincipals NVARCHAR(2048) NULL,
+                    BroadAccessRights NVARCHAR(2048) NULL,
+                    AclErrorText NVARCHAR(2048) NULL,
                     CONSTRAINT FK_FileInventoryItems_Snapshot
                         FOREIGN KEY (SnapshotId) REFERENCES dbo.FileInventorySnapshots(Id)
                         ON DELETE CASCADE
                 );
+            END;
+
+            IF OBJECT_ID(N'dbo.FileInventoryItems', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.FileInventoryItems', N'AclCollected') IS NULL
+            BEGIN
+                ALTER TABLE dbo.FileInventoryItems ADD
+                    AclCollected BIT NOT NULL CONSTRAINT DF_FileInventoryItems_AclCollected DEFAULT 0 WITH VALUES,
+                    AclOwner NVARCHAR(512) NULL,
+                    AclInheritanceProtected BIT NOT NULL CONSTRAINT DF_FileInventoryItems_AclInheritanceProtected DEFAULT 0 WITH VALUES,
+                    AclRiskLevel NVARCHAR(32) NOT NULL CONSTRAINT DF_FileInventoryItems_AclRiskLevel DEFAULT N'not_collected' WITH VALUES,
+                    BroadAccessPrincipals NVARCHAR(2048) NULL,
+                    BroadAccessRights NVARCHAR(2048) NULL,
+                    AclErrorText NVARCHAR(2048) NULL;
             END;
 
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_FileInventorySnapshots_Latest' AND object_id = OBJECT_ID(N'dbo.FileInventorySnapshots'))
@@ -4076,7 +4118,9 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             SELECT
                 Id, SnapshotId, ScannedAtUtc, ServerName, ShareName, RootPath, FullPath,
                 RelativePath, ItemName, ItemType, Extension, SizeBytes, Depth,
-                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText
+                CreatedUtc, ModifiedUtc, AccessedUtc, StatusName, ErrorText,
+                AclCollected, AclOwner, AclInheritanceProtected, AclRiskLevel,
+                BroadAccessPrincipals, BroadAccessRights, AclErrorText
             FROM dbo.FileInventoryItems
             WHERE SnapshotId = @SnapshotId;
             """;
@@ -4127,7 +4171,13 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                 SUM(CASE WHEN SizeBytes >= 1073741824 THEN 1 ELSE 0 END) AS LargeFileCount,
                 SUM(CASE WHEN SizeBytes >= 1073741824 THEN SizeBytes ELSE 0 END) AS LargeFileBytes,
                 SUM(CASE WHEN Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com') THEN 1 ELSE 0 END) AS ExecutableFileCount,
-                SUM(CASE WHEN Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com') THEN SizeBytes ELSE 0 END) AS ExecutableFileBytes
+                SUM(CASE WHEN Extension IN (N'.exe', N'.msi', N'.dll', N'.ps1', N'.bat', N'.cmd', N'.vbs', N'.js', N'.jar', N'.scr', N'.com') THEN SizeBytes ELSE 0 END) AS ExecutableFileBytes,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclCollected = 1) AS AclCollectedFolderCount,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclRiskLevel = N'error') AS AclErrorFolderCount,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclCollected = 1 AND AclInheritanceProtected = 1) AS InheritanceProtectedFolderCount,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclCollected = 1 AND BroadAccessPrincipals IS NOT NULL) AS BroadAccessFolderCount,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclRiskLevel = N'expected') AS ExpectedAclFolderCount,
+                (SELECT COUNT_BIG(*) FROM dbo.FileInventoryItems WHERE SnapshotId = @SnapshotId AND ItemType = N'folder' AND StatusName = N'active' AND AclRiskLevel = N'critical') AS CriticalAclFolderCount
             FROM ActiveFiles;
 
             WITH ActiveItems AS
@@ -4269,6 +4319,23 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
                AND (Buckets.MaxDays IS NULL OR DATEDIFF(day, ActiveFiles.ReferenceUtc, SYSUTCDATETIME()) <= Buckets.MaxDays)
             GROUP BY Buckets.Label, Buckets.SortOrder
             ORDER BY Buckets.SortOrder;
+
+            SELECT TOP (@Top)
+                FullPath,
+                AclOwner,
+                AclInheritanceProtected,
+                AclRiskLevel,
+                BroadAccessPrincipals,
+                BroadAccessRights,
+                AclErrorText
+            FROM dbo.FileInventoryItems
+            WHERE SnapshotId = @SnapshotId
+              AND ItemType = N'folder'
+              AND StatusName = N'active'
+              AND AclRiskLevel IN (N'critical', N'attention', N'error')
+            ORDER BY
+                CASE AclRiskLevel WHEN N'critical' THEN 0 WHEN N'error' THEN 1 ELSE 2 END,
+                FullPath ASC;
             """;
         command.Parameters.AddWithValue("@SnapshotId", snapshot.Id);
         command.Parameters.AddWithValue("@Top", Math.Clamp(top, 1, 100));
@@ -4297,6 +4364,9 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         await reader.NextResultAsync(cancellationToken);
         var ageBuckets = await ReadAgeBucketsAsync(reader, cancellationToken);
 
+        await reader.NextResultAsync(cancellationToken);
+        var aclRisks = await ReadAclRisksAsync(reader, cancellationToken);
+
         return new FileInventorySummary(
             SnapshotId: snapshot.Id,
             Server: snapshot.Server,
@@ -4322,7 +4392,8 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             Comparison: comparison,
             Insight: FileInventoryAnalyzer.BuildEmptyManagerialInsight(),
             ExecutiveOverview: FileInventoryAnalyzer.BuildEmptyExecutiveOverview(),
-            Recommendations: BuildInventoryRecommendations(snapshot, governance));
+            Recommendations: BuildInventoryRecommendations(snapshot, governance),
+            AclRisks: aclRisks);
     }
 
     private static async Task<FileInventoryGrowthSummary> BuildSqlGrowthSummaryAsync(
@@ -4481,7 +4552,13 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             LargeFileCount: ReadInt64(reader, "LargeFileCount"),
             LargeFileBytes: ReadInt64(reader, "LargeFileBytes"),
             ExecutableFileCount: ReadInt64(reader, "ExecutableFileCount"),
-            ExecutableFileBytes: ReadInt64(reader, "ExecutableFileBytes"));
+            ExecutableFileBytes: ReadInt64(reader, "ExecutableFileBytes"),
+            AclCollectedFolderCount: ReadInt64(reader, "AclCollectedFolderCount"),
+            AclErrorFolderCount: ReadInt64(reader, "AclErrorFolderCount"),
+            InheritanceProtectedFolderCount: ReadInt64(reader, "InheritanceProtectedFolderCount"),
+            BroadAccessFolderCount: ReadInt64(reader, "BroadAccessFolderCount"),
+            ExpectedAclFolderCount: ReadInt64(reader, "ExpectedAclFolderCount"),
+            CriticalAclFolderCount: ReadInt64(reader, "CriticalAclFolderCount"));
     }
 
     private static async Task<IReadOnlyCollection<FileInventoryTopFolder>> ReadTopFoldersAsync(
@@ -4570,6 +4647,26 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         return result;
     }
 
+    private static async Task<IReadOnlyCollection<FileInventoryAclRiskCandidate>> ReadAclRisksAsync(
+        SqlDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<FileInventoryAclRiskCandidate>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(new FileInventoryAclRiskCandidate(
+                Path: reader.GetString(reader.GetOrdinal("FullPath")),
+                Owner: ReadNullableString(reader, "AclOwner"),
+                InheritanceProtected: reader.GetBoolean(reader.GetOrdinal("AclInheritanceProtected")),
+                RiskLevel: reader.GetString(reader.GetOrdinal("AclRiskLevel")),
+                BroadAccessPrincipals: ReadNullableString(reader, "BroadAccessPrincipals"),
+                BroadAccessRights: ReadNullableString(reader, "BroadAccessRights"),
+                Error: ReadNullableString(reader, "AclErrorText")));
+        }
+
+        return result;
+    }
+
     private static IReadOnlyCollection<FileInventoryRecommendation> BuildInventoryRecommendations(
         FileInventorySnapshot snapshot,
         FileInventoryGovernanceMetrics metrics)
@@ -4616,6 +4713,37 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             recommendations.Add(new FileInventoryRecommendation(
                 Title: "Itens sem leitura no scan",
                 Detail: $"{snapshot.ErrorCount:N0} item(ns) nao puderam ser lidos. Revise permissao da conta de scan ou caminhos inacessiveis.",
+                Severity: "warning"));
+        }
+
+        if (metrics.CriticalAclFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas com permissao ampla de escrita",
+                Detail: $"{metrics.CriticalAclFolderCount:N0} pasta(s) permitem alteracao por grupos amplos. Revise o menor privilegio.",
+                Severity: "warning"));
+        }
+        else if (metrics.BroadAccessFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas com acesso amplo",
+                Detail: $"{metrics.BroadAccessFolderCount:N0} pasta(s) concedem acesso a grupos amplos.",
+                Severity: "info"));
+        }
+
+        if (metrics.InheritanceProtectedFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas fora da heranca de permissoes",
+                Detail: $"{metrics.InheritanceProtectedFolderCount:N0} pasta(s) usam ACL protegida e merecem validacao da excecao.",
+                Severity: "info"));
+        }
+
+        if (metrics.AclErrorFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "ACLs sem leitura",
+                Detail: $"{metrics.AclErrorFolderCount:N0} pasta(s) nao tiveram a ACL lida pela conta de scan.",
                 Severity: "warning"));
         }
 
@@ -4682,6 +4810,7 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             "inactive365" or "inactive" or "inativos" => "inactive365",
             "executable" or "executables" or "scripts" or "executaveis" => "executable",
             "errors" or "erros" => "errors",
+            "acl-risk" or "aclrisk" or "permissions" or "permissoes" => "acl-risk",
             _ => "all"
         };
     }
@@ -4717,6 +4846,13 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
         command.Parameters.AddWithValue("@AccessedUtc", DbValue(item.AccessedUtc?.UtcDateTime));
         command.Parameters.AddWithValue("@StatusName", item.Status);
         command.Parameters.AddWithValue("@ErrorText", DbValue(item.Error));
+        command.Parameters.AddWithValue("@AclCollected", item.AclCollected);
+        command.Parameters.AddWithValue("@AclOwner", DbValue(item.AclOwner));
+        command.Parameters.AddWithValue("@AclInheritanceProtected", item.AclInheritanceProtected);
+        command.Parameters.AddWithValue("@AclRiskLevel", item.AclRiskLevel);
+        command.Parameters.AddWithValue("@BroadAccessPrincipals", DbValue(item.BroadAccessPrincipals));
+        command.Parameters.AddWithValue("@BroadAccessRights", DbValue(item.BroadAccessRights));
+        command.Parameters.AddWithValue("@AclErrorText", DbValue(item.AclError));
     }
 
     private static FileInventorySnapshot ReadSnapshot(SqlDataReader reader)
@@ -4756,7 +4892,14 @@ internal sealed class SqlServerInventoryRepository : IInventoryRepository
             ModifiedUtc: ReadDateTimeOffset(reader, "ModifiedUtc"),
             AccessedUtc: ReadDateTimeOffset(reader, "AccessedUtc"),
             Status: reader.GetString(reader.GetOrdinal("StatusName")),
-            Error: ReadNullableString(reader, "ErrorText"));
+            Error: ReadNullableString(reader, "ErrorText"),
+            AclCollected: reader.GetBoolean(reader.GetOrdinal("AclCollected")),
+            AclOwner: ReadNullableString(reader, "AclOwner"),
+            AclInheritanceProtected: reader.GetBoolean(reader.GetOrdinal("AclInheritanceProtected")),
+            AclRiskLevel: reader.GetString(reader.GetOrdinal("AclRiskLevel")),
+            BroadAccessPrincipals: ReadNullableString(reader, "BroadAccessPrincipals"),
+            BroadAccessRights: ReadNullableString(reader, "BroadAccessRights"),
+            AclError: ReadNullableString(reader, "AclErrorText"));
     }
 
     private static DateTimeOffset? ReadDateTimeOffset(SqlDataReader reader, string name)
@@ -4858,7 +5001,7 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            var lease = await TryClaimAsync(cancellationToken);
+            var lease = await TryClaimAsync(cancellationToken, debounce, maxDebounce);
             if (lease is not null)
             {
                 return lease;
@@ -5032,7 +5175,9 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
     }
 
     private async Task<TimelineMaterializationLease?> TryClaimAsync(
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan debounce,
+        TimeSpan maxDebounce)
     {
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -5043,29 +5188,54 @@ internal sealed class SqlServerTimelineMaterializationQueue : ITimelineMateriali
             await RecoverExpiredLeasesAsync(connection, transaction, cancellationToken);
 
             var candidates = new List<TimelineMaterializationJob>();
+            var timings = new Dictionary<Guid, TimelineMaterializationJobTiming>();
             await using (var select = connection.CreateCommand())
             {
                 select.Transaction = transaction;
                 select.CommandText = """
-                    SELECT TOP (@CandidateLimit) Id, FromUtc, ToUtc
+                    SELECT TOP (@CandidateLimit)
+                        Id,
+                        FromUtc,
+                        ToUtc,
+                        CreatedUtc,
+                        AvailableUtc,
+                        CASE WHEN LastError IS NULL THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END AS IsRetry
                     FROM dbo.TimelineMaterializationJobs WITH (UPDLOCK, READPAST, ROWLOCK)
-                    WHERE StatusName = N'pending' AND AvailableUtc <= SYSUTCDATETIME()
+                    WHERE StatusName = N'pending'
                     ORDER BY FromUtc, ToUtc;
                     """;
                 select.Parameters.AddWithValue("@CandidateLimit", CandidateLimit);
                 await using var reader = await select.ExecuteReaderAsync(cancellationToken);
                 while (await reader.ReadAsync(cancellationToken))
                 {
+                    var id = reader.GetGuid(0);
                     candidates.Add(new TimelineMaterializationJob(
-                        reader.GetGuid(0),
+                        id,
                         new TimelineMaterializationWindow(
                             ReadUtc(reader.GetDateTime(1)),
                             ReadUtc(reader.GetDateTime(2)))));
+                    var createdUtc = ReadUtc(reader.GetDateTime(3));
+                    var isRetry = reader.GetBoolean(5);
+                    timings[id] = new TimelineMaterializationJobTiming(
+                        createdUtc,
+                        isRetry
+                            ? ReadUtc(reader.GetDateTime(4))
+                            : createdUtc + debounce,
+                        isRetry);
                 }
             }
 
             var lease = TimelineMaterializationLease.Select(candidates);
             if (lease is null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return null;
+            }
+
+            var readyUtc = TimelineMaterializationDebounce.GetReadyUtc(
+                lease.JobIds.Select(id => timings[id]),
+                maxDebounce);
+            if (DateTimeOffset.UtcNow < readyUtc)
             {
                 await transaction.CommitAsync(cancellationToken);
                 return null;
@@ -6522,6 +6692,10 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
             "errors" => query
                 .Where(item => item.Status != "active" || !string.IsNullOrWhiteSpace(item.Error))
                 .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
+            "acl-risk" => query
+                .Where(item => item.ItemType == "folder" && item.Status == "active" && item.AclRiskLevel is "critical" or "attention" or "error")
+                .OrderBy(item => item.AclRiskLevel switch { "critical" => 0, "error" => 1, _ => 2 })
+                .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase),
             _ => query
                 .Where(item => item.Status == "active")
                 .OrderBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
@@ -6571,6 +6745,7 @@ internal sealed class InMemoryInventoryRepository : IInventoryRepository
             "inactive365" or "inactive" or "inativos" => "inactive365",
             "executable" or "executables" or "scripts" or "executaveis" => "executable",
             "errors" or "erros" => "errors",
+            "acl-risk" or "aclrisk" or "permissions" or "permissoes" => "acl-risk",
             _ => "all"
         };
     }
@@ -9859,6 +10034,9 @@ internal sealed class InventoryScanSettingsStore
             BatchSize: configuration.GetValue<int?>("InventoryScan:BatchSize"),
             MaxItemsPerScan: configuration.GetValue<int?>("InventoryScan:MaxItemsPerScan"),
             IncludeLastAccessTime: configuration.GetValue("InventoryScan:IncludeLastAccessTime", true),
+            CollectDirectoryAcl: configuration.GetValue("InventoryScan:CollectDirectoryAcl", false),
+            ExpectedBroadReadPrincipals: configuration.GetSection("InventoryScan:ExpectedBroadReadPrincipals").Get<string[]>(),
+            ExpectedBroadWritePrincipals: configuration.GetSection("InventoryScan:ExpectedBroadWritePrincipals").Get<string[]>(),
             WindowStartLocal: configuration.GetValue<string>("InventoryScan:WindowStartLocal"),
             WindowEndLocal: configuration.GetValue<string>("InventoryScan:WindowEndLocal"),
             RootPath: configuration.GetValue<string>("InventoryScan:RootPath"),
@@ -9931,6 +10109,9 @@ internal sealed class InventoryScanSettingsStore
             BatchSize: Math.Clamp(request.BatchSize ?? 1000, 100, 2000),
             MaxItemsPerScan: Math.Clamp(request.MaxItemsPerScan ?? 0, 0, 10_000_000),
             IncludeLastAccessTime: request.IncludeLastAccessTime,
+            CollectDirectoryAcl: request.CollectDirectoryAcl,
+            ExpectedBroadReadPrincipals: NormalizePrincipalList(request.ExpectedBroadReadPrincipals),
+            ExpectedBroadWritePrincipals: NormalizePrincipalList(request.ExpectedBroadWritePrincipals),
             WindowStartLocal: request.WindowStartLocal?.Trim() ?? string.Empty,
             WindowEndLocal: request.WindowEndLocal?.Trim() ?? string.Empty,
             RootPath: rootPath,
@@ -9938,6 +10119,16 @@ internal sealed class InventoryScanSettingsStore
             Share: string.IsNullOrWhiteSpace(request.Share) ? "Corporativo" : request.Share.Trim(),
             RunRequestedUtc: request.RunRequestedUtc,
             UpdatedUtc: DateTimeOffset.UtcNow);
+    }
+
+    private static IReadOnlyCollection<string> NormalizePrincipalList(IReadOnlyCollection<string>? values)
+    {
+        return (values ?? Array.Empty<string>())
+            .SelectMany(value => value.Split(new[] { ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Where(value => value.Length is > 0 and <= 256)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(64)
+            .ToArray();
     }
 
 #if SQLSERVER
@@ -9955,6 +10146,9 @@ internal sealed class InventoryScanSettingsStore
                 BatchSize,
                 MaxItemsPerScan,
                 IncludeLastAccessTime,
+                CollectDirectoryAcl,
+                ExpectedBroadReadPrincipals,
+                ExpectedBroadWritePrincipals,
                 WindowStartLocal,
                 WindowEndLocal,
                 RootPath,
@@ -9988,6 +10182,9 @@ internal sealed class InventoryScanSettingsStore
                     BatchSize = @BatchSize,
                     MaxItemsPerScan = @MaxItemsPerScan,
                     IncludeLastAccessTime = @IncludeLastAccessTime,
+                    CollectDirectoryAcl = @CollectDirectoryAcl,
+                    ExpectedBroadReadPrincipals = @ExpectedBroadReadPrincipals,
+                    ExpectedBroadWritePrincipals = @ExpectedBroadWritePrincipals,
                     WindowStartLocal = @WindowStartLocal,
                     WindowEndLocal = @WindowEndLocal,
                     RootPath = @RootPath,
@@ -10004,6 +10201,9 @@ internal sealed class InventoryScanSettingsStore
                     BatchSize,
                     MaxItemsPerScan,
                     IncludeLastAccessTime,
+                    CollectDirectoryAcl,
+                    ExpectedBroadReadPrincipals,
+                    ExpectedBroadWritePrincipals,
                     WindowStartLocal,
                     WindowEndLocal,
                     RootPath,
@@ -10020,6 +10220,9 @@ internal sealed class InventoryScanSettingsStore
                     @BatchSize,
                     @MaxItemsPerScan,
                     @IncludeLastAccessTime,
+                    @CollectDirectoryAcl,
+                    @ExpectedBroadReadPrincipals,
+                    @ExpectedBroadWritePrincipals,
                     @WindowStartLocal,
                     @WindowEndLocal,
                     @RootPath,
@@ -10047,6 +10250,9 @@ internal sealed class InventoryScanSettingsStore
                     BatchSize INT NOT NULL,
                     MaxItemsPerScan INT NOT NULL,
                     IncludeLastAccessTime BIT NOT NULL,
+                    CollectDirectoryAcl BIT NOT NULL CONSTRAINT DF_InventoryScanSettings_CollectDirectoryAcl DEFAULT 0,
+                    ExpectedBroadReadPrincipals NVARCHAR(4000) NOT NULL CONSTRAINT DF_InventoryScanSettings_ExpectedBroadReadPrincipals DEFAULT N'',
+                    ExpectedBroadWritePrincipals NVARCHAR(4000) NOT NULL CONSTRAINT DF_InventoryScanSettings_ExpectedBroadWritePrincipals DEFAULT N'',
                     WindowStartLocal NVARCHAR(16) NOT NULL,
                     WindowEndLocal NVARCHAR(16) NOT NULL,
                     RootPath NVARCHAR(1024) NOT NULL,
@@ -10056,9 +10262,34 @@ internal sealed class InventoryScanSettingsStore
                     RunRequestedUtc DATETIME2(3) NULL
                 );
             END;
-            ELSE IF COL_LENGTH(N'dbo.InventoryScanSettings', N'RunRequestedUtc') IS NULL
+            IF OBJECT_ID(N'dbo.InventoryScanSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.InventoryScanSettings', N'RunRequestedUtc') IS NULL
             BEGIN
                 ALTER TABLE dbo.InventoryScanSettings ADD RunRequestedUtc DATETIME2(3) NULL;
+            END;
+
+            IF OBJECT_ID(N'dbo.InventoryScanSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.InventoryScanSettings', N'CollectDirectoryAcl') IS NULL
+            BEGIN
+                ALTER TABLE dbo.InventoryScanSettings
+                    ADD CollectDirectoryAcl BIT NOT NULL
+                        CONSTRAINT DF_InventoryScanSettings_CollectDirectoryAcl DEFAULT 0 WITH VALUES;
+            END;
+
+            IF OBJECT_ID(N'dbo.InventoryScanSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.InventoryScanSettings', N'ExpectedBroadReadPrincipals') IS NULL
+            BEGIN
+                ALTER TABLE dbo.InventoryScanSettings
+                    ADD ExpectedBroadReadPrincipals NVARCHAR(4000) NOT NULL
+                        CONSTRAINT DF_InventoryScanSettings_ExpectedBroadReadPrincipals DEFAULT N'' WITH VALUES;
+            END;
+
+            IF OBJECT_ID(N'dbo.InventoryScanSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.InventoryScanSettings', N'ExpectedBroadWritePrincipals') IS NULL
+            BEGIN
+                ALTER TABLE dbo.InventoryScanSettings
+                    ADD ExpectedBroadWritePrincipals NVARCHAR(4000) NOT NULL
+                        CONSTRAINT DF_InventoryScanSettings_ExpectedBroadWritePrincipals DEFAULT N'' WITH VALUES;
             END;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -10081,6 +10312,9 @@ internal sealed class InventoryScanSettingsStore
         command.Parameters.AddWithValue("@BatchSize", settings.BatchSize);
         command.Parameters.AddWithValue("@MaxItemsPerScan", settings.MaxItemsPerScan);
         command.Parameters.AddWithValue("@IncludeLastAccessTime", settings.IncludeLastAccessTime);
+        command.Parameters.AddWithValue("@CollectDirectoryAcl", settings.CollectDirectoryAcl);
+        command.Parameters.AddWithValue("@ExpectedBroadReadPrincipals", string.Join(';', settings.ExpectedBroadReadPrincipals));
+        command.Parameters.AddWithValue("@ExpectedBroadWritePrincipals", string.Join(';', settings.ExpectedBroadWritePrincipals));
         command.Parameters.AddWithValue("@WindowStartLocal", settings.WindowStartLocal);
         command.Parameters.AddWithValue("@WindowEndLocal", settings.WindowEndLocal);
         command.Parameters.AddWithValue("@RootPath", settings.RootPath);
@@ -10098,6 +10332,9 @@ internal sealed class InventoryScanSettingsStore
             BatchSize: reader.GetInt32(reader.GetOrdinal("BatchSize")),
             MaxItemsPerScan: reader.GetInt32(reader.GetOrdinal("MaxItemsPerScan")),
             IncludeLastAccessTime: reader.GetBoolean(reader.GetOrdinal("IncludeLastAccessTime")),
+            CollectDirectoryAcl: reader.GetBoolean(reader.GetOrdinal("CollectDirectoryAcl")),
+            ExpectedBroadReadPrincipals: NormalizePrincipalList(new[] { reader.GetString(reader.GetOrdinal("ExpectedBroadReadPrincipals")) }),
+            ExpectedBroadWritePrincipals: NormalizePrincipalList(new[] { reader.GetString(reader.GetOrdinal("ExpectedBroadWritePrincipals")) }),
             WindowStartLocal: reader.GetString(reader.GetOrdinal("WindowStartLocal")),
             WindowEndLocal: reader.GetString(reader.GetOrdinal("WindowEndLocal")),
             RootPath: reader.GetString(reader.GetOrdinal("RootPath")),
@@ -13180,6 +13417,9 @@ internal sealed record InventoryScanOptions(
     int BatchSize,
     int MaxItemsPerScan,
     bool IncludeLastAccessTime,
+    bool CollectDirectoryAcl,
+    IReadOnlyCollection<string> ExpectedBroadReadPrincipals,
+    IReadOnlyCollection<string> ExpectedBroadWritePrincipals,
     string WindowStartLocal,
     string WindowEndLocal,
     string RootPath,
@@ -13194,6 +13434,9 @@ internal sealed record InventoryScanSettingsRequest(
     int? BatchSize,
     int? MaxItemsPerScan,
     bool IncludeLastAccessTime,
+    bool CollectDirectoryAcl,
+    IReadOnlyCollection<string>? ExpectedBroadReadPrincipals,
+    IReadOnlyCollection<string>? ExpectedBroadWritePrincipals,
     string? WindowStartLocal,
     string? WindowEndLocal,
     string? RootPath,
@@ -13207,6 +13450,9 @@ internal sealed record InventoryScanSettingsResponse(
     int BatchSize,
     int MaxItemsPerScan,
     bool IncludeLastAccessTime,
+    bool CollectDirectoryAcl,
+    IReadOnlyCollection<string> ExpectedBroadReadPrincipals,
+    IReadOnlyCollection<string> ExpectedBroadWritePrincipals,
     string WindowStartLocal,
     string WindowEndLocal,
     string RootPath,
@@ -13223,6 +13469,9 @@ internal sealed record InventoryScanSettingsResponse(
             settings.BatchSize,
             settings.MaxItemsPerScan,
             settings.IncludeLastAccessTime,
+            settings.CollectDirectoryAcl,
+            settings.ExpectedBroadReadPrincipals,
+            settings.ExpectedBroadWritePrincipals,
             settings.WindowStartLocal,
             settings.WindowEndLocal,
             settings.RootPath,
@@ -13356,7 +13605,14 @@ internal sealed record InventoryItemRequest(
     DateTimeOffset? CreatedUtc,
     DateTimeOffset? ModifiedUtc,
     DateTimeOffset? AccessedUtc,
-    string? Error)
+    string? Error,
+    bool AclCollected = false,
+    string? AclOwner = null,
+    bool AclInheritanceProtected = false,
+    string? AclRiskLevel = null,
+    string? BroadAccessPrincipals = null,
+    string? BroadAccessRights = null,
+    string? AclError = null)
 {
     public FileInventoryItem ToInventoryItem(Guid snapshotId)
     {
@@ -13374,7 +13630,14 @@ internal sealed record InventoryItemRequest(
             CreatedUtc: CreatedUtc,
             ModifiedUtc: ModifiedUtc,
             AccessedUtc: AccessedUtc,
-            Error: Error));
+            Error: Error,
+            AclCollected: AclCollected,
+            AclOwner: AclOwner,
+            AclInheritanceProtected: AclInheritanceProtected,
+            AclRiskLevel: AclRiskLevel,
+            BroadAccessPrincipals: BroadAccessPrincipals,
+            BroadAccessRights: BroadAccessRights,
+            AclError: AclError));
     }
 }
 

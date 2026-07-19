@@ -16,7 +16,14 @@ public sealed record FileInventoryItemInput(
     DateTimeOffset? CreatedUtc,
     DateTimeOffset? ModifiedUtc,
     DateTimeOffset? AccessedUtc,
-    string? Error);
+    string? Error,
+    bool AclCollected = false,
+    string? AclOwner = null,
+    bool AclInheritanceProtected = false,
+    string? AclRiskLevel = null,
+    string? BroadAccessPrincipals = null,
+    string? BroadAccessRights = null,
+    string? AclError = null);
 
 public sealed record FileInventoryItem(
     Guid Id,
@@ -36,7 +43,14 @@ public sealed record FileInventoryItem(
     DateTimeOffset? ModifiedUtc,
     DateTimeOffset? AccessedUtc,
     string Status,
-    string? Error);
+    string? Error,
+    bool AclCollected = false,
+    string? AclOwner = null,
+    bool AclInheritanceProtected = false,
+    string AclRiskLevel = "not_collected",
+    string? BroadAccessPrincipals = null,
+    string? BroadAccessRights = null,
+    string? AclError = null);
 
 public sealed record FileInventorySnapshot(
     Guid Id,
@@ -77,7 +91,8 @@ public sealed record FileInventorySummary(
     FileInventoryCycleComparison Comparison,
     FileInventoryManagerialInsight Insight,
     FileInventoryExecutiveOverview ExecutiveOverview,
-    IReadOnlyCollection<FileInventoryRecommendation> Recommendations);
+    IReadOnlyCollection<FileInventoryRecommendation> Recommendations,
+    IReadOnlyCollection<FileInventoryAclRiskCandidate> AclRisks);
 
 public sealed record FileInventoryGovernanceMetrics(
     long Inactive180DaysFileCount,
@@ -89,7 +104,22 @@ public sealed record FileInventoryGovernanceMetrics(
     long LargeFileCount,
     long LargeFileBytes,
     long ExecutableFileCount,
-    long ExecutableFileBytes);
+    long ExecutableFileBytes,
+    long AclCollectedFolderCount = 0,
+    long AclErrorFolderCount = 0,
+    long InheritanceProtectedFolderCount = 0,
+    long BroadAccessFolderCount = 0,
+    long ExpectedAclFolderCount = 0,
+    long CriticalAclFolderCount = 0);
+
+public sealed record FileInventoryAclRiskCandidate(
+    string Path,
+    string? Owner,
+    bool InheritanceProtected,
+    string RiskLevel,
+    string? BroadAccessPrincipals,
+    string? BroadAccessRights,
+    string? Error);
 
 public sealed record FileInventoryTopFolder(string Path, long FileCount, long FolderCount, long TotalBytes);
 
@@ -219,7 +249,14 @@ public static class FileInventoryNormalizer
             ModifiedUtc: input.ModifiedUtc,
             AccessedUtc: input.AccessedUtc,
             Status: string.IsNullOrWhiteSpace(input.Error) ? "active" : "error",
-            Error: string.IsNullOrWhiteSpace(input.Error) ? null : input.Error.Trim());
+            Error: string.IsNullOrWhiteSpace(input.Error) ? null : input.Error.Trim(),
+            AclCollected: itemType == "folder" && input.AclCollected && string.IsNullOrWhiteSpace(input.AclError),
+            AclOwner: NormalizeOptionalText(input.AclOwner),
+            AclInheritanceProtected: itemType == "folder" && input.AclInheritanceProtected,
+            AclRiskLevel: NormalizeAclRiskLevel(itemType, input.AclCollected, input.AclRiskLevel, input.AclError),
+            BroadAccessPrincipals: NormalizeOptionalText(input.BroadAccessPrincipals),
+            BroadAccessRights: NormalizeOptionalText(input.BroadAccessRights),
+            AclError: NormalizeOptionalText(input.AclError));
     }
 
     public static string NormalizePath(string? path)
@@ -238,6 +275,33 @@ public static class FileInventoryNormalizer
     private static string NormalizeText(string? value, string fallback)
     {
         return string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+    }
+
+    private static string? NormalizeOptionalText(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    }
+
+    private static string NormalizeAclRiskLevel(string itemType, bool collected, string? riskLevel, string? error)
+    {
+        if (itemType != "folder")
+        {
+            return "not_collected";
+        }
+
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            return "error";
+        }
+
+        if (!collected)
+        {
+            return "not_collected";
+        }
+
+        return riskLevel?.Trim().ToLowerInvariant() is "clear" or "expected" or "attention" or "critical"
+            ? riskLevel.Trim().ToLowerInvariant()
+            : "clear";
     }
 
     private static string NormalizeRelativePath(string? relativePath, string path, string rootPath)
@@ -326,7 +390,7 @@ public static class FileInventoryAnalyzer
             FolderCount: snapshot?.FolderCount ?? folders.LongLength,
             TotalBytes: snapshot?.TotalBytes ?? files.Sum(item => item.SizeBytes),
             ErrorCount: snapshot?.ErrorCount ?? items.LongCount(item => item.Status == "error"),
-            Governance: BuildGovernanceMetrics(files, currentNow),
+            Governance: BuildGovernanceMetrics(files, folders, currentNow),
             TopFolders: BuildTopFolders(items, safeTop),
             TopExtensions: BuildTopExtensions(files, safeTop),
             ContentCategories: BuildContentCategories(files),
@@ -339,7 +403,8 @@ public static class FileInventoryAnalyzer
             Comparison: BuildEmptyCycleComparison(),
             Insight: BuildEmptyManagerialInsight(),
             ExecutiveOverview: BuildEmptyExecutiveOverview(),
-            Recommendations: BuildRecommendations(snapshot, items, files, currentNow));
+            Recommendations: BuildRecommendations(snapshot, items, files, folders, currentNow),
+            AclRisks: BuildAclRisks(folders, safeTop));
     }
 
     public static FileInventoryGrowthSummary BuildGrowthSummary(
@@ -905,6 +970,7 @@ public static class FileInventoryAnalyzer
 
     private static FileInventoryGovernanceMetrics BuildGovernanceMetrics(
         IReadOnlyCollection<FileInventoryItem> files,
+        IReadOnlyCollection<FileInventoryItem> folders,
         DateTimeOffset nowUtc)
     {
         var inactive180 = files.Where(item => IsInactiveForDays(item, nowUtc, 180)).ToArray();
@@ -923,7 +989,38 @@ public static class FileInventoryAnalyzer
             LargeFileCount: largeFiles.LongLength,
             LargeFileBytes: largeFiles.Sum(item => item.SizeBytes),
             ExecutableFileCount: executableFiles.LongLength,
-            ExecutableFileBytes: executableFiles.Sum(item => item.SizeBytes));
+            ExecutableFileBytes: executableFiles.Sum(item => item.SizeBytes),
+            AclCollectedFolderCount: folders.LongCount(item => item.AclCollected),
+            AclErrorFolderCount: folders.LongCount(item => item.AclRiskLevel == "error"),
+            InheritanceProtectedFolderCount: folders.LongCount(item => item.AclCollected && item.AclInheritanceProtected),
+            BroadAccessFolderCount: folders.LongCount(item => item.AclCollected && !string.IsNullOrWhiteSpace(item.BroadAccessPrincipals)),
+            ExpectedAclFolderCount: folders.LongCount(item => item.AclRiskLevel == "expected"),
+            CriticalAclFolderCount: folders.LongCount(item => item.AclRiskLevel == "critical"));
+    }
+
+    private static IReadOnlyCollection<FileInventoryAclRiskCandidate> BuildAclRisks(
+        IReadOnlyCollection<FileInventoryItem> folders,
+        int top)
+    {
+        return folders
+            .Where(item => item.AclRiskLevel is "critical" or "attention" or "error")
+            .OrderBy(item => item.AclRiskLevel switch
+            {
+                "critical" => 0,
+                "error" => 1,
+                _ => 2
+            })
+            .ThenBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
+            .Take(Math.Clamp(top, 1, 100))
+            .Select(item => new FileInventoryAclRiskCandidate(
+                Path: item.Path,
+                Owner: item.AclOwner,
+                InheritanceProtected: item.AclInheritanceProtected,
+                RiskLevel: item.AclRiskLevel,
+                BroadAccessPrincipals: item.BroadAccessPrincipals,
+                BroadAccessRights: item.BroadAccessRights,
+                Error: item.AclError))
+            .ToArray();
     }
 
     private static bool IsExecutableOrScriptExtension(string? extension)
@@ -940,10 +1037,11 @@ public static class FileInventoryAnalyzer
         FileInventorySnapshot? snapshot,
         IReadOnlyCollection<FileInventoryItem> items,
         IReadOnlyCollection<FileInventoryItem> files,
+        IReadOnlyCollection<FileInventoryItem> folders,
         DateTimeOffset nowUtc)
     {
         var recommendations = new List<FileInventoryRecommendation>();
-        var metrics = BuildGovernanceMetrics(files, nowUtc);
+        var metrics = BuildGovernanceMetrics(files, folders, nowUtc);
         var errorCount = snapshot?.ErrorCount ?? items.LongCount(item => item.Status == "error");
         var totalBytes = snapshot?.TotalBytes ?? files.Sum(item => item.SizeBytes);
         var inactive365Percent = totalBytes == 0 ? 0 : metrics.Inactive365DaysBytes * 100m / totalBytes;
@@ -986,6 +1084,37 @@ public static class FileInventoryAnalyzer
             recommendations.Add(new FileInventoryRecommendation(
                 Title: "Itens sem leitura no scan",
                 Detail: $"{errorCount:N0} item(ns) nao puderam ser lidos. Revise permissao da conta de scan ou caminhos inacessiveis.",
+                Severity: "warning"));
+        }
+
+        if (metrics.CriticalAclFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas com permissao ampla de escrita",
+                Detail: $"{metrics.CriticalAclFolderCount:N0} pasta(s) permitem alteracao por grupos amplos. Valide necessidade e reduza o acesso ao menor privilegio.",
+                Severity: "warning"));
+        }
+        else if (metrics.BroadAccessFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas com acesso amplo",
+                Detail: $"{metrics.BroadAccessFolderCount:N0} pasta(s) possuem leitura ou execucao concedida a grupos amplos.",
+                Severity: "info"));
+        }
+
+        if (metrics.InheritanceProtectedFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "Pastas fora da heranca de permissoes",
+                Detail: $"{metrics.InheritanceProtectedFolderCount:N0} pasta(s) usam ACL protegida. Confirme se a excecao continua justificada.",
+                Severity: "info"));
+        }
+
+        if (metrics.AclErrorFolderCount > 0)
+        {
+            recommendations.Add(new FileInventoryRecommendation(
+                Title: "ACLs sem leitura",
+                Detail: $"{metrics.AclErrorFolderCount:N0} pasta(s) nao tiveram a ACL lida. Revise a conta e os privilegios usados pelo scan.",
                 Severity: "warning"));
         }
 

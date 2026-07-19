@@ -325,6 +325,45 @@ Para evoluir a camada gerencial do produto, consulte tambem:
 - [Blueprint inspirado no Varonis](./docs/varonis-file-server-monitor-blueprint.md)
 - [Modelo de relatorio QBR](./docs/modelo-relatorio-qbr-file-server-monitor.md)
 
+## Inventario e Governanca de Permissoes
+
+O scan gerencial pode coletar, de forma opcional, o proprietario e a ACL das
+pastas. A coleta e feita apenas em diretorios para evitar uma leitura de
+permissoes por arquivo em estruturas com milhoes de itens.
+
+Configuracao remota:
+
+```text
+collectDirectoryAcl=true
+expectedBroadReadPrincipals=["S-1-5-11"]
+expectedBroadWritePrincipals=[]
+```
+
+Quando habilitada, a API persiste o proprietario, o estado da heranca, as
+identidades de acesso amplo, os direitos encontrados e eventuais falhas de
+leitura. A aba `Inventario > Risco` apresenta os totais e as pastas
+prioritarias para revisao.
+
+Classificacao inicial:
+
+- `critico`: `Everyone`, `Authenticated Users`, `BUILTIN\\Users` ou
+  `Domain Users` com escrita, alteracao ou controle total;
+- `atencao`: acesso amplo somente de leitura ou heranca interrompida;
+- `sem risco`: ACL coletada sem os sinais anteriores;
+- `erro`: a ACL nao pode ser lida.
+
+As listas esperadas sao uma calibracao explicita da politica do
+compartilhamento. Leitura e escrita sao configuradas separadamente; uma
+identidade aprovada apenas para leitura continua critica se receber escrita.
+ACLs cobertas pela politica recebem o estado `esperado`: permanecem
+persistidas e contabilizadas, mas nao entram na fila de risco.
+
+A opcao vem desligada por padrao. Antes de expandir para todos os
+compartilhamentos, valide a conta do servico, a conectividade com o dominio e
+o tempo do scan em uma arvore representativa. O agente mantem em cache a
+traducao SID para conta durante o processo para nao consultar repetidamente o
+Active Directory.
+
 ## Autenticacao Inicial
 
 A API suporta uma protecao inicial por API key. Em desenvolvimento ela vem desligada.
@@ -403,7 +442,7 @@ O agente fica em:
 src/FileServerMonitor.Agent
 ```
 
-Ele executa em loop, chama o script PowerShell de coleta, envia eventos para `/api/events/batch` e envia heartbeat para `/api/agents/heartbeat`.
+Ele executa coleta, entrega e heartbeat em fluxos independentes. A coleta chama os scripts PowerShell e persiste os eventos localmente antes de avancar os cursores; a entrega drena a fila para `/api/events/batch`; e o heartbeat continua atualizando `/api/agents/heartbeat` mesmo quando USN, Security Log ou API estao lentos.
 
 Configuracao principal:
 
@@ -417,8 +456,12 @@ Campos importantes:
 - `server`: nome do Windows Server.
 - `apiBaseUrl`: URL da API central.
 - `pollIntervalSeconds`: intervalo de coleta.
+- `heartbeatIntervalSeconds`: intervalo independente do heartbeat.
+- `heartbeatRequestTimeoutSeconds`: timeout curto e exclusivo do heartbeat.
 - `batchSize`: quantidade maxima de eventos por lote.
 - `queueFlushMaxEventsPerCycle`: teto de eventos pendentes enviados em cada ciclo. O agente usa fila em streaming para não carregar a fila inteira na memória durante picos.
+- `queueRetrySeconds`: espera antes de repetir um lote quando a API nao confirma a entrega.
+- `queueDrainPauseMilliseconds`: pausa cooperativa entre blocos de drenagem para nao monopolizar CPU ou rede.
 - `enableSecurityLogCollector`: ativa coleta do Windows Security Log.
 - `enableUsnJournalCollector`: ativa coleta do USN Journal.
 - `enableCorrelation`: ativa enriquecimento de eventos USN com dados do Security Log.
@@ -440,6 +483,8 @@ Coleta avancada:
 - Security Log identifica melhor quem fez a acao.
 - USN Journal detecta mudancas no volume NTFS com mais eficiencia em ambientes grandes.
 - O agente mantem `LastRecordId` para Security Log e `LastUsnByVolume` para cada volume.
+- A fila usa um cursor lateral (`.cursor`), confirma cada lote e evita reescrever todo o arquivo quando existe backlog. Se houver parada entre a confirmacao da API e o cursor local, a API ignora a eventual repeticao pela identidade estavel do evento.
+- Na API, lotes sobrepostos sao consolidados por uma janela movel de silencio antes da materializacao. O Core indexa evidencias por caminho para manter rajadas de arquivos independentes com custo previsivel, preservando contexto amplo para transicoes de pastas e descendentes.
 - No primeiro piloto, mantenha `enableUsnJournalCollector` como `false`, valide Security Log e depois habilite USN em um volume controlado.
 
 Correlacao:

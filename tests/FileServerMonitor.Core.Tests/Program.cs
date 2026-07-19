@@ -82,6 +82,9 @@ var tests = new (string Name, Action Test)[]
     ("timeline remove permissao ecoada durante exclusao", TimelineSuppressesPermissionEchoDuringDelete),
     ("timeline preserva lote misto paralelo sem ruido cruzado", TimelineKeepsLongMixedParallelBatchStable),
     ("timeline preserva contagem em lote misto de maior volume", TimelineKeepsMassMixedBatchCountsStable),
+    ("timeline projeta rajada de dois mil arquivos em tempo previsivel", TimelineProjectsTwoThousandFileBurstPredictably),
+    ("timeline projeta mil ciclos de criacao e exclusao em tempo previsivel", TimelineProjectsOneThousandCreateDeleteCyclesPredictably),
+    ("timeline preserva exclusao em massa sem cruzar fallback ambiguo do security log", TimelineKeepsMassDeletionWithoutAmbiguousSecurityFallback),
     ("timeline remove modified imediato depois de criacao confirmada", TimelineSuppressesImmediateSecurityModifyAfterConfirmedCreate),
     ("timeline preserva alteracao real depois de criacao antes de exclusao", TimelineKeepsRealModificationAfterCreateBeforeDelete),
     ("timeline preserva acesso real depois de criacao antes de move", TimelineKeepsRealAccessAfterCreateBeforeMove),
@@ -91,6 +94,10 @@ var tests = new (string Name, Action Test)[]
     ("fila duravel descarrega apenas o limite mantendo a ordem", DurableQueueFlushesWithinLimitAndPreservesOrder),
     ("fila duravel preserva lote quando o envio falha", DurableQueuePreservesUnsentBatchAfterFailure),
     ("fila duravel planeja drenagem pelo lote real da API", DurableQueuePlansDrainByApiBatch),
+    ("fila com cursor drena sem reescrever o backlog", CheckpointedQueueDrainsWithoutRewritingBacklog),
+    ("fila com cursor retoma exatamente no lote que falhou", CheckpointedQueueRetriesFailedBatch),
+    ("fila com cursor mantem custo previsivel em cem mil eventos", CheckpointedQueueScalesToOneHundredThousandLines),
+    ("agendamento do agente nao soma espera depois de coleta lenta", AgentPollingScheduleAvoidsExtraDelayAfterSlowCollection),
     ("arquivo frio compacta lote e registra hash verificavel", ColdArchiveWritesCompressedBatchWithVerifiableHash),
     ("arquivo frio le lote somente quando manifesto confere", ColdArchiveReadsBatchWhenManifestMatches),
     ("arquivo frio recusa restauracao quando hash diverge", ColdArchiveRejectsRestoreWhenHashDiffers),
@@ -99,10 +106,15 @@ var tests = new (string Name, Action Test)[]
     ("materializacao mantem janelas distantes em trabalhos separados", TimelineMaterializationKeepsDistantWindowsSeparate),
     ("materializacao preserva sinal recebido depois do periodo silencioso", TimelineMaterializationPreservesSignalAfterQuietPeriod),
     ("fila de materializacao seleciona cadeia sobreposta sem engolir janela distante", TimelineMaterializationLeaseSelectionKeepsDistantWorkPending),
+    ("fila de materializacao aguarda silencio mas limita espera da rajada", TimelineMaterializationDebounceWaitsForQuietWithMaximumDelay),
     ("fila de materializacao calcula janela de ingestao com margem", TimelineMaterializationBuildsIngestionWindowWithPadding),
     ("saude da fila de materializacao distingue fluxo normal atraso e bloqueio", TimelineMaterializationClassifiesQueueHealth),
     ("inventario normaliza item de arquivo e pasta", InventoryNormalizesFileAndFolderItems),
     ("inventario calcula resumo gerencial", InventoryBuildsGovernanceSummary),
+    ("inventario classifica exposicao ampla de ACL", InventoryClassifiesBroadAclExposure),
+    ("inventario calibra ACL ampla somente quando a politica aprova o direito", InventoryCalibratesExpectedBroadAclByRight),
+    ("inventario distingue heranca protegida e falha de leitura de ACL", InventoryClassifiesAclInheritanceAndReadFailure),
+    ("inventario resume riscos de ACL por pasta", InventoryBuildsAclGovernanceSummary),
     ("inventario cruza uso real observado por pasta e usuario", InventoryBuildsObservedActivitySummary),
     ("inventario calcula crescimento entre snapshots", InventoryBuildsGrowthSummary),
     ("inventario calcula comparacao e insight gerencial", InventoryBuildsManagerialInsight)
@@ -558,6 +570,159 @@ static void DurableQueuePlansDrainByApiBatch()
     Assert(capped.MaxLines == 3_000, "O limite absoluto de eventos deveria prevalecer.");
 }
 
+static void CheckpointedQueueDrainsWithoutRewritingBacklog()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"fsm-checkpoint-queue-{Guid.NewGuid():N}.ndjson");
+    try
+    {
+        CheckpointedLineQueue.AppendAsync(path, new[] { "one", "two", "three", "four", "five" }, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        var sent = new List<string>();
+
+        var first = CheckpointedLineQueue.FlushAsync(
+                path,
+                batchSize: 2,
+                maxLines: 3,
+                (batch, _) =>
+                {
+                    sent.AddRange(batch);
+                    return Task.FromResult(true);
+                },
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+
+        Assert(first.SentLines == 3, "A primeira drenagem deveria respeitar o limite configurado.");
+        Assert(CheckpointedLineQueue.CountPendingLines(path) == 2, "Duas linhas deveriam permanecer pendentes.");
+        Assert(!first.Completed, "A fila ainda deveria possuir dados pendentes.");
+        Assert(sent.SequenceEqual(new[] { "one", "two", "three" }), "A fila deveria preservar a ordem FIFO.");
+        Assert(File.ReadAllLines(path).Length == 5, "A drenagem parcial nao deveria reescrever o arquivo inteiro.");
+
+        CheckpointedLineQueue.AppendAsync(path, new[] { "six" }, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        Assert(CheckpointedLineQueue.CountPendingLines(path) == 3, "O contador deveria considerar o cursor e novos appends.");
+
+        sent.Clear();
+        var second = CheckpointedLineQueue.FlushAsync(
+                path,
+                batchSize: 10,
+                maxLines: 10,
+                (batch, _) =>
+                {
+                    sent.AddRange(batch);
+                    return Task.FromResult(true);
+                },
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+
+        Assert(second.Completed, "A segunda drenagem deveria concluir a fila.");
+        Assert(CheckpointedLineQueue.CountPendingLines(path) == 0, "Nao deveria restar backlog.");
+        Assert(sent.SequenceEqual(new[] { "four", "five", "six" }), "A retomada deveria iniciar depois do cursor confirmado.");
+        Assert(!File.Exists(path), "A fila vazia deveria remover o arquivo de dados.");
+    }
+    finally
+    {
+        CheckpointedLineQueue.Delete(path);
+    }
+}
+
+static void CheckpointedQueueRetriesFailedBatch()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"fsm-checkpoint-queue-{Guid.NewGuid():N}.ndjson");
+    try
+    {
+        CheckpointedLineQueue.AppendAsync(path, new[] { "one", "two", "three", "four" }, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        var attempts = 0;
+
+        var first = CheckpointedLineQueue.FlushAsync(
+                path,
+                batchSize: 2,
+                maxLines: 4,
+                (_, _) => Task.FromResult(++attempts < 2),
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+
+        Assert(first.SentLines == 2, "Somente o lote confirmado deveria avancar o cursor.");
+        Assert(CheckpointedLineQueue.CountPendingLines(path) == 2, "O lote rejeitado deveria permanecer pendente.");
+
+        var retried = new List<string>();
+        var second = CheckpointedLineQueue.FlushAsync(
+                path,
+                batchSize: 2,
+                maxLines: 4,
+                (batch, _) =>
+                {
+                    retried.AddRange(batch);
+                    return Task.FromResult(true);
+                },
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+
+        Assert(second.Completed, "A repeticao deveria concluir a fila.");
+        Assert(retried.SequenceEqual(new[] { "three", "four" }), "Somente o lote nao confirmado deveria ser reenviado.");
+    }
+    finally
+    {
+        CheckpointedLineQueue.Delete(path);
+    }
+}
+
+static void CheckpointedQueueScalesToOneHundredThousandLines()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"fsm-checkpoint-load-{Guid.NewGuid():N}.ndjson");
+    try
+    {
+        const int total = 100_000;
+        CheckpointedLineQueue.AppendAsync(
+                path,
+                Enumerable.Range(1, total).Select(index => $"{{\"id\":{index}}}"),
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        var originalLength = new FileInfo(path).Length;
+        var stopwatch = Stopwatch.StartNew();
+
+        var result = CheckpointedLineQueue.FlushAsync(
+                path,
+                batchSize: 1_000,
+                maxLines: 10_000,
+                (_, _) => Task.FromResult(true),
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        stopwatch.Stop();
+
+        Assert(result.SentLines == 10_000, "A drenagem deveria confirmar dez lotes de mil eventos.");
+        Assert(CheckpointedLineQueue.CountPendingLines(path) == 90_000, "Noventa mil eventos deveriam permanecer pendentes.");
+        Assert(new FileInfo(path).Length == originalLength, "O backlog nao deveria ser reescrito durante a drenagem parcial.");
+        Console.WriteLine($"METRIC fila-cursor-100000-drena-10000={stopwatch.ElapsedMilliseconds}ms");
+    }
+    finally
+    {
+        CheckpointedLineQueue.Delete(path);
+    }
+}
+
+static void AgentPollingScheduleAvoidsExtraDelayAfterSlowCollection()
+{
+    var regular = AgentPollingSchedule.CalculateDelay(
+        TimeSpan.FromSeconds(15),
+        TimeSpan.FromSeconds(4));
+    var catchingUp = AgentPollingSchedule.CalculateDelay(
+        TimeSpan.FromSeconds(15),
+        TimeSpan.FromSeconds(25));
+
+    Assert(regular == TimeSpan.FromSeconds(11), "O ciclo rapido deveria aguardar apenas o restante do intervalo.");
+    Assert(catchingUp == TimeSpan.FromMilliseconds(100), "O ciclo atrasado deveria recomecar apos uma breve cedencia.");
+}
+
 static void TimelineMaterializationCoalescesConcurrentWindows()
 {
     var coordinator = new TimelineMaterializationCoordinator();
@@ -659,6 +824,32 @@ static void TimelineMaterializationLeaseSelectionKeepsDistantWorkPending()
     Assert(!lease.JobIds.Contains(distantId), "Uma janela distante nao deve ampliar desnecessariamente o recorte de correlacao.");
 }
 
+static void TimelineMaterializationDebounceWaitsForQuietWithMaximumDelay()
+{
+    var start = new DateTimeOffset(2026, 7, 19, 8, 0, 0, TimeSpan.Zero);
+    var jobs = new[]
+    {
+        new TimelineMaterializationJobTiming(start, start.AddSeconds(10), IsRetry: false),
+        new TimelineMaterializationJobTiming(start.AddSeconds(8), start.AddSeconds(18), IsRetry: false),
+        new TimelineMaterializationJobTiming(start.AddSeconds(19), start.AddSeconds(29), IsRetry: false)
+    };
+
+    var readyUtc = TimelineMaterializationDebounce.GetReadyUtc(jobs, TimeSpan.FromSeconds(30));
+    Assert(readyUtc == start.AddSeconds(29), "Uma rajada curta deve aguardar o periodo de silencio do ultimo lote.");
+
+    var sustained = jobs.Append(
+        new TimelineMaterializationJobTiming(start.AddSeconds(28), start.AddSeconds(38), IsRetry: false));
+    readyUtc = TimelineMaterializationDebounce.GetReadyUtc(sustained, TimeSpan.FromSeconds(30));
+    Assert(readyUtc == start.AddSeconds(30), "Uma rajada continua deve respeitar o limite maximo desde o primeiro lote.");
+
+    var retry = new[]
+    {
+        new TimelineMaterializationJobTiming(start, start.AddMinutes(2), IsRetry: true)
+    };
+    readyUtc = TimelineMaterializationDebounce.GetReadyUtc(retry, TimeSpan.FromSeconds(30));
+    Assert(readyUtc == start.AddMinutes(2), "O limite da rajada nao pode antecipar um retry explicitamente adiado.");
+}
+
 static void TimelineMaterializationBuildsIngestionWindowWithPadding()
 {
     var start = new DateTimeOffset(2026, 7, 19, 7, 0, 0, TimeSpan.Zero);
@@ -732,7 +923,9 @@ static void InventoryNormalizesFileAndFolderItems()
         CreatedUtc: null,
         ModifiedUtc: null,
         AccessedUtc: null,
-        Error: null));
+        Error: null,
+        AclCollected: true,
+        AclRiskLevel: "expected"));
 
     Assert(file.Server == "FileServer", "Servidor do inventario deveria ser aparado.");
     Assert(file.Path == @"C:\Corporativo\RH\Relatorio.XLSX", "Caminho deveria usar separador Windows.");
@@ -744,6 +937,7 @@ static void InventoryNormalizesFileAndFolderItems()
     Assert(folder.ItemType == "folder", "Directory deveria virar folder.");
     Assert(folder.SizeBytes == 0, "Pasta nao deveria carregar tamanho proprio.");
     Assert(folder.Extension is null, "Pasta nao deveria ter extensao.");
+    Assert(folder.AclRiskLevel == "expected", "Normalizacao deveria preservar ACL coberta pela politica.");
 }
 
 static void InventoryBuildsGovernanceSummary()
@@ -819,6 +1013,136 @@ static void InventoryBuildsObservedActivitySummary()
     Assert(activity.TopFolders.First().LastActivityUtc == now.AddMinutes(-4), "Pasta RH deveria carregar ultima atividade.");
     Assert(activity.TopUsers.First().User == "FILESERVER\\ana", "Usuario ana deveria liderar por atividade.");
     Assert(activity.TopUsers.First().EventCount == 2, "Usuario ana deveria somar dois eventos.");
+}
+
+static void InventoryClassifiesBroadAclExposure()
+{
+    var assessment = FileInventoryAclClassifier.Assess(
+        owner: @"TCEAL\Infraestrutura",
+        inheritanceProtected: false,
+        entries: new[]
+        {
+            new FileInventoryAclEntryInput(@"BUILTIN\Administrators", "S-1-5-32-544", "FullControl", "Allow", false),
+            new FileInventoryAclEntryInput(@"NT AUTHORITY\Authenticated Users", "S-1-5-11", "ReadAndExecute", "Allow", true),
+            new FileInventoryAclEntryInput(@"TCEAL\Domain Users", "S-1-5-21-10-20-30-513", "Modify, Synchronize", "Allow", true)
+        },
+        error: null);
+
+    Assert(assessment.Collected, "ACL lida deveria ser marcada como coletada.");
+    Assert(assessment.Owner == @"TCEAL\Infraestrutura", "Proprietario deveria ser preservado.");
+    Assert(assessment.RiskLevel == "critical", "Escrita ampla deveria ser classificada como critica.");
+    Assert(assessment.BroadAccessPrincipals?.Contains("Authenticated Users", StringComparison.OrdinalIgnoreCase) == true, "Leitura ampla deveria ser registrada.");
+    Assert(assessment.BroadAccessPrincipals?.Contains("Domain Users", StringComparison.OrdinalIgnoreCase) == true, "Grupo de dominio amplo deveria ser registrado pelo SID RID 513.");
+    Assert(assessment.BroadAccessRights?.Contains("Modify", StringComparison.OrdinalIgnoreCase) == true, "Direito de escrita amplo deveria permanecer auditavel.");
+}
+
+static void InventoryCalibratesExpectedBroadAclByRight()
+{
+    var readEntry = new FileInventoryAclEntryInput(
+        @"NT AUTHORITY\Authenticated Users",
+        "S-1-5-11",
+        "ReadAndExecute, Synchronize",
+        "Allow",
+        true);
+    var writeEntry = new FileInventoryAclEntryInput(
+        @"BUILTIN\Users",
+        "S-1-5-32-545",
+        "Modify, Synchronize",
+        "Allow",
+        true);
+
+    var expectedRead = FileInventoryAclClassifier.Assess(
+        owner: @"TCEAL\Infraestrutura",
+        inheritanceProtected: false,
+        entries: new[] { readEntry },
+        error: null,
+        policy: new FileInventoryAclPolicy(
+            ExpectedBroadReadPrincipals: new[] { "S-1-5-11" },
+            ExpectedBroadWritePrincipals: Array.Empty<string>()));
+
+    Assert(expectedRead.RiskLevel == "expected", "Leitura ampla explicitamente aprovada deveria permanecer visivel sem gerar atencao.");
+
+    var unapprovedWrite = FileInventoryAclClassifier.Assess(
+        owner: @"TCEAL\Infraestrutura",
+        inheritanceProtected: false,
+        entries: new[] { writeEntry },
+        error: null,
+        policy: new FileInventoryAclPolicy(
+            ExpectedBroadReadPrincipals: new[] { "S-1-5-32-545" },
+            ExpectedBroadWritePrincipals: Array.Empty<string>()));
+
+    Assert(unapprovedWrite.RiskLevel == "critical", "Aprovacao de leitura nunca deveria aprovar escrita ampla.");
+}
+
+static void InventoryClassifiesAclInheritanceAndReadFailure()
+{
+    var protectedAcl = FileInventoryAclClassifier.Assess(
+        owner: @"TCEAL\Financeiro",
+        inheritanceProtected: true,
+        entries: new[]
+        {
+            new FileInventoryAclEntryInput(@"TCEAL\Financeiro_RW", "S-1-5-21-10-20-30-2101", "Modify", "Allow", false)
+        },
+        error: null);
+
+    Assert(protectedAcl.RiskLevel == "attention", "Heranca interrompida deveria pedir revisao sem virar critica sozinha.");
+    Assert(string.IsNullOrWhiteSpace(protectedAcl.BroadAccessPrincipals), "Grupo departamental nao deveria ser tratado como exposicao ampla.");
+
+    var failed = FileInventoryAclClassifier.Assess(
+        owner: null,
+        inheritanceProtected: false,
+        entries: Array.Empty<FileInventoryAclEntryInput>(),
+        error: "Access is denied.");
+
+    Assert(!failed.Collected, "Falha de leitura nao deveria fingir ACL coletada.");
+    Assert(failed.RiskLevel == "error", "Falha de leitura deveria ser distinguida de risco de permissao.");
+    Assert(failed.Error == "Access is denied.", "Erro deveria permanecer disponivel para diagnostico.");
+}
+
+static void InventoryBuildsAclGovernanceSummary()
+{
+    var snapshotId = Guid.NewGuid();
+    var now = DateTimeOffset.Parse("2026-07-19T12:00:00Z");
+    var critical = BuildInventoryItem(snapshotId, now, @"C:\Corporativo\Publico", "folder", 0) with
+    {
+        AclCollected = true,
+        AclOwner = @"TCEAL\Infraestrutura",
+        AclRiskLevel = "critical",
+        BroadAccessPrincipals = @"TCEAL\Domain Users",
+        BroadAccessRights = "Modify"
+    };
+    var protectedFolder = BuildInventoryItem(snapshotId, now, @"C:\Corporativo\Financeiro", "folder", 0) with
+    {
+        AclCollected = true,
+        AclOwner = @"TCEAL\Financeiro",
+        AclInheritanceProtected = true,
+        AclRiskLevel = "attention"
+    };
+    var failed = BuildInventoryItem(snapshotId, now, @"C:\Corporativo\Restrito", "folder", 0) with
+    {
+        AclRiskLevel = "error",
+        AclError = "Access is denied."
+    };
+    var expected = BuildInventoryItem(snapshotId, now, @"C:\Corporativo\Colaboracao", "folder", 0) with
+    {
+        AclCollected = true,
+        AclOwner = @"TCEAL\Infraestrutura",
+        AclRiskLevel = "expected",
+        BroadAccessPrincipals = @"TCEAL\Domain Users",
+        BroadAccessRights = "ReadAndExecute"
+    };
+
+    var summary = FileInventoryAnalyzer.BuildSummary(null, new[] { critical, protectedFolder, failed, expected }, top: 10, nowUtc: now);
+
+    Assert(summary.Governance.AclCollectedFolderCount == 3, "Resumo deveria contar somente ACLs efetivamente lidas.");
+    Assert(summary.Governance.ExpectedAclFolderCount == 1, "Resumo deveria separar ACL ampla coberta pela politica.");
+    Assert(summary.Governance.CriticalAclFolderCount == 1, "Resumo deveria contar escrita ampla critica.");
+    Assert(summary.Governance.BroadAccessFolderCount == 2, "Resumo deveria manter toda evidencia de principal amplo, inclusive a esperada.");
+    Assert(summary.Governance.InheritanceProtectedFolderCount == 1, "Resumo deveria contar heranca interrompida.");
+    Assert(summary.Governance.AclErrorFolderCount == 1, "Resumo deveria separar falha de leitura.");
+    Assert(summary.AclRisks.First().Path.EndsWith("Publico", StringComparison.Ordinal), "Risco critico deveria liderar a lista.");
+    Assert(summary.AclRisks.All(item => !item.Path.EndsWith("Colaboracao", StringComparison.Ordinal)), "ACL esperada nao deveria poluir a fila de risco.");
+    Assert(summary.Recommendations.Any(item => item.Title.Contains("permissao ampla", StringComparison.OrdinalIgnoreCase)), "Resumo deveria recomendar revisao de escrita ampla.");
 }
 
 static void InventoryBuildsGrowthSummary()
@@ -2619,6 +2943,76 @@ static void TimelineKeepsMassMixedBatchCountsStable()
     Assert(display.Count(item => item.Action == "deleted" && item.Path.StartsWith($@"{root}\delete-", StringComparison.OrdinalIgnoreCase)) == 4, $"Os 4 deletes finais deveriam sobreviver. Atual: {debug}");
     Assert(display.Count(item => item.Action == "accessed" && item.Path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) == 0, $"Nao deveria restar ruido de acesso tecnico no lote misto. Atual: {debug}");
     Assert(display.Count(item => item.Action == "created" && item.Path.Contains("-final.txt", StringComparison.OrdinalIgnoreCase)) == 0, $"Arquivos renomeados nao deveriam reaparecer como criacao. Atual: {debug}");
+}
+
+static void TimelineProjectsTwoThousandFileBurstPredictably()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T18:52:30Z");
+    var events = Enumerable.Range(1, 2_000)
+        .Select(index => BuildTimelineEvent(
+            timestamp.AddMilliseconds(index % 1_000),
+            "created",
+            $@"C:\Corporativo\carga\arquivo-{index:D5}.txt",
+            source: "usn-journal+security-log"))
+        .ToArray();
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+    var display = new EventTimelineProjector().BuildDisplayEvents(events);
+
+    stopwatch.Stop();
+    Console.WriteLine($"METRIC timeline-2000={stopwatch.ElapsedMilliseconds}ms");
+    Assert(display.Count == 2_000, "A rajada deve preservar uma criacao por arquivo.");
+    Assert(stopwatch.Elapsed < TimeSpan.FromSeconds(5), "A projecao indexada de dois mil arquivos nao deve voltar ao custo quadratico.");
+}
+
+static void TimelineProjectsOneThousandCreateDeleteCyclesPredictably()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T18:52:30Z");
+    var events = Enumerable.Range(1, 1_000)
+        .SelectMany(index =>
+        {
+            var path = $@"C:\Corporativo\carga\ciclo-{index:D5}.txt";
+            return new[]
+            {
+                BuildTimelineEvent(timestamp.AddMilliseconds(index % 1_000), "created", path, source: "usn-journal+security-log"),
+                BuildTimelineEvent(timestamp.AddMinutes(2).AddMilliseconds(index % 1_000), "deleted", path, source: "usn-journal+security-log")
+            };
+        })
+        .ToArray();
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+    var display = new EventTimelineProjector().BuildDisplayEvents(events);
+
+    stopwatch.Stop();
+    Console.WriteLine($"METRIC timeline-1000-create-delete={stopwatch.ElapsedMilliseconds}ms");
+    Assert(display.Count(item => item.Action == "created") == 1_000, "Cada ciclo deve preservar sua criacao.");
+    Assert(display.Count(item => item.Action == "deleted") == 1_000, "Cada ciclo deve preservar sua exclusao.");
+    Assert(stopwatch.Elapsed < TimeSpan.FromSeconds(5), "A deduplicacao de exclusoes nao deve voltar a comparar todos os pares de arquivos.");
+}
+
+static void TimelineKeepsMassDeletionWithoutAmbiguousSecurityFallback()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T19:24:13Z");
+    var events = Enumerable.Range(1, 500)
+        .SelectMany(index =>
+        {
+            var path = $@"C:\Corporativo\carga\delete-{index:D5}.txt";
+            return new[]
+            {
+                BuildTimelineEvent(timestamp.AddMilliseconds(index % 500), "deleted", path, source: "usn-journal+security-log"),
+                BuildTimelineEvent(timestamp.AddMilliseconds(index % 500 + 30), "deleted", path, source: "windows-security-log"),
+                BuildTimelineEvent(timestamp.AddMilliseconds(index % 500 + 60), "accessed", path, source: "windows-security-log")
+            };
+        })
+        .ToArray();
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+    var display = new EventTimelineProjector().BuildDisplayEvents(events);
+
+    stopwatch.Stop();
+    Console.WriteLine($"METRIC timeline-500-mass-delete={stopwatch.ElapsedMilliseconds}ms");
+    Assert(display.Count(item => item.Action == "deleted") == 500, "A exclusao em massa deve preservar um evento por arquivo.");
+    Assert(display.All(item => item.Action != "accessed"), "Os acessos tecnicos da exclusao nao devem sobreviver.");
 }
 
 static void KnownPathMapRelocatesFolderDescendants()
