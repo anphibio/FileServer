@@ -62,6 +62,7 @@ var tests = new (string Name, Action Test)[]
     ("timeline colapsa rename duplicado depois de resolver usuario", TimelineCollapsesRenameDuplicateAfterUserResolution),
     ("timeline prefere usuario conhecido em criacao bruta duplicada", TimelinePrefersKnownUserAcrossDuplicateRawCreations),
     ("timeline trata rename de pasta provisoria do windows como criacao", TimelineTreatsProvisionalFolderRenameAsCreation),
+    ("timeline trata pasta provisoria numerada do windows como criacao final", TimelineTreatsNumberedProvisionalFolderRenameAsCreation),
     ("timeline preserva rename de pasta provisoria quando ja houve criacao explicita", TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated),
     ("timeline preserva rename entre nomes padrao do Windows", TimelineKeepsRenameBetweenWindowsDefaultNames),
     ("timeline remove acesso tecnico logo apos rename de arquivo", TimelineSuppressesAccessEchoAfterFileRename),
@@ -1953,6 +1954,29 @@ static void TimelineTreatsProvisionalFolderRenameAsCreation()
     Assert(display[0].Action == "created", $"Rename vindo de 'Nova pasta' deveria virar criação. Atual: {debug}");
     Assert(display[0].DisplayAction == "Criação", $"A ação visível deveria ser criação. Atual: {debug}");
     Assert(display[0].Path == @"C:\Corporativo\teste - 11", $"A criação deveria apontar para o nome final. Atual: {debug}");
+}
+
+static void TimelineTreatsNumberedProvisionalFolderRenameAsCreation()
+{
+    var timestamp = DateTimeOffset.Parse("2026-07-19T11:20:17Z");
+    var provisionalPath = @"C:\Corporativo\Nova pasta (2)";
+    var finalPath = @"C:\Corporativo\DTI";
+    var projector = new EventTimelineProjector();
+    var events = new[]
+    {
+        BuildTimelineEvent(timestamp, "created", provisionalPath, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp, "created", provisionalPath, objectType: "folder", source: "usn-journal+security-log"),
+        BuildTimelineEvent(timestamp.AddSeconds(4), "renamed", finalPath, previousPath: provisionalPath, objectType: "folder", source: "usn-journal+security-log")
+    };
+
+    var display = projector.BuildDisplayEvents(events).OrderBy(item => item.TimestampUtc).ToArray();
+    var debug = string.Join(" || ", display.Select(item => $"{item.TimestampUtc:O}|{item.Action}|{item.Path}|prev={item.PreviousPath}|src={item.Source}"));
+
+    Assert(display.Length == 1, $"Criação de pasta numerada pelo Explorer deveria resultar em um único evento. Atual: {debug}");
+    Assert(display[0].Action == "created", $"Confirmação do nome DTI deveria permanecer como criação. Atual: {debug}");
+    Assert(display[0].DisplayAction == "Criação", $"A ação visível deveria ser criação. Atual: {debug}");
+    Assert(display[0].Path == finalPath, $"A criação deveria apontar para DTI. Atual: {debug}");
+    Assert(display[0].PreviousPath is null, $"A criação final não deveria expor o nome provisório. Atual: {debug}");
 }
 
 static void TimelineKeepsProvisionalFolderRenameWhenOriginalFolderWasCreated()

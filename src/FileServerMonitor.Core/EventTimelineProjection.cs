@@ -2550,7 +2550,7 @@ public sealed class EventTimelineProjector
     private static bool IsProvisionalFolderName(string path)
     {
         var leaf = GetLeafName(path).ToLowerInvariant();
-        return leaf is "nova pasta" or "new folder";
+        return Regex.IsMatch(leaf, @"^(?:nova pasta|new folder)(?: \(\d+\))?$");
     }
 
     private static bool IsTransientArtifactPath(string path)
