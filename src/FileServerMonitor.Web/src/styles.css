@@ -864,6 +864,85 @@ tbody tr:hover {
   padding: 16px;
 }
 
+.timeline-runtime {
+  display: grid;
+  gap: 18px;
+  padding: 18px;
+}
+
+.timeline-runtime-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.timeline-runtime-heading div {
+  display: grid;
+  gap: 3px;
+}
+
+.timeline-runtime-heading span:first-child {
+  color: #637083;
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.timeline-runtime-heading strong {
+  color: #18212c;
+  font-size: 18px;
+}
+
+.timeline-runtime-grid {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0;
+}
+
+.timeline-runtime-grid div {
+  display: grid;
+  justify-content: initial;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 16px;
+  border-left: 1px solid #e1e7ed;
+}
+
+.timeline-runtime-grid div:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.timeline-runtime-grid dt {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.timeline-runtime-grid dd {
+  color: #18212c;
+  font-size: 18px;
+  font-weight: 750;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.timeline-runtime-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  padding-top: 14px;
+  border-top: 1px solid #e1e7ed;
+  color: #8f2f2f;
+}
+
+.timeline-runtime-error span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .agent-card {
   border: 1px solid #d9e0e7;
   border-radius: 8px;
@@ -1533,6 +1612,16 @@ dd {
   .report-qbr-kpis,
   .report-qbr-sections {
     grid-template-columns: 1fr;
+  }
+
+  .timeline-runtime-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px 0;
+  }
+
+  .timeline-runtime-grid div:nth-child(odd) {
+    padding-left: 0;
+    border-left: 0;
   }
 
   .content {

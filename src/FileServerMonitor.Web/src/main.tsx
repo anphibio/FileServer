@@ -51,6 +51,23 @@ type HealthResponse = {
   storageProvider: string;
   storedEvents: number;
   lastEventUtc: string | null;
+  timeline: TimelineMaterializationMetrics;
+};
+
+type TimelineMaterializationMetrics = {
+  status: string;
+  provider: string;
+  totalJobs: number | null;
+  pendingJobs: number | null;
+  processingJobs: number | null;
+  retryingJobs: number | null;
+  maxAttemptCount: number | null;
+  oldestJobCreatedUtc: string | null;
+  oldestJobAgeSeconds: number | null;
+  lastErrorUtc: string | null;
+  lastError: string | null;
+  queryDurationMs: number;
+  error: string | null;
 };
 
 type AuthStatusResponse = {
@@ -938,7 +955,7 @@ function App() {
           />
         )}
 
-        {activeTab === "agents" && <AgentsView agents={agents} />}
+        {activeTab === "agents" && <AgentsView agents={agents} timeline={health?.timeline ?? null} />}
 
         {activeTab === "paths" && <MonitoredPathsView paths={monitoredPaths} canManagePaths={accessPolicy.canManagePaths} onChanged={loadData} onNotify={setNotice} />}
 
@@ -2672,7 +2689,13 @@ function AlertRulesEditor({
   );
 }
 
-function AgentsView({ agents }: { agents: AgentHealth[] }) {
+function AgentsView({
+  agents,
+  timeline
+}: {
+  agents: AgentHealth[];
+  timeline: TimelineMaterializationMetrics | null;
+}) {
   const attentionAgents = agents.filter((agent) => agent.operationalStatus === "attention").length;
   const criticalAgents = agents.filter((agent) => agent.operationalStatus === "critical" || agent.isStale).length;
   const staleAgents = attentionAgents + criticalAgents;
@@ -2711,6 +2734,64 @@ function AgentsView({ agents }: { agents: AgentHealth[] }) {
           tone={lastHeartbeat ? "neutral" : "warning"}
         />
       </section>
+
+      <Panel
+        title="Core e timeline"
+        subtitle="Estado da fila persistente que transforma eventos brutos em dados prontos para consulta."
+      >
+        {timeline ? (
+          <div className="timeline-runtime">
+            <div className="timeline-runtime-heading">
+              <div>
+                <span>Materialização</span>
+                <strong>{timeline.provider}</strong>
+              </div>
+              <span className={`status ${timeline.status}`}>{formatRuntimeStatus(timeline.status)}</span>
+            </div>
+            <dl className="timeline-runtime-grid">
+              <div>
+                <dt>Jobs</dt>
+                <dd>{formatNullableCount(timeline.totalJobs)}</dd>
+              </div>
+              <div>
+                <dt>Pendentes</dt>
+                <dd>{formatNullableCount(timeline.pendingJobs)}</dd>
+              </div>
+              <div>
+                <dt>Processando</dt>
+                <dd>{formatNullableCount(timeline.processingJobs)}</dd>
+              </div>
+              <div>
+                <dt>Em repetição</dt>
+                <dd className={timeline.retryingJobs ? "queue-warning" : ""}>{formatNullableCount(timeline.retryingJobs)}</dd>
+              </div>
+              <div>
+                <dt>Maior espera</dt>
+                <dd>{timeline.oldestJobAgeSeconds === null ? "Sem fila" : formatElapsedSeconds(timeline.oldestJobAgeSeconds)}</dd>
+              </div>
+              <div>
+                <dt>Maior tentativa</dt>
+                <dd>{formatNullableCount(timeline.maxAttemptCount)}</dd>
+              </div>
+              <div>
+                <dt>Consulta</dt>
+                <dd>{formatDurationMs(timeline.queryDurationMs)}</dd>
+              </div>
+            </dl>
+            {(timeline.lastError || timeline.error) && (
+              <p className="timeline-runtime-error">
+                <AlertTriangle size={16} />
+                <span>
+                  <strong>Último erro</strong>
+                  {timeline.lastError ?? timeline.error}
+                </span>
+              </p>
+            )}
+          </div>
+        ) : (
+          <EmptyState text="Aguardando os sinais operacionais do Core." />
+        )}
+      </Panel>
 
       <Panel title="Agentes" subtitle="Saúde do coletor, atraso de heartbeat, fila local e progresso no USN.">
         <div className="agent-grid">
@@ -5700,6 +5781,32 @@ function formatDurationMs(value: number) {
   }
 
   return `${(value / 1000).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} s`;
+}
+
+function formatElapsedSeconds(value: number) {
+  if (value < 60) {
+    return `${Math.round(value)} s`;
+  }
+
+  if (value < 3600) {
+    return `${Math.round(value / 60)} min`;
+  }
+
+  return `${(value / 3600).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} h`;
+}
+
+function formatNullableCount(value: number | null) {
+  return value === null ? "Indisponível" : value.toLocaleString("pt-BR");
+}
+
+function formatRuntimeStatus(value: string) {
+  const labels: Record<string, string> = {
+    healthy: "saudável",
+    degraded: "atenção",
+    critical: "crítico"
+  };
+
+  return labels[value] ?? value;
 }
 
 function formatAgentOperationalStatus(value: string) {
