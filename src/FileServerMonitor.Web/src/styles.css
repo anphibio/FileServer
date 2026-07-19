@@ -3476,6 +3476,33 @@ dd {
   align-items: center;
 }
 
+.compact-actions,
+.inventory-inline-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.inventory-inline-toolbar {
+  border-bottom: 1px solid #dde5ee;
+  margin: 0 0 16px;
+  padding: 0 0 16px;
+}
+
+.inventory-inline-toolbar > div {
+  display: grid;
+  gap: 4px;
+}
+
+.inventory-inline-toolbar span,
+.table-wrap td small {
+  color: #64748b;
+  display: block;
+  font-size: 0.82rem;
+}
+
 .secondary-button {
   display: inline-flex;
   align-items: center;

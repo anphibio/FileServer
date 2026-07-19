@@ -364,6 +364,26 @@ o tempo do scan em uma arvore representativa. O agente mantem em cache a
 traducao SID para conta durante o processo para nao consultar repetidamente o
 Active Directory.
 
+Para traduzir um grupo amplo em usuarios efetivamente expostos, configure em
+`Configuracao > Acesso corporativo` uma conta de consulta do diretorio. Essa
+conta e independente do login dos operadores: a senha e recebida somente na
+gravacao, protegida pela Data Protection da API e nunca devolvida ao navegador.
+O botao `Testar consulta ao AD` valida bind, conectividade e Base DN antes de
+qualquer expansao.
+
+Em `Inventario > Risco`, `Atualizar membros` consulta somente os grupos
+observados no snapshot atual. O resultado e paginado, limitado a 2.000 usuarios
+por grupo e armazenado por 12 horas em `DirectoryGroupExpansionCache`. A
+consulta nao roda dentro do scan e, portanto, nao aumenta o tempo do agente.
+Principais integrados como `Everyone` e `Authenticated Users` sao sinalizados
+como nao enumeraveis; grupos de dominio, incluindo `Domain Users`, sao
+resolvidos com membros aninhados e `primaryGroupID`.
+
+As chaves da Data Protection precisam ser persistentes e compartilhadas entre
+instancias da API. Defina `Auth__DataProtectionKeysPath` para um diretorio em
+volume duravel e monte o mesmo caminho em todas as replicas; perder essas chaves
+invalida a senha de bind protegida e exige que ela seja informada novamente.
+
 ## Autenticacao Inicial
 
 A API suporta uma protecao inicial por API key. Em desenvolvimento ela vem desligada.

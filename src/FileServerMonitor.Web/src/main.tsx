@@ -96,6 +96,10 @@ type AuthConfig = {
   adminGroupDn: string;
   operatorGroupDn: string;
   readerGroupDn: string;
+  directoryBindUsername: string;
+  directoryBindPassword: string;
+  directoryBindPasswordConfigured: boolean;
+  clearDirectoryBindPassword: boolean;
   configurationStatus: string;
   loginMode: string;
   updatedUtc: string;
@@ -576,6 +580,26 @@ type InventoryAclRiskCandidate = {
   riskLevel: string;
   broadAccessPrincipals?: string | null;
   broadAccessRights?: string | null;
+  error?: string | null;
+};
+
+type DirectoryGroupMember = {
+  username: string;
+  displayName: string;
+  distinguishedName: string;
+  enabled: boolean;
+};
+
+type DirectoryGroupResult = {
+  principal: string;
+  groupName?: string | null;
+  groupDn?: string | null;
+  status: string;
+  memberCount: number;
+  truncated: boolean;
+  members: DirectoryGroupMember[];
+  resolvedUtc: string;
+  expiresUtc: string;
   error?: string | null;
 };
 
@@ -1195,11 +1219,12 @@ function LoginPage({ onLogin }: { onLogin: (response: LoginResponse) => void }) 
 function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | null) => void; onChanged: () => void }) {
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [saving, setSaving] = useState(false);
+  const [testingDirectory, setTestingDirectory] = useState(false);
   const [activeConfigSection, setActiveConfigSection] = useState<"access" | "inventory" | "retention">("access");
 
   useEffect(() => {
     fetchJson<AuthConfig>("/api/auth/config")
-      .then(setConfig)
+      .then((value) => setConfig({ ...value, directoryBindPassword: "", clearDirectoryBindPassword: false }))
       .catch((error) => onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar LDAP/AD." }));
   }, [onNotify]);
 
@@ -1226,13 +1251,43 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
         throw new Error(await readErrorMessage(response, "Nao foi possivel salvar LDAP/AD."));
       }
 
-      setConfig((await response.json()) as AuthConfig);
+      const saved = (await response.json()) as AuthConfig;
+      setConfig({ ...saved, directoryBindPassword: "", clearDirectoryBindPassword: false });
       onChanged();
       onNotify({ tone: "success", message: "Configuracao LDAP/AD salva." });
     } catch (error) {
       onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel salvar LDAP/AD." });
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function testDirectoryConnection() {
+    if (!config) {
+      return;
+    }
+
+    if (config.directoryBindPassword || config.clearDirectoryBindPassword) {
+      onNotify({ tone: "warning", message: "Salve a conta de consulta antes de testar a conexao." });
+      return;
+    }
+
+    setTestingDirectory(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/auth/directory/test`, {
+        method: "POST",
+        headers: buildJsonHeaders()
+      });
+      const body = await response.json() as { connectedHost?: string | null; durationMs?: number; error?: string | null };
+      if (!response.ok) {
+        throw new Error(body.error || "Nao foi possivel consultar o diretorio.");
+      }
+
+      onNotify({ tone: "success", message: `Consulta ao AD concluida por ${body.connectedHost || config.host} em ${body.durationMs ?? 0} ms.` });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel consultar o diretorio." });
+    } finally {
+      setTestingDirectory(false);
     }
   }
 
@@ -1344,6 +1399,54 @@ function LdapAuthView({ onNotify, onChanged }: { onNotify: (notice: Notice | nul
               <input value={config.readerGroupDn} onChange={(event) => update("readerGroupDn", event.target.value)} placeholder="CN=FILESERV_LEITOR,OU=Grupos,DC=tceal,DC=tc,DC=br" />
             </label>
           </div>
+
+          <section className="acl-policy-section" aria-label="Conta de consulta do diretorio">
+            <div>
+              <strong>Conta de consulta do diretório</strong>
+              <p>Usada somente para inventário de grupos e permissões. A senha é protegida no servidor e nunca retorna para o navegador.</p>
+            </div>
+            <div className="form-grid two">
+              <label>
+                Usuário de bind
+                <input
+                  value={config.directoryBindUsername}
+                  onChange={(event) => update("directoryBindUsername", event.target.value)}
+                  placeholder="svc_fileserver_inventory"
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                Senha de bind
+                <input
+                  value={config.directoryBindPassword}
+                  onChange={(event) => update("directoryBindPassword", event.target.value)}
+                  placeholder={config.directoryBindPasswordConfigured ? "Senha já configurada" : "Informe a senha da conta"}
+                  type="password"
+                  autoComplete="new-password"
+                />
+                <small>{config.directoryBindPasswordConfigured ? "Deixe em branco para manter a senha atual." : "Obrigatória para consultar grupos do AD."}</small>
+              </label>
+            </div>
+            {config.directoryBindPasswordConfigured ? (
+              <label className="check-row">
+                <input
+                  type="checkbox"
+                  checked={config.clearDirectoryBindPassword}
+                  onChange={(event) => update("clearDirectoryBindPassword", event.target.checked)}
+                />
+                Remover a senha de consulta armazenada
+              </label>
+            ) : null}
+            <div className="form-actions compact-actions">
+              <button className="secondary-button" type="button" disabled={testingDirectory || saving} onClick={testDirectoryConnection}>
+                <ShieldCheck size={18} />
+                {testingDirectory ? "Testando..." : "Testar consulta ao AD"}
+              </button>
+              <span className={`badge ${config.directoryBindPasswordConfigured ? "low" : "neutral"}`}>
+                {config.directoryBindPasswordConfigured ? "Credencial protegida" : "Credencial pendente"}
+              </span>
+            </div>
+          </section>
 
           <div className="auth-badges">
             <span className="badge low">Configuracao salva</span>
@@ -4670,6 +4773,13 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
         )}
 
         {activeInventoryTab === "risk" && (
+          <AclDirectoryGroupsPanel
+            principals={summary.aclRisks.flatMap((item) => (item.broadAccessPrincipals ?? "").split(";").map((value) => value.trim()).filter(Boolean))}
+            onNotify={onNotify}
+          />
+        )}
+
+        {activeInventoryTab === "risk" && (
           <Panel title="Executáveis e scripts encontrados" subtitle="Arquivos que merecem revisão rápida em compartilhamentos corporativos.">
             <InventoryRanking
               items={summary.topExecutableFiles}
@@ -4689,6 +4799,128 @@ function InventoryGovernanceView({ onNotify }: { onNotify: (notice: Notice | nul
       </div>
       </div>
     </div>
+  );
+}
+
+function AclDirectoryGroupsPanel({
+  principals,
+  onNotify
+}: {
+  principals: string[];
+  onNotify: (notice: Notice | null) => void;
+}) {
+  const [groups, setGroups] = useState<DirectoryGroupResult[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const normalizedPrincipals = useMemo(
+    () => Array.from(new Set(principals.map((value) => value.trim()).filter(Boolean))).slice(0, 25),
+    [principals]
+  );
+
+  async function loadGroups() {
+    setLoading(true);
+    try {
+      setGroups(await fetchJson<DirectoryGroupResult[]>("/api/inventory/acl/directory-groups"));
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel carregar grupos do diretorio." });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadGroups();
+  }, []);
+
+  async function refreshGroups() {
+    if (normalizedPrincipals.length === 0) {
+      onNotify({ tone: "warning", message: "O snapshot atual nao possui grupos amplos para expandir." });
+      return;
+    }
+
+    setRefreshing(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/inventory/acl/directory-groups/refresh`, {
+        method: "POST",
+        headers: buildJsonHeaders(),
+        body: JSON.stringify({ principals: normalizedPrincipals })
+      });
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, "Nao foi possivel atualizar os grupos do AD."));
+      }
+
+      const refreshed = (await response.json()) as DirectoryGroupResult[];
+      setGroups((current) => {
+        const merged = new Map(current.map((item) => [item.principal.toLowerCase(), item]));
+        refreshed.forEach((item) => merged.set(item.principal.toLowerCase(), item));
+        return Array.from(merged.values()).sort((left, right) => right.resolvedUtc.localeCompare(left.resolvedUtc));
+      });
+      onNotify({ tone: "success", message: `${refreshed.length} grupo(s) consultado(s) no Active Directory.` });
+    } catch (error) {
+      onNotify({ tone: "danger", message: error instanceof Error ? error.message : "Nao foi possivel atualizar os grupos do AD." });
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  const relevantGroups = groups.filter((group) =>
+    normalizedPrincipals.some((principal) => principal.localeCompare(group.principal, undefined, { sensitivity: "accent" }) === 0));
+
+  return (
+    <Panel title="Exposição efetiva por grupos" subtitle="Expansão sob demanda dos grupos encontrados nas permissões amplas, com cache de 12 horas.">
+      <div className="inventory-inline-toolbar">
+        <div>
+          <strong>{normalizedPrincipals.length.toLocaleString("pt-BR")} principal(is) no snapshot</strong>
+          <span>A consulta é limitada a 2.000 usuários por grupo e não é executada durante o scan.</span>
+        </div>
+        <button className="secondary-button" type="button" onClick={refreshGroups} disabled={refreshing || loading || normalizedPrincipals.length === 0}>
+          <RefreshCcw size={17} />
+          {refreshing ? "Consultando AD..." : "Atualizar membros"}
+        </button>
+      </div>
+
+      {loading ? (
+        <EmptyState text="Carregando cache de grupos do diretório..." />
+      ) : relevantGroups.length ? (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Grupo</th>
+                <th>Estado</th>
+                <th>Membros</th>
+                <th>Amostra de usuários</th>
+                <th>Atualização</th>
+              </tr>
+            </thead>
+            <tbody>
+              {relevantGroups.map((group) => (
+                <tr key={group.principal}>
+                  <td title={group.groupDn || group.principal}>
+                    <strong>{group.groupName || group.principal}</strong>
+                    <small>{group.principal}</small>
+                  </td>
+                  <td>
+                    <span className={`status ${group.status === "ready" ? "ok" : group.status === "truncated" ? "attention" : "neutral"}`}>
+                      {formatDirectoryGroupStatus(group.status)}
+                    </span>
+                  </td>
+                  <td>{group.memberCount.toLocaleString("pt-BR")}{group.truncated ? "+" : ""}</td>
+                  <td title={group.error || undefined}>
+                    {group.members.length
+                      ? group.members.slice(0, 4).map((member) => member.displayName).join(", ")
+                      : group.error || "Sem membros enumerados"}
+                  </td>
+                  <td>{formatRelativeTime(group.resolvedUtc)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <EmptyState text={normalizedPrincipals.length ? "Os grupos deste snapshot ainda não foram consultados no AD." : "Nenhum principal amplo foi encontrado no snapshot atual."} />
+      )}
+    </Panel>
   );
 }
 
@@ -4772,6 +5004,18 @@ function formatAclRisk(risk: string) {
     not_collected: "não coletada"
   };
   return labels[risk.toLowerCase()] ?? risk;
+}
+
+function formatDirectoryGroupStatus(status: string) {
+  return status === "ready"
+    ? "Atualizado"
+    : status === "truncated"
+      ? "Limite atingido"
+      : status === "not_enumerable"
+        ? "Principal integrado"
+        : status === "not_found"
+          ? "Não encontrado"
+          : "Falha na consulta";
 }
 
 function parsePrincipalLines(value: string) {

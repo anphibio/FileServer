@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using FileServerMonitor.Core;
+using Microsoft.AspNetCore.DataProtection;
 #if SQLSERVER
 using Microsoft.Data.SqlClient;
 #endif
@@ -34,10 +35,18 @@ builder.Services.AddSingleton<RetentionCoordinator>();
 builder.Services.AddHostedService<ArchiveLifecycleWorker>();
 builder.Services.AddSingleton<InventoryScanSettingsStore>();
 builder.Services.AddSingleton<LdapAuthenticator>();
+builder.Services.AddSingleton<LdapDirectoryClient>();
+builder.Services.AddSingleton<DirectoryGroupCacheStore>();
 builder.Services.AddSingleton<TimelineMaterializationCoordinator>();
 builder.Services.AddSingleton<TimelineMaterializer>();
 builder.Services.AddHostedService<RetentionWorker>();
 builder.Services.AddHostedService<TimelineMaterializationWorker>();
+var dataProtection = builder.Services.AddDataProtection().SetApplicationName("FileServerMonitor");
+var dataProtectionKeysPath = builder.Configuration.GetValue<string>("Auth:DataProtectionKeysPath");
+if (!string.IsNullOrWhiteSpace(dataProtectionKeysPath))
+{
+    dataProtection.PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysPath));
+}
 builder.Services.AddCors(options =>
 {
     var allowedOrigins = builder.Configuration
@@ -1164,6 +1173,65 @@ app.MapPut("/api/auth/config", async (
         Details: AuthConfigResponse.FromSettings(settings)), cancellationToken);
 
     return Results.Ok(AuthConfigResponse.FromSettings(settings));
+});
+
+app.MapPost("/api/auth/directory/test", async (
+    LdapAuthSettingsStore store,
+    LdapDirectoryClient directory,
+    CancellationToken cancellationToken) =>
+{
+    var settings = await store.GetAsync(cancellationToken);
+    var result = await directory.TestAsync(settings, cancellationToken);
+    return result.Success
+        ? Results.Ok(result)
+        : Results.Json(result, statusCode: StatusCodes.Status422UnprocessableEntity);
+});
+
+app.MapGet("/api/inventory/acl/directory-groups", async (
+    DirectoryGroupCacheStore cache,
+    CancellationToken cancellationToken) =>
+{
+    return Results.Ok(await cache.ListAsync(cancellationToken));
+});
+
+app.MapPost("/api/inventory/acl/directory-groups/refresh", async (
+    DirectoryGroupRefreshRequest request,
+    LdapAuthSettingsStore settingsStore,
+    LdapDirectoryClient directory,
+    DirectoryGroupCacheStore cache,
+    AdminAuditStore adminAudit,
+    HttpContext httpContext,
+    CancellationToken cancellationToken) =>
+{
+    var principals = DirectoryGroupRefreshRequest.Normalize(request.Principals);
+    if (principals.Count == 0)
+    {
+        return Results.BadRequest(new ErrorResponse("Informe ao menos um grupo para consultar."));
+    }
+
+    var settings = await settingsStore.GetAsync(cancellationToken);
+    if (!settings.CanQueryDirectory())
+    {
+        return Results.BadRequest(new ErrorResponse("Configure e teste a conta de consulta do diretorio antes de expandir grupos."));
+    }
+
+    var results = new List<LdapDirectoryGroupResult>();
+    foreach (var principal in principals)
+    {
+        var result = await directory.ResolveGroupAsync(settings, principal, maxMembers: 2000, cancellationToken);
+        await cache.UpsertAsync(result, cancellationToken);
+        results.Add(result);
+    }
+
+    await adminAudit.AddAsync(AdminAuditEntry.Create(
+        Action: "inventory.acl.directory-groups.refresh",
+        EntityType: "directory_group_cache",
+        EntityId: string.Join(';', principals),
+        Actor: AdminAuditHelpers.GetActor(httpContext),
+        SourceIp: AdminAuditHelpers.GetSourceIp(httpContext),
+        Details: new { groups = results.Count, members = results.Sum(item => item.MemberCount) }), cancellationToken);
+
+    return Results.Ok(results);
 });
 
 app.MapGet("/api/retention/config", async (
@@ -12301,6 +12369,8 @@ internal sealed record LdapAuthSettings(
     string AdminGroupDn,
     string OperatorGroupDn,
     string ReaderGroupDn,
+    string DirectoryBindUsername,
+    string DirectoryBindPassword,
     DateTimeOffset UpdatedUtc)
 {
     public static LdapAuthSettings Default => new(
@@ -12317,6 +12387,8 @@ internal sealed record LdapAuthSettings(
         AdminGroupDn: "",
         OperatorGroupDn: "",
         ReaderGroupDn: "",
+        DirectoryBindUsername: "",
+        DirectoryBindPassword: "",
         UpdatedUtc: DateTimeOffset.UtcNow);
 }
 
@@ -12333,7 +12405,10 @@ internal sealed record LdapAuthSettingsRequest(
     string? NetbiosDomain,
     string? AdminGroupDn,
     string? OperatorGroupDn,
-    string? ReaderGroupDn);
+    string? ReaderGroupDn,
+    string? DirectoryBindUsername,
+    string? DirectoryBindPassword,
+    bool? ClearDirectoryBindPassword);
 
 internal sealed record AuthConfigResponse(
     bool Enabled,
@@ -12349,6 +12424,8 @@ internal sealed record AuthConfigResponse(
     string AdminGroupDn,
     string OperatorGroupDn,
     string ReaderGroupDn,
+    string DirectoryBindUsername,
+    bool DirectoryBindPasswordConfigured,
     string ConfigurationStatus,
     string LoginMode,
     DateTimeOffset UpdatedUtc)
@@ -12369,6 +12446,8 @@ internal sealed record AuthConfigResponse(
             settings.AdminGroupDn,
             settings.OperatorGroupDn,
             settings.ReaderGroupDn,
+            settings.DirectoryBindUsername,
+            !string.IsNullOrWhiteSpace(settings.DirectoryBindPassword),
             settings.IsComplete() ? "complete" : "incomplete",
             settings.Enabled ? "ldap-ad" : "api-key",
             settings.UpdatedUtc);
@@ -12417,18 +12496,28 @@ internal static class LdapAuthSettingsExtensions
             && !string.IsNullOrWhiteSpace(settings.OperatorGroupDn)
             && !string.IsNullOrWhiteSpace(settings.ReaderGroupDn);
     }
+
+    public static bool CanQueryDirectory(this LdapAuthSettings settings)
+    {
+        return !string.IsNullOrWhiteSpace(settings.Host)
+            && !string.IsNullOrWhiteSpace(settings.BaseDn)
+            && !string.IsNullOrWhiteSpace(settings.DirectoryBindUsername)
+            && !string.IsNullOrWhiteSpace(settings.DirectoryBindPassword);
+    }
 }
 
 internal sealed class LdapAuthSettingsStore
 {
     private LdapAuthSettings _settings = LdapAuthSettings.Default;
+    private readonly IDataProtector _credentialProtector;
 #if SQLSERVER
     private readonly bool _persistSettings;
     private readonly string? _connectionString;
 #endif
 
-    public LdapAuthSettingsStore(IConfiguration configuration)
+    public LdapAuthSettingsStore(IConfiguration configuration, IDataProtectionProvider dataProtectionProvider)
     {
+        _credentialProtector = dataProtectionProvider.CreateProtector("FileServerMonitor.Ldap.DirectoryBind.v1");
 #if SQLSERVER
         _persistSettings = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
             .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
@@ -12448,7 +12537,10 @@ internal sealed class LdapAuthSettingsStore
             NetbiosDomain: configuration.GetValue<string>("Auth:Ldap:NetbiosDomain"),
             AdminGroupDn: configuration.GetValue<string>("Auth:Ldap:AdminGroupDn"),
             OperatorGroupDn: configuration.GetValue<string>("Auth:Ldap:OperatorGroupDn"),
-            ReaderGroupDn: configuration.GetValue<string>("Auth:Ldap:ReaderGroupDn")));
+            ReaderGroupDn: configuration.GetValue<string>("Auth:Ldap:ReaderGroupDn"),
+            DirectoryBindUsername: configuration.GetValue<string>("Auth:Ldap:DirectoryBindUsername"),
+            DirectoryBindPassword: configuration.GetValue<string>("Auth:Ldap:DirectoryBindPassword"),
+            ClearDirectoryBindPassword: false), existingPassword: null);
     }
 
     public async Task<LdapAuthSettings> GetAsync(CancellationToken cancellationToken)
@@ -12469,7 +12561,8 @@ internal sealed class LdapAuthSettingsStore
 
     public async Task<LdapAuthSettings> SaveAsync(LdapAuthSettingsRequest request, CancellationToken cancellationToken)
     {
-        var settings = Normalize(request);
+        var current = await GetAsync(cancellationToken);
+        var settings = Normalize(request, current.DirectoryBindPassword);
         _settings = settings;
 
 #if SQLSERVER
@@ -12482,7 +12575,7 @@ internal sealed class LdapAuthSettingsStore
         return settings;
     }
 
-    private static LdapAuthSettings Normalize(LdapAuthSettingsRequest request)
+    private static LdapAuthSettings Normalize(LdapAuthSettingsRequest request, string? existingPassword)
     {
         var security = NormalizeSecurity(request.Security);
         var port = request.Port is > 0 and <= 65535
@@ -12503,6 +12596,12 @@ internal sealed class LdapAuthSettingsStore
             AdminGroupDn: Trim(request.AdminGroupDn),
             OperatorGroupDn: Trim(request.OperatorGroupDn),
             ReaderGroupDn: Trim(request.ReaderGroupDn),
+            DirectoryBindUsername: Trim(request.DirectoryBindUsername),
+            DirectoryBindPassword: request.ClearDirectoryBindPassword == true
+                ? string.Empty
+                : string.IsNullOrEmpty(request.DirectoryBindPassword)
+                    ? existingPassword ?? string.Empty
+                    : request.DirectoryBindPassword,
             UpdatedUtc: DateTimeOffset.UtcNow);
     }
 
@@ -12537,6 +12636,8 @@ internal sealed class LdapAuthSettingsStore
                 AdminGroupDn,
                 OperatorGroupDn,
                 ReaderGroupDn,
+                DirectoryBindUsername,
+                DirectoryBindPasswordProtected,
                 UpdatedUtc
             FROM dbo.LdapAuthSettings
             WHERE Id = 1;
@@ -12572,6 +12673,8 @@ internal sealed class LdapAuthSettingsStore
                     AdminGroupDn = @AdminGroupDn,
                     OperatorGroupDn = @OperatorGroupDn,
                     ReaderGroupDn = @ReaderGroupDn,
+                    DirectoryBindUsername = @DirectoryBindUsername,
+                    DirectoryBindPasswordProtected = @DirectoryBindPasswordProtected,
                     UpdatedUtc = @UpdatedUtc
             WHEN NOT MATCHED THEN
                 INSERT
@@ -12590,6 +12693,8 @@ internal sealed class LdapAuthSettingsStore
                     AdminGroupDn,
                     OperatorGroupDn,
                     ReaderGroupDn,
+                    DirectoryBindUsername,
+                    DirectoryBindPasswordProtected,
                     UpdatedUtc
                 )
                 VALUES
@@ -12608,6 +12713,8 @@ internal sealed class LdapAuthSettingsStore
                     @AdminGroupDn,
                     @OperatorGroupDn,
                     @ReaderGroupDn,
+                    @DirectoryBindUsername,
+                    @DirectoryBindPasswordProtected,
                     @UpdatedUtc
                 );
             """;
@@ -12637,6 +12744,8 @@ internal sealed class LdapAuthSettingsStore
                     AdminGroupDn NVARCHAR(1024) NOT NULL,
                     OperatorGroupDn NVARCHAR(1024) NOT NULL,
                     ReaderGroupDn NVARCHAR(1024) NOT NULL,
+                    DirectoryBindUsername NVARCHAR(512) NOT NULL CONSTRAINT DF_LdapAuthSettings_DirectoryBindUsername DEFAULT N'',
+                    DirectoryBindPasswordProtected NVARCHAR(2048) NOT NULL CONSTRAINT DF_LdapAuthSettings_DirectoryBindPasswordProtected DEFAULT N'',
                     UpdatedUtc DATETIME2(3) NOT NULL
                 );
             END;
@@ -12644,6 +12753,21 @@ internal sealed class LdapAuthSettingsStore
             BEGIN
                 ALTER TABLE dbo.LdapAuthSettings
                 ADD ValidateTlsCertificate BIT NOT NULL CONSTRAINT DF_LdapAuthSettings_ValidateTlsCertificate DEFAULT (1);
+            END;
+
+            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.LdapAuthSettings', N'DirectoryBindUsername') IS NULL
+            BEGIN
+                ALTER TABLE dbo.LdapAuthSettings ADD
+                    DirectoryBindUsername NVARCHAR(512) NOT NULL CONSTRAINT DF_LdapAuthSettings_DirectoryBindUsername_Upgrade DEFAULT N'' WITH VALUES,
+                    DirectoryBindPasswordProtected NVARCHAR(2048) NOT NULL CONSTRAINT DF_LdapAuthSettings_DirectoryBindPasswordProtected_Upgrade DEFAULT N'' WITH VALUES;
+            END;
+
+            IF OBJECT_ID(N'dbo.LdapAuthSettings', N'U') IS NOT NULL
+                AND COL_LENGTH(N'dbo.LdapAuthSettings', N'DirectoryBindPasswordProtected') IS NULL
+            BEGIN
+                ALTER TABLE dbo.LdapAuthSettings ADD
+                    DirectoryBindPasswordProtected NVARCHAR(2048) NOT NULL CONSTRAINT DF_LdapAuthSettings_DirectoryBindPasswordProtected_Repair DEFAULT N'' WITH VALUES;
             END;
             """;
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -12659,7 +12783,7 @@ internal sealed class LdapAuthSettingsStore
         return new SqlConnection(_connectionString);
     }
 
-    private static void AddParameters(SqlCommand command, LdapAuthSettings settings)
+    private void AddParameters(SqlCommand command, LdapAuthSettings settings)
     {
         command.Parameters.AddWithValue("@Enabled", settings.Enabled);
         command.Parameters.AddWithValue("@HostName", settings.Host);
@@ -12674,10 +12798,12 @@ internal sealed class LdapAuthSettingsStore
         command.Parameters.AddWithValue("@AdminGroupDn", settings.AdminGroupDn);
         command.Parameters.AddWithValue("@OperatorGroupDn", settings.OperatorGroupDn);
         command.Parameters.AddWithValue("@ReaderGroupDn", settings.ReaderGroupDn);
+        command.Parameters.AddWithValue("@DirectoryBindUsername", settings.DirectoryBindUsername);
+        command.Parameters.AddWithValue("@DirectoryBindPasswordProtected", ProtectCredential(settings.DirectoryBindPassword));
         command.Parameters.AddWithValue("@UpdatedUtc", settings.UpdatedUtc.UtcDateTime);
     }
 
-    private static LdapAuthSettings ReadSettings(SqlDataReader reader)
+    private LdapAuthSettings ReadSettings(SqlDataReader reader)
     {
         return new LdapAuthSettings(
             Enabled: reader.GetBoolean(reader.GetOrdinal("Enabled")),
@@ -12693,8 +12819,624 @@ internal sealed class LdapAuthSettingsStore
             AdminGroupDn: reader.GetString(reader.GetOrdinal("AdminGroupDn")),
             OperatorGroupDn: reader.GetString(reader.GetOrdinal("OperatorGroupDn")),
             ReaderGroupDn: reader.GetString(reader.GetOrdinal("ReaderGroupDn")),
+            DirectoryBindUsername: reader.GetString(reader.GetOrdinal("DirectoryBindUsername")),
+            DirectoryBindPassword: UnprotectCredential(reader.GetString(reader.GetOrdinal("DirectoryBindPasswordProtected"))),
             UpdatedUtc: new DateTimeOffset(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal("UpdatedUtc")), DateTimeKind.Utc)));
     }
+
+    private string ProtectCredential(string value) =>
+        string.IsNullOrEmpty(value) ? string.Empty : _credentialProtector.Protect(value);
+
+    private string UnprotectCredential(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return _credentialProtector.Unprotect(value);
+        }
+        catch (CryptographicException)
+        {
+            return string.Empty;
+        }
+    }
+#endif
+}
+
+internal sealed record DirectoryGroupRefreshRequest(IReadOnlyCollection<string>? Principals)
+{
+    public static IReadOnlyCollection<string> Normalize(IReadOnlyCollection<string>? principals)
+    {
+        return (principals ?? Array.Empty<string>())
+            .SelectMany(value => value.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(25)
+            .ToArray();
+    }
+}
+
+internal sealed record LdapDirectoryGroupMember(
+    string Username,
+    string DisplayName,
+    string DistinguishedName,
+    bool Enabled);
+
+internal sealed record LdapDirectoryGroupResult(
+    string Principal,
+    string? GroupName,
+    string? GroupDn,
+    string Status,
+    int MemberCount,
+    bool Truncated,
+    IReadOnlyCollection<LdapDirectoryGroupMember> Members,
+    DateTimeOffset ResolvedUtc,
+    DateTimeOffset ExpiresUtc,
+    string? Error);
+
+internal sealed record LdapDirectoryTestResult(
+    bool Success,
+    string Status,
+    string? ConnectedHost,
+    string BaseDn,
+    long DurationMs,
+    string? Error);
+
+internal sealed class LdapDirectoryClient
+{
+    private readonly ILogger<LdapDirectoryClient> _logger;
+
+    public LdapDirectoryClient(ILogger<LdapDirectoryClient> logger)
+    {
+        _logger = logger;
+    }
+
+    public Task<LdapDirectoryTestResult> TestAsync(
+        LdapAuthSettings settings,
+        CancellationToken cancellationToken)
+    {
+        if (!settings.CanQueryDirectory())
+        {
+            return Task.FromResult(new LdapDirectoryTestResult(
+                false,
+                "incomplete",
+                null,
+                settings.BaseDn,
+                0,
+                "Informe o usuario e a senha da conta de consulta do diretorio."));
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var errors = new List<string>();
+
+        foreach (var host in GetCandidateHosts(settings.Host))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                using var connection = CreateConnection(settings, host);
+                connection.AuthType = AuthType.Basic;
+                connection.Bind(new NetworkCredential(
+                    BuildBindName(settings, settings.DirectoryBindUsername),
+                    settings.DirectoryBindPassword));
+
+                var request = new SearchRequest(
+                    settings.BaseDn,
+                    "(objectClass=*)",
+                    SearchScope.Base,
+                    "distinguishedName");
+                _ = (SearchResponse)connection.SendRequest(request);
+                stopwatch.Stop();
+
+                return Task.FromResult(new LdapDirectoryTestResult(
+                    true,
+                    "ready",
+                    host,
+                    settings.BaseDn,
+                    stopwatch.ElapsedMilliseconds,
+                    null));
+            }
+            catch (Exception ex) when (ex is LdapException
+                or DirectoryOperationException
+                or InvalidOperationException
+                or TypeInitializationException
+                or DllNotFoundException)
+            {
+                var detail = DescribeFailure(host, ex);
+                errors.Add(detail);
+                _logger.LogWarning(ex, "Falha ao testar conta de consulta LDAP/AD em {Host}:{Port}.", host, settings.Port);
+            }
+        }
+
+        stopwatch.Stop();
+        return Task.FromResult(new LdapDirectoryTestResult(
+            false,
+            "unavailable",
+            null,
+            settings.BaseDn,
+            stopwatch.ElapsedMilliseconds,
+            errors.Count == 0 ? "Nao foi possivel consultar o LDAP/AD." : string.Join(" | ", errors)));
+    }
+
+    public Task<LdapDirectoryGroupResult> ResolveGroupAsync(
+        LdapAuthSettings settings,
+        string principal,
+        int maxMembers,
+        CancellationToken cancellationToken)
+    {
+        var normalizedPrincipal = principal.Trim();
+        var resolvedUtc = DateTimeOffset.UtcNow;
+        var expiresUtc = resolvedUtc.AddHours(12);
+
+        if (IsNonEnumerableBuiltIn(normalizedPrincipal))
+        {
+            return Task.FromResult(new LdapDirectoryGroupResult(
+                normalizedPrincipal,
+                GetPrincipalLeaf(normalizedPrincipal),
+                null,
+                "not_enumerable",
+                0,
+                false,
+                Array.Empty<LdapDirectoryGroupMember>(),
+                resolvedUtc,
+                expiresUtc,
+                "Principal integrado do Windows; nao possui membros enumeraveis no Active Directory."));
+        }
+
+        var errors = new List<string>();
+        foreach (var host in GetCandidateHosts(settings.Host))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                using var connection = CreateConnection(settings, host);
+                connection.AuthType = AuthType.Basic;
+                connection.Bind(new NetworkCredential(
+                    BuildBindName(settings, settings.DirectoryBindUsername),
+                    settings.DirectoryBindPassword));
+
+                var group = FindGroup(connection, settings.BaseDn, normalizedPrincipal);
+                if (group is null)
+                {
+                    return Task.FromResult(new LdapDirectoryGroupResult(
+                        normalizedPrincipal,
+                        GetPrincipalLeaf(normalizedPrincipal),
+                        null,
+                        "not_found",
+                        0,
+                        false,
+                        Array.Empty<LdapDirectoryGroupMember>(),
+                        resolvedUtc,
+                        expiresUtc,
+                        "Grupo nao encontrado no diretorio."));
+                }
+
+                var members = FindMembers(connection, settings.BaseDn, group.Value.Dn, group.Value.PrimaryGroupToken, maxMembers, cancellationToken);
+                return Task.FromResult(new LdapDirectoryGroupResult(
+                    normalizedPrincipal,
+                    group.Value.Name,
+                    group.Value.Dn,
+                    members.Truncated ? "truncated" : "ready",
+                    members.Items.Count,
+                    members.Truncated,
+                    members.Items,
+                    resolvedUtc,
+                    expiresUtc,
+                    null));
+            }
+            catch (Exception ex) when (ex is LdapException
+                or DirectoryOperationException
+                or InvalidOperationException
+                or TypeInitializationException
+                or DllNotFoundException)
+            {
+                errors.Add(DescribeFailure(host, ex));
+                _logger.LogWarning(ex, "Falha ao expandir grupo LDAP/AD {Principal} em {Host}:{Port}.", normalizedPrincipal, host, settings.Port);
+            }
+        }
+
+        return Task.FromResult(new LdapDirectoryGroupResult(
+            normalizedPrincipal,
+            GetPrincipalLeaf(normalizedPrincipal),
+            null,
+            "error",
+            0,
+            false,
+            Array.Empty<LdapDirectoryGroupMember>(),
+            resolvedUtc,
+            expiresUtc,
+            errors.Count == 0 ? "Nao foi possivel consultar o grupo." : string.Join(" | ", errors)));
+    }
+
+    private static (string Dn, string Name, string? PrimaryGroupToken)? FindGroup(
+        LdapConnection connection,
+        string baseDn,
+        string principal)
+    {
+        var leaf = GetPrincipalLeaf(principal);
+        var escapedPrincipal = EscapeLdapFilter(principal);
+        var escapedLeaf = EscapeLdapFilter(leaf);
+        var filter = $"(&(objectClass=group)(|(distinguishedName={escapedPrincipal})(sAMAccountName={escapedLeaf})(cn={escapedLeaf})))";
+        var request = new SearchRequest(
+            baseDn,
+            filter,
+            SearchScope.Subtree,
+            "distinguishedName",
+            "sAMAccountName",
+            "cn",
+            "primaryGroupToken");
+        var response = (SearchResponse)connection.SendRequest(request);
+        var entry = response.Entries.Cast<SearchResultEntry>().FirstOrDefault();
+        if (entry is null)
+        {
+            return null;
+        }
+
+        var dn = GetAttributeValue(entry, "distinguishedName");
+        if (string.IsNullOrWhiteSpace(dn))
+        {
+            return null;
+        }
+
+        return (
+            dn,
+            GetAttributeValue(entry, "sAMAccountName") ?? GetAttributeValue(entry, "cn") ?? leaf,
+            GetAttributeValue(entry, "primaryGroupToken"));
+    }
+
+    private static (IReadOnlyCollection<LdapDirectoryGroupMember> Items, bool Truncated) FindMembers(
+        LdapConnection connection,
+        string baseDn,
+        string groupDn,
+        string? primaryGroupToken,
+        int maxMembers,
+        CancellationToken cancellationToken)
+    {
+        var limit = Math.Clamp(maxMembers, 1, 5000);
+        var escapedDn = EscapeLdapFilter(groupDn);
+        var membershipFilter = string.IsNullOrWhiteSpace(primaryGroupToken)
+            ? $"(memberOf:1.2.840.113556.1.4.1941:={escapedDn})"
+            : $"(|(memberOf:1.2.840.113556.1.4.1941:={escapedDn})(primaryGroupID={EscapeLdapFilter(primaryGroupToken)}))";
+        var filter = $"(&(objectCategory=person)(objectClass=user){membershipFilter})";
+        var members = new Dictionary<string, LdapDirectoryGroupMember>(StringComparer.OrdinalIgnoreCase);
+        var page = new PageResultRequestControl(Math.Min(500, limit));
+        var truncated = false;
+
+        do
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var request = new SearchRequest(
+                baseDn,
+                filter,
+                SearchScope.Subtree,
+                "sAMAccountName",
+                "displayName",
+                "distinguishedName",
+                "userAccountControl");
+            request.Controls.Add(page);
+            var response = (SearchResponse)connection.SendRequest(request);
+
+            foreach (SearchResultEntry entry in response.Entries)
+            {
+                var username = GetAttributeValue(entry, "sAMAccountName");
+                var dn = GetAttributeValue(entry, "distinguishedName");
+                if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(dn))
+                {
+                    continue;
+                }
+
+                var userAccountControl = int.TryParse(GetAttributeValue(entry, "userAccountControl"), out var parsed) ? parsed : 0;
+                members[dn] = new LdapDirectoryGroupMember(
+                    username,
+                    GetAttributeValue(entry, "displayName") ?? username,
+                    dn,
+                    Enabled: (userAccountControl & 2) == 0);
+
+                if (members.Count >= limit)
+                {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            if (truncated)
+            {
+                break;
+            }
+
+            var pageResponse = response.Controls.OfType<PageResultResponseControl>().FirstOrDefault();
+            page.Cookie = pageResponse?.Cookie ?? Array.Empty<byte>();
+        }
+        while (page.Cookie.Length > 0);
+
+        return (
+            members.Values.OrderBy(member => member.DisplayName, StringComparer.OrdinalIgnoreCase).ToArray(),
+            truncated);
+    }
+
+    private static LdapConnection CreateConnection(LdapAuthSettings settings, string host)
+    {
+        Environment.SetEnvironmentVariable(
+            "LDAPTLS_REQCERT",
+            settings.ValidateTlsCertificate ? "demand" : "never");
+
+        var identifier = new LdapDirectoryIdentifier(
+            host,
+            settings.Port,
+            fullyQualifiedDnsHostName: !IPAddress.TryParse(host, out _),
+            connectionless: false);
+        var connection = new LdapConnection(identifier)
+        {
+            Timeout = TimeSpan.FromSeconds(settings.TimeoutSeconds)
+        };
+        connection.SessionOptions.ProtocolVersion = 3;
+        connection.SessionOptions.ReferralChasing = ReferralChasingOptions.None;
+
+        if (settings.Security.Equals("LDAPS", StringComparison.OrdinalIgnoreCase))
+        {
+            connection.SessionOptions.SecureSocketLayer = true;
+        }
+
+        return connection;
+    }
+
+    private static string BuildBindName(LdapAuthSettings settings, string username)
+    {
+        var normalized = username.Trim();
+        if (normalized.Contains('\\') || normalized.Contains('@') || normalized.Contains('=', StringComparison.Ordinal))
+        {
+            return normalized;
+        }
+
+        return settings.BindFormat switch
+        {
+            "usuario@dominio" when !string.IsNullOrWhiteSpace(settings.DomainSuffix) => $"{normalized}@{settings.DomainSuffix}",
+            "DN" => normalized,
+            _ when !string.IsNullOrWhiteSpace(settings.NetbiosDomain) => $"{settings.NetbiosDomain}\\{normalized}",
+            _ when !string.IsNullOrWhiteSpace(settings.DomainSuffix) => $"{normalized}@{settings.DomainSuffix}",
+            _ => normalized
+        };
+    }
+
+    private static IReadOnlyCollection<string> GetCandidateHosts(string configuredHost)
+    {
+        var hosts = new List<string> { configuredHost };
+        if (IPAddress.TryParse(configuredHost, out var address))
+        {
+            try
+            {
+                var hostEntry = Dns.GetHostEntry(address);
+                if (!string.IsNullOrWhiteSpace(hostEntry.HostName))
+                {
+                    hosts.Insert(0, hostEntry.HostName);
+                }
+            }
+            catch
+            {
+                // O IP configurado continua disponivel quando o DNS reverso falha.
+            }
+        }
+
+        return hosts
+            .Where(host => !string.IsNullOrWhiteSpace(host))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool IsNonEnumerableBuiltIn(string principal)
+    {
+        var leaf = GetPrincipalLeaf(principal);
+        return principal.Equals("S-1-1-0", StringComparison.OrdinalIgnoreCase)
+            || principal.Equals("S-1-5-11", StringComparison.OrdinalIgnoreCase)
+            || principal.Equals("S-1-5-32-545", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("Everyone", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("Authenticated Users", StringComparison.OrdinalIgnoreCase)
+            || leaf.Equals("Users", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetPrincipalLeaf(string principal)
+    {
+        var slash = Math.Max(principal.LastIndexOf('\\'), principal.LastIndexOf('/'));
+        return slash >= 0 && slash < principal.Length - 1 ? principal[(slash + 1)..] : principal;
+    }
+
+    private static string? GetAttributeValue(SearchResultEntry entry, string name)
+    {
+        return entry.Attributes.Contains(name) && entry.Attributes[name].Count > 0
+            ? entry.Attributes[name][0]?.ToString()
+            : null;
+    }
+
+    private static string EscapeLdapFilter(string value)
+    {
+        return value
+            .Replace("\\", "\\5c", StringComparison.Ordinal)
+            .Replace("*", "\\2a", StringComparison.Ordinal)
+            .Replace("(", "\\28", StringComparison.Ordinal)
+            .Replace(")", "\\29", StringComparison.Ordinal)
+            .Replace("\0", "\\00", StringComparison.Ordinal);
+    }
+
+    private static string DescribeFailure(string host, Exception exception)
+    {
+        if (exception is LdapException ldapException)
+        {
+            var serverError = string.IsNullOrWhiteSpace(ldapException.ServerErrorMessage)
+                ? null
+                : $" server='{ldapException.ServerErrorMessage}'";
+            return $"{host}: LDAP {ldapException.ErrorCode} - {ldapException.Message}{serverError}";
+        }
+
+        return $"{host}: {exception.GetType().Name} - {exception.Message}";
+    }
+}
+
+internal sealed class DirectoryGroupCacheStore
+{
+    private readonly ConcurrentDictionary<string, LdapDirectoryGroupResult> _memory = new(StringComparer.OrdinalIgnoreCase);
+#if SQLSERVER
+    private readonly bool _persist;
+    private readonly string? _connectionString;
+#endif
+
+    public DirectoryGroupCacheStore(IConfiguration configuration)
+    {
+#if SQLSERVER
+        _persist = configuration.GetValue("Monitor:StorageProvider", "SqlServer")
+            .Equals("SqlServer", StringComparison.OrdinalIgnoreCase);
+        _connectionString = configuration.GetConnectionString("SqlServer");
+#endif
+    }
+
+    public async Task UpsertAsync(LdapDirectoryGroupResult result, CancellationToken cancellationToken)
+    {
+        _memory[result.Principal] = result;
+
+#if SQLSERVER
+        if (_persist)
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                MERGE dbo.DirectoryGroupExpansionCache AS target
+                USING (SELECT @PrincipalKey AS PrincipalKey) AS source
+                    ON target.PrincipalKey = source.PrincipalKey
+                WHEN MATCHED THEN UPDATE SET
+                    GroupName = @GroupName,
+                    GroupDn = @GroupDn,
+                    StatusName = @StatusName,
+                    MemberCount = @MemberCount,
+                    IsTruncated = @IsTruncated,
+                    MembersJson = @MembersJson,
+                    ResolvedUtc = @ResolvedUtc,
+                    ExpiresUtc = @ExpiresUtc,
+                    ErrorText = @ErrorText
+                WHEN NOT MATCHED THEN INSERT
+                (
+                    PrincipalKey, GroupName, GroupDn, StatusName, MemberCount,
+                    IsTruncated, MembersJson, ResolvedUtc, ExpiresUtc, ErrorText
+                )
+                VALUES
+                (
+                    @PrincipalKey, @GroupName, @GroupDn, @StatusName, @MemberCount,
+                    @IsTruncated, @MembersJson, @ResolvedUtc, @ExpiresUtc, @ErrorText
+                );
+                """;
+            command.Parameters.AddWithValue("@PrincipalKey", result.Principal);
+            command.Parameters.AddWithValue("@GroupName", DbValue(result.GroupName));
+            command.Parameters.AddWithValue("@GroupDn", DbValue(result.GroupDn));
+            command.Parameters.AddWithValue("@StatusName", result.Status);
+            command.Parameters.AddWithValue("@MemberCount", result.MemberCount);
+            command.Parameters.AddWithValue("@IsTruncated", result.Truncated);
+            command.Parameters.AddWithValue("@MembersJson", JsonSerializer.Serialize(result.Members));
+            command.Parameters.AddWithValue("@ResolvedUtc", result.ResolvedUtc.UtcDateTime);
+            command.Parameters.AddWithValue("@ExpiresUtc", result.ExpiresUtc.UtcDateTime);
+            command.Parameters.AddWithValue("@ErrorText", DbValue(result.Error));
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+#endif
+    }
+
+    public async Task<IReadOnlyCollection<LdapDirectoryGroupResult>> ListAsync(CancellationToken cancellationToken)
+    {
+#if SQLSERVER
+        if (_persist)
+        {
+            await using var connection = CreateConnection();
+            await connection.OpenAsync(cancellationToken);
+            await EnsureSchemaAsync(connection, cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT TOP (100)
+                    PrincipalKey, GroupName, GroupDn, StatusName, MemberCount,
+                    IsTruncated, MembersJson, ResolvedUtc, ExpiresUtc, ErrorText
+                FROM dbo.DirectoryGroupExpansionCache
+                ORDER BY ResolvedUtc DESC, PrincipalKey;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            var results = new List<LdapDirectoryGroupResult>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var members = JsonSerializer.Deserialize<LdapDirectoryGroupMember[]>(reader.GetString(reader.GetOrdinal("MembersJson")))
+                    ?? Array.Empty<LdapDirectoryGroupMember>();
+                results.Add(new LdapDirectoryGroupResult(
+                    reader.GetString(reader.GetOrdinal("PrincipalKey")),
+                    ReadNullableString(reader, "GroupName"),
+                    ReadNullableString(reader, "GroupDn"),
+                    reader.GetString(reader.GetOrdinal("StatusName")),
+                    reader.GetInt32(reader.GetOrdinal("MemberCount")),
+                    reader.GetBoolean(reader.GetOrdinal("IsTruncated")),
+                    members,
+                    ReadDateTimeOffset(reader, "ResolvedUtc"),
+                    ReadDateTimeOffset(reader, "ExpiresUtc"),
+                    ReadNullableString(reader, "ErrorText")));
+            }
+
+            return results;
+        }
+#endif
+
+        return _memory.Values
+            .OrderByDescending(item => item.ResolvedUtc)
+            .ThenBy(item => item.Principal, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+#if SQLSERVER
+    private async Task EnsureSchemaAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            IF OBJECT_ID(N'dbo.DirectoryGroupExpansionCache', N'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.DirectoryGroupExpansionCache
+                (
+                    PrincipalKey NVARCHAR(512) NOT NULL CONSTRAINT PK_DirectoryGroupExpansionCache PRIMARY KEY,
+                    GroupName NVARCHAR(512) NULL,
+                    GroupDn NVARCHAR(1024) NULL,
+                    StatusName NVARCHAR(32) NOT NULL,
+                    MemberCount INT NOT NULL,
+                    IsTruncated BIT NOT NULL,
+                    MembersJson NVARCHAR(MAX) NOT NULL,
+                    ResolvedUtc DATETIME2(3) NOT NULL,
+                    ExpiresUtc DATETIME2(3) NOT NULL,
+                    ErrorText NVARCHAR(2048) NULL
+                );
+
+                CREATE INDEX IX_DirectoryGroupExpansionCache_ExpiresUtc
+                    ON dbo.DirectoryGroupExpansionCache (ExpiresUtc);
+            END;
+            """;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private SqlConnection CreateConnection()
+    {
+        if (string.IsNullOrWhiteSpace(_connectionString))
+        {
+            throw new InvalidOperationException("ConnectionStrings:SqlServer nao foi configurada.");
+        }
+
+        return new SqlConnection(_connectionString);
+    }
+
+    private static object DbValue(string? value) => string.IsNullOrWhiteSpace(value) ? DBNull.Value : value;
+
+    private static string? ReadNullableString(SqlDataReader reader, string name)
+    {
+        var ordinal = reader.GetOrdinal(name);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
+
+    private static DateTimeOffset ReadDateTimeOffset(SqlDataReader reader, string name) =>
+        new(DateTime.SpecifyKind(reader.GetDateTime(reader.GetOrdinal(name)), DateTimeKind.Utc));
 #endif
 }
 
@@ -13155,7 +13897,8 @@ internal static class AuthHelpers
             return AuthRole.Admin;
         }
 
-        if (request.Path.StartsWithSegments("/api/auth/config"))
+        if (request.Path.StartsWithSegments("/api/auth/config")
+            || request.Path.StartsWithSegments("/api/auth/directory"))
         {
             return AuthRole.Admin;
         }
@@ -13171,6 +13914,12 @@ internal static class AuthHelpers
         }
 
         if (request.Path.StartsWithSegments("/api/inventory/scan-now"))
+        {
+            return AuthRole.Admin;
+        }
+
+        if (request.Path.StartsWithSegments("/api/inventory/acl/directory-groups")
+            && HttpMethods.IsPost(request.Method))
         {
             return AuthRole.Admin;
         }

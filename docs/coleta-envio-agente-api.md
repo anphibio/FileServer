@@ -658,10 +658,21 @@ Regras `Deny` nao sao tratadas como exposicao ampla. Escrita ampla gera risco
 critico; leitura ampla ou heranca interrompida gera atencao. Falhas de leitura
 ficam registradas e nao interrompem o restante do scan.
 
-Limite conhecido: esta primeira versao classifica a ACL declarada e nao expande
-recursivamente grupos do Active Directory. A expansao de membros deve ser uma
-etapa posterior e controlada, pois pode elevar muito o custo e exigir uma
-credencial de consulta dedicada.
+A expansao de grupos do Active Directory e uma operacao administrativa separada
+do scan. A conta de consulta e configurada na API, com senha protegida e sem
+retorno ao frontend. Antes da primeira consulta, o endpoint
+`POST /api/auth/directory/test` valida bind e Base DN.
+
+O frontend envia somente os principais amplos observados no snapshot para
+`POST /api/inventory/acl/directory-groups/refresh`. A API limita o recorte a 25
+grupos e 2.000 usuarios por grupo, usa paginacao LDAP, inclui grupos aninhados e
+considera `primaryGroupID`. O resultado fica materializado por 12 horas em
+`dbo.DirectoryGroupExpansionCache` e pode ser lido sem nova chamada ao dominio
+por `GET /api/inventory/acl/directory-groups`.
+
+`Everyone`, `Authenticated Users` e `BUILTIN\Users` nao representam grupos AD
+enumeraveis e recebem estado `not_enumerable`, sem serem tratados como falha de
+conectividade. A expansao nunca e executada pelo agente nem no ciclo do scan.
 
 ## Checklist operacional
 

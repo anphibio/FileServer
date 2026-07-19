@@ -248,3 +248,5 @@ Observacoes:
 - API materializa os indicadores de governanca de ACL por snapshot e a interface apresenta totais, riscos prioritarios e investigacao das pastas afetadas.
 - Traducao de SID para conta usa cache no agente para reduzir consultas repetidas ao dominio durante scans extensos.
 - Politica de ACL esperada separa aprovacao de leitura e escrita por compartilhamento, mantendo a evidencia aprovada no snapshot sem poluir a fila de risco.
+- Conta dedicada de consulta LDAP/AD passou a usar senha write-only protegida pela API, com teste de bind e Base DN na configuracao.
+- Risco de ACL ganhou expansao sob demanda dos grupos observados, paginacao e limite de membros, cache SQL de 12 horas e leitura de membros efetivos sem aumentar o tempo do scan.
